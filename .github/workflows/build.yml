@@ -1,5 +1,7 @@
-# Construit l'application Windows (.exe) et Mac (.dmg) à chaque envoi de code,
-# et les attache automatiquement à chaque « Release » publiée (v1.0.0, v1.1.0…).
+# Construit Bev à chaque envoi de code :
+#  - Windows : un INSTALLATEUR (Bev-Setup-x.y.z.exe : menu Démarrer, raccourci, désinstallation, mises à jour) ;
+#  - Mac : une image disque (.dmg).
+# Et les attache automatiquement à chaque « Release » publiée (v1.1.0, v1.1.1…).
 name: Construire Bev
 
 on:
@@ -36,43 +38,58 @@ jobs:
           Copy-Item fftmp\*\bin\ffmpeg.exe, fftmp\*\bin\ffprobe.exe, fftmp\*\bin\ffplay.exe ffmpeg\
           ffmpeg\ffmpeg.exe -version | Select-Object -First 1
 
-      - name: Icône, version et dépôt
+      - name: Icône, image de démarrage, version et dépôt
         env:
           TAG: ${{ github.event_name == 'release' && github.ref_name || '' }}
           REPO: ${{ github.repository }}
         run: python tools/prepare.py
 
+      # Application en DOSSIER (et non plus en un seul .exe) : plus de décompression de 260 Mo à chaque lancement,
+      # Bev s'ouvre en quelques secondes ; l'image de démarrage s'affiche dès le double-clic.
       - name: Construction (PyInstaller)
         run: >
-          pyinstaller --noconfirm --clean --onefile --windowed --name Bev
+          pyinstaller --noconfirm --clean --onedir --windowed --name Bev
           --icon build/icon.ico
+          --splash build/splash.png
           --add-binary "ffmpeg/ffmpeg.exe;bin"
           --add-binary "ffmpeg/ffprobe.exe;bin"
           --add-binary "ffmpeg/ffplay.exe;bin"
           --collect-all sounddevice
           --hidden-import pyaudiowpatch
+          --hidden-import PySide6.QtNetwork
           broadcast_tool_qt.py
 
       - name: Vérification automatique (selftest)
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath dist\Bev.exe -ArgumentList "--selftest" -Wait -PassThru
+          $env:PYINSTALLER_SUPPRESS_SPLASH_SCREEN = "1"
+          $p = Start-Process -FilePath dist\Bev\Bev.exe -ArgumentList "--selftest" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { throw "selftest en échec" }
 
+      - name: Installateur (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $ver = (Get-Content build\version.txt).Trim()
+          & $iscc "/DMyAppVersion=$ver" installer\bev.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup en échec" }
+          Get-ChildItem dist-installer
+
       - uses: actions/upload-artifact@v4
         with:
-          name: Bev-Windows
+          name: Bev-Windows-installateur
           path: |
-            dist/Bev.exe
+            dist-installer/Bev-Setup-*.exe
             selftest.txt
 
       - name: Joindre à la Release
         if: github.event_name == 'release'
         shell: pwsh
         run: |
-          Copy-Item dist\Bev.exe Bev-Windows.exe
-          gh release upload "${{ github.ref_name }}" Bev-Windows.exe --clobber
+          $f = Get-ChildItem dist-installer\Bev-Setup-*.exe | Select-Object -First 1
+          gh release upload "${{ github.ref_name }}" $f.FullName --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -115,6 +132,7 @@ jobs:
           --add-binary "ffmpeg/ffprobe:bin"
           --add-binary "ffmpeg/ffplay:bin"
           --collect-all sounddevice
+          --hidden-import PySide6.QtNetwork
           broadcast_tool_qt.py
 
       - name: Autorisation micro + signature locale
