@@ -523,7 +523,21 @@ def fmt_dur(sec):
 
 
 # --------------------------------------------------- périphériques d'entrée
+def dev_short_name(device):
+    """Nom lisible d'une entrée (« loopback:Haut-parleurs » -> « Son de l'ordinateur (Haut-parleurs) »)."""
+    d = str(device or "")
+    if d == "loopback:default":
+        return "Son de l'ordinateur"
+    if d.startswith("loopback:"):
+        return f"Son de l'ordinateur ({d[9:]})"
+    if d.startswith("lavfi:"):
+        return "Générateur de test"
+    return d or "(aucune)"
+
+
 def input_args(device):
+    if str(device).startswith("lavfi:"):          # générateur de test (diagnostic, essais sans carte son)
+        return ["-re", "-f", "lavfi", "-i", device[6:]]
     if SYS == "Windows":
         return ["-f", "dshow", "-i", f"audio={device}"]
     if SYS == "Darwin":
@@ -878,16 +892,28 @@ class CartMonitor:
 
 
 class Engine:
-    """Moteur de diffusion (sans interface) : capture, détection de signal,
-    secours, fondus, cartouches, retard de sécurité et distribution aux sorties."""
+    """Moteur audio PERMANENT (sans interface) : il démarre avec l'application et ne s'arrête qu'à sa fermeture.
+    Cartoucheur, contrôle d'entrée et antenne sont trois états de ce même moteur, qui ne se gênent jamais :
+      - cartouches : toujours jouables (casque hors antenne, antenne pendant la diffusion) ;
+      - capture de l'entrée : ouverte seulement quand on regarde l'entrée (monitor) ou pendant l'antenne (air) ;
+      - antenne (air) : flux de sortie, détection de silence, playlist de secours, retard de sécurité.
+    Démarrer / arrêter la diffusion ne coupe donc plus les cartouches, et le contrôle d'entrée ne touche à rien d'autre."""
 
     def __init__(self, prof, log, alert=None, standalone=False):
-        self.prof, self.log, self.standalone = prof, log, standalone
+        self.prof, self.log, self.standalone = prof, log, False
         self.alert = alert or (lambda text, key=None: None)
         self.lock = threading.Lock()
+        self.air_lk = threading.RLock()
         self.ev = threading.Event()
         self.running = False
         self.started = 0.0
+        self.air = self.monitor = self.listen = False
+        self.src_dev = (prof.get("source") or {}).get("device", "")
+        self.cap_gen, self.cap_wake = 0, threading.Event()
+        self.cap_state, self.cap_err, self.cap_t = "off", "", 0.0
+        self.fb_ver, self._fbp, self._fbp_ver = 0, None, -1
+        self.counts_ver = 0
+        self.fb_note = ""
         self.live_buf, self.pl_buf = bytearray(), bytearray()
         self.pl_marks, self.pl_in, self.pl_out = deque(), 0, 0
         self.backup = self.manual = self.mute = self.tone = self.pl_active = False
@@ -909,36 +935,159 @@ class Engine:
         self.cmon = CartMonitor(self.log)
         self.buses, self.bus_bad, self.n_dist = {}, set(), 0
         self.cap_proc = self.pl_proc = None
-        self.outputs = [make_output(c, self) for c in prof["outputs"]]
+        self.cap_stream = None
+        self.outputs = []                      # flux : créés seulement à la mise à l'antenne
 
-    # --- démarrage / arrêt
+    # --- démarrage / arrêt du moteur (= ouverture / fermeture de l'application)
     def start(self):
         self.running = True
         self.ev.clear()
         c = self.prof["carts"]
         self.cmon.set_device(c.get("device", ""))
-        self.started = time.time()
-        fns = ((self.feeder_loop, self.preload_carts) if self.standalone else
-               (self.capture_loop, self.playlist_loop, self.feeder_loop, self.meta_loop,
-                self.preload_carts, self.jingle_loop))
-        for fn in fns:
+        for fn in (self.capture_loop, self.playlist_loop, self.feeder_loop, self.meta_loop,
+                   self.preload_carts, self.jingle_loop):
             threading.Thread(target=fn, daemon=True).start()
-        for o in self.outputs:
-            if o.cfg.get("enabled", True):
-                o.start()
 
     def stop(self):
         self.running = False
         self.ev.set()
+        self.cap_wake.set()
         self.cmon.close()
         for o in self.outputs:
             o.stop()
         for b in list(self.buses.values()):
             b.stop()
         self.buses = {}
-        for p in (self.cap_proc, self.pl_proc):
-            if p:
-                stop_proc(p)
+        self._cap_kill()
+        if self.pl_proc:
+            stop_proc(self.pl_proc)
+
+    # --- antenne : marche / arrêt (le moteur, lui, continue : cartouches et casque ne sont jamais coupés)
+    def set_air(self, on, prof=None):
+        with self.air_lk:
+            if on:
+                if prof is not None:
+                    self.set_prof(prof)
+                for o in self.outputs:              # (sécurité) anciens flux encore présents
+                    threading.Thread(target=o.stop, daemon=True).start()
+                for b in list(self.buses.values()):
+                    b.stop()
+                self.buses, self.bus_bad = {}, set()
+                with self.lock:
+                    self.pl_buf.clear()
+                    self.pl_marks.clear()
+                    self.pl_in = self.pl_out = 0
+                self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+                self.silent_ms = self.loud_ms = 0
+                self.mix_g, self.track, self.pl_cur, self.next_file, self.pl_skip = 0.0, "", None, None, False
+                self.delay_q.clear()
+                self.meta = ""
+                self.late, self.late_hist = 0, []
+                self.started = time.time()
+                self.outputs = [make_output(c, self) for c in self.prof.get("outputs", [])]
+                self.air = True
+                self._cap_kick()
+                for o in self.outputs:
+                    if o.cfg.get("enabled", True):
+                        o.start()
+                p = self.fb_params()
+                if p["enabled"] and p["files"]:
+                    self.log(f"Bascule automatique activée : seuil {p['thr']:g} dB, délai {p['delay'] / 1000:g} s, "
+                             f"{len(p['files'])} titre(s) dans la playlist de secours.")
+                elif p["enabled"]:
+                    self.log("Playlist de secours activée mais vide : ajoute des titres pour que la relève puisse se faire.")
+                else:
+                    self.log("Bascule automatique désactivée : en cas de silence, rien ne prendra le relais.")
+            else:
+                if not self.air:
+                    return
+                self.air = False
+                outs, self.outputs = self.outputs, []
+                for o in outs:
+                    o.stop()
+                for b in list(self.buses.values()):
+                    b.stop()
+                self.buses = {}
+                self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+                self.silent_ms = self.loud_ms = 0
+                self.track, self.pl_cur = "", None
+                if self.pl_proc:
+                    stop_proc(self.pl_proc)
+                self.delay_q.clear()
+                self._cap_kick()
+
+    def set_prof(self, prof):
+        """Nouveau profil complet (mise à l'antenne, changement de profil hors antenne)."""
+        counts = self.prof.get("fallback", {}).get("counts")
+        self.prof = prof
+        if counts and isinstance(prof.get("fallback"), dict):
+            prof["fallback"].setdefault("counts", {}).update({k: max(v, prof["fallback"]["counts"].get(k, 0)) for k, v in counts.items()})
+        self.meta_manual = prof.get("meta", {}).get("text", "")
+        self.delay_blocks = self.to_blocks(prof.get("delay", "0"))
+        self.set_gain(prof.get("gain", "0"))
+        self.fb_ver += 1
+        self.set_source((prof.get("source") or {}).get("device", ""))
+        self.cmon.set_device(prof.get("carts", {}).get("device", ""))
+
+    def set_monitor(self, on):
+        """Contrôle d'entrée : ouvre (ou ferme) la capture sans rien diffuser."""
+        self.monitor = bool(on)
+        self._cap_kick()
+
+    def set_listen(self, on):
+        """Écoute de l'antenne au casque (carte son du cartoucheur)."""
+        self.listen = bool(on)
+
+    def set_source(self, dev):
+        dev = dev or ""
+        if dev != self.src_dev:
+            self.src_dev = dev
+            self.prof.setdefault("source", {})["device"] = dev
+            self._cap_kick()
+
+    def capture_wanted(self):
+        return self.running and (self.air or self.monitor) and not self.ev.is_set()
+
+    def _cap_kick(self):
+        """Relance (ou ferme) la capture : nouvelle entrée, début / fin d'antenne, contrôle d'entrée."""
+        self.cap_gen += 1
+        self.cap_wake.set()
+        self._cap_kill()
+
+    def _cap_kill(self):
+        p, st = self.cap_proc, self.cap_stream
+        if st is not None:
+            try:
+                st.stop_stream()
+            except Exception:
+                pass
+        if p is not None:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
+            stop_proc(p)
+
+    # --- réglages du secours : relus à chaud (toute modification compte tout de suite, même pendant l'antenne)
+    def fb_params(self):
+        if self._fbp is not None and self._fbp_ver == self.fb_ver:
+            return self._fbp
+        fb = self.prof.get("fallback", {})
+
+        def num(k, d, lo, hi):
+            try:
+                return max(lo, min(hi, float(str(fb.get(k, d)).replace(",", ".").strip() or d)))
+            except (TypeError, ValueError):
+                return d
+        off = set(fb.get("off") or [])
+        files = [f for f in (fb.get("playlist") or []) if f not in off]
+        p = {"enabled": bool(fb.get("enabled")), "thr": num("threshold", -50.0, -90.0, -1.0),
+             "delay": num("silence_s", 10.0, 1.0, 3600.0) * 1000, "rec": num("recover_s", 2.0, 0.2, 600.0) * 1000,
+             "fi": num("fade_in", 0.5, 0.05, 30.0), "fo": num("fade_out", 1.2, 0.05, 30.0),
+             "shuffle": bool(fb.get("shuffle")), "files": files}
+        self._fbp, self._fbp_ver = p, self.fb_ver
+        return p
 
     def output(self, oid):
         return next((o for o in self.outputs if o.cfg["id"] == oid), None)
@@ -979,17 +1128,25 @@ class Engine:
             threading.Thread(target=o.stop, daemon=True).start()
 
     def prof_update(self, section, **kw):
-        """Réglage modifié pendant l'antenne (volume du cartoucheur, fondus du secours, titre…)."""
+        """Réglage modifié à chaud (volume du cartoucheur, secours, titre…) : pris en compte immédiatement."""
         _merge(self.prof.setdefault(section, {}), kw)
+        if section == "fallback":
+            self.fb_ver += 1
+        elif section == "source" and "device" in kw:
+            self.set_source(kw["device"])
+        elif section == "carts" and "device" in kw:
+            self.cmon.set_device(kw["device"] or "")
 
     def swap_output(self, cfg):
         """Ajoute ou remplace une sortie en cours d'antenne (nouveau plateau, adresse modifiée)."""
+        if not self.air:
+            return
         old = self.output(cfg["id"])
         new = make_output(cfg, self)
         self.outputs = [o for o in self.outputs if o is not old] + [new]
         if old:
             old.stop()
-        if self.running and cfg.get("enabled", True):
+        if self.running and self.air and cfg.get("enabled", True):
             new.start()
 
     # --- commandes à chaud
@@ -1016,10 +1173,14 @@ class Engine:
 
     def play_now(self, path):
         """Joue tout de suite ce morceau / cette émission de la playlist de secours."""
+        if not self.air:
+            return
         self.next_file, self.pl_skip, self.pl_active, self.manual = path, True, True, True
         self.log("Lecture choisie : " + os.path.basename(path))
 
     def set_manual(self, on):
+        if not self.air:
+            return
         self.manual = bool(on)
         if not on:
             self.log("Retour manuel au direct demandé.")
@@ -1033,7 +1194,7 @@ class Engine:
     def meta_loop(self):
         while not self.ev.is_set():
             try:
-                text = self.desired_meta()
+                text = self.desired_meta() if self.air else None
             except Exception:
                 text = None
             if text is not None and text != self.meta:
@@ -1071,6 +1232,7 @@ class Engine:
     def count_play(self, f, title=None):
         c = self.counts()
         c[f] = c.get(f, 0) + 1
+        self.counts_ver += 1
         self.history("Secours", title or os.path.splitext(os.path.basename(f))[0], f)
 
     def jingle_loop(self):
@@ -1078,8 +1240,8 @@ class Engine:
         since = None
         while not self.ev.wait(1):
             j = self.prof["fallback"].get("jingle", {})
-            files = [f for f in j.get("files", []) if os.path.exists(f)]
-            if not (j.get("enabled") and files and self.backup):
+            files = [f for f in j.get("files", []) if os.path.exists(f)] if (self.air and self.backup and j.get("enabled")) else []
+            if not (j.get("enabled") and files and self.backup and self.air):
                 since = None
                 continue
             now = time.time()
@@ -1290,10 +1452,14 @@ class Engine:
         except Exception:
             pass
 
-    def pump(self, proc, prefix=""):
+    def pump(self, proc, store):
+        """Lit la sortie d'erreur de ffmpeg (sans l'afficher ligne à ligne : une entrée en panne ne doit pas inonder le journal)."""
         buf = b""
         while True:
-            chunk = proc.stderr.read(1024)
+            try:
+                chunk = proc.stderr.read(1024)
+            except Exception:
+                break
             if not chunk:
                 break
             parts = re.split(rb"[\r\n]+", buf + chunk)
@@ -1301,7 +1467,7 @@ class Engine:
             for p in parts:
                 line = p.decode("utf-8", "replace").strip()
                 if line:
-                    self.log(prefix + line)
+                    store.append(line)
 
     def open_loopback(self, device):
         """Capture du son de l'ordinateur (WASAPI loopback, PyAudioWPatch) ;
@@ -1364,13 +1530,30 @@ class Engine:
             raise
 
     def capture_loop(self):
-        """Lit l'entrée audio (PCM) dans un tampon ; relance si elle disparaît."""
-        device = self.prof["source"]["device"]
+        """Lit l'entrée audio (PCM) dans un tampon, seulement quand elle sert (antenne ou contrôle d'entrée).
+        Changement d'entrée, début ou fin d'antenne : la capture est relancée aussitôt. En cas de panne, nouvel essai
+        toutes les 2 s ; l'état (active / en panne + raison) est visible dans l'interface, le journal n'est pas inondé."""
+        last_log = 0.0
         while not self.ev.is_set():
+            if not self.capture_wanted():
+                self.cap_state, self.cap_err = "off", ""
+                with self.lock:
+                    self.live_buf.clear()
+                self.cap_wake.wait(0.25)
+                self.cap_wake.clear()
+                continue
+            gen, device = self.cap_gen, self.src_dev
             stream = pa_inst = p = None
+            err = deque(maxlen=8)
+            got = 0
+            t0 = time.time()
+            self.cap_state = "starting"
             try:
+                if not device:
+                    raise RuntimeError("aucune entrée choisie")
                 if device.startswith("loopback:"):
                     p, pa_inst, stream = self.open_loopback(device)
+                    self.cap_stream = stream
                 else:
                     p = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error"] +
                               input_args(device) +
@@ -1378,11 +1561,11 @@ class Engine:
                               bufsize=0, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
                 self.cap_proc = p
-                threading.Thread(target=self.pump, args=(p, "Entrée : "), daemon=True).start()
+                threading.Thread(target=self.pump, args=(p, err), daemon=True).start()
                 with self.lock:
                     self.live_buf.clear()
                 carry = b""
-                while True:
+                while gen == self.cap_gen and self.capture_wanted():
                     data = p.stdout.read(CH)
                     if not data:
                         break
@@ -1391,6 +1574,12 @@ class Engine:
                     data, carry = data[:n], data[n:]
                     if not data:
                         continue
+                    got += len(data)
+                    if got > CH * 10 and self.cap_state != "ok":
+                        if self.cap_state == "error" or last_log:
+                            self.log("Entrée audio rétablie : " + dev_short_name(device))
+                            last_log = 0.0
+                        self.cap_state, self.cap_err, self.cap_t = "ok", "", time.time()
                     if self.gain != 1.0:
                         data = scale_pcm(data, self.gain)
                     lv = peak_db(data)  # niveau d'entrée mesuré dès l'arrivée du son
@@ -1400,10 +1589,11 @@ class Engine:
                         self.live_buf += data
                         trim(self.live_buf)
             except ImportError:
-                self.log("Module PyAudioWPatch manquant : installe-le depuis l'onglet SOS.")
+                err.append("module PyAudioWPatch manquant (onglet SOS > Installer)")
             except Exception as e:
-                self.log(f"Capture impossible : {e}")
+                err.append(str(e) or e.__class__.__name__)
             finally:
+                self.cap_stream = None
                 try:
                     if stream:
                         stream.stop_stream()
@@ -1414,21 +1604,38 @@ class Engine:
                     pass
                 if p:
                     stop_proc(p)
+                self.cap_proc = None
             with self.lock:
-                del self.live_buf[len(self.live_buf) // 4 * 4:]
-            if not self.ev.is_set():
-                self.log("Entrée audio indisponible, nouvelle tentative dans 3 s...")
-                self.ev.wait(3)
+                self.live_buf.clear()
+            if self.ev.is_set():
+                break
+            if gen != self.cap_gen or not self.capture_wanted():
+                continue                                   # relance voulue (nouvelle entrée, fin d'antenne…) : pas une panne
+            time.sleep(0.15)                               # laisse ffmpeg écrire sa dernière ligne d'erreur
+            why = next((re.sub(r"^(\[[^\]]*\]\s*)+", "", l) for l in reversed(list(err)) if l and "Error opening input file" not in l), "") or (
+                "l'entrée s'est arrêtée" if got else "entrée introuvable ou occupée par un autre logiciel")
+            self.cap_state, self.cap_err = "error", why[:160]
+            now = time.time()
+            if now - last_log > 60:
+                last_log = now
+                self.log(f"Entrée audio « {dev_short_name(device)} » indisponible : {why[:160]} · nouvel essai automatique toutes les 2 s.")
+            if time.time() - t0 < 2:
+                self.cap_wake.wait(2)
+                self.cap_wake.clear()
 
     # --- playlist de secours
     def playlist_loop(self):
-        """Décode la playlist de secours plus vite que le temps réel (5 s d'avance)."""
-        fb = self.prof["fallback"]
+        """Décode la playlist de secours plus vite que le temps réel (5 s d'avance). Les réglages et la liste des titres
+        sont relus à chaque titre : un ajout ou une modification pendant l'antenne compte tout de suite."""
+        missing = set()
         while not self.ev.is_set():
-            full = list(fb["playlist"])
-            off = set(fb.get("off", []))
-            files = [x for x in full if x not in off]
-            if not (self.pl_active and files):
+            fb = self.prof.get("fallback", {})
+            full = list(fb.get("playlist") or [])
+            off = set(fb.get("off") or [])
+            files = [x for x in full if x not in off and x not in missing]
+            if not (self.air and self.pl_active and files):
+                if not self.pl_active:
+                    missing.clear()                       # un fichier revenu (clé USB rebranchée) sera réessayé
                 self.ev.wait(0.1)
                 continue
             if self.next_file and self.next_file in full:  # morceau / émission choisi(e)
@@ -1440,7 +1647,11 @@ class Engine:
                         self.pl_in = self.pl_out = 0
                         self.pl_skip = False
             else:
-                f = self.least_played(files, fb["shuffle"])  # les moins lus d'abord
+                f = self.least_played(files, fb.get("shuffle"))  # les moins lus d'abord
+            if not os.path.isfile(f):
+                missing.add(f)
+                self.log(f"Playlist de secours : fichier introuvable, ignoré : {f}")
+                continue
             title, dur = track_info(f)
             self.count_play(f, title)
             got, p, err = False, None, deque(maxlen=10)
@@ -1454,7 +1665,7 @@ class Engine:
                 threading.Thread(target=self.drain, args=(p, err), daemon=True).start()
                 with self.lock:
                     self.pl_marks.append((self.pl_in, title, full.index(f), f, dur))
-                while self.pl_active and not self.ev.is_set() and not self.pl_skip:
+                while self.air and self.pl_active and not self.ev.is_set() and not self.pl_skip:
                     if len(self.pl_buf) > 250 * CH:
                         self.ev.wait(0.02)
                         continue
@@ -1474,48 +1685,31 @@ class Engine:
                     del self.pl_buf[len(self.pl_buf) - cut:]
                     self.pl_in -= cut
                 skipped, self.pl_skip = self.pl_skip, False
-                if skipped or not self.pl_active:
+                if skipped or not self.pl_active or not self.air:
                     self.pl_buf.clear()
                     self.pl_marks.clear()
                     self.pl_in = self.pl_out = 0
-                if not self.pl_active:
+                if not self.pl_active or not self.air:
                     self.track, self.pl_cur = "", None
             if not got and not skipped:
-                if self.pl_active and not self.ev.is_set():
+                if self.pl_active and self.air and not self.ev.is_set():
+                    missing.add(f)
                     self.log(f"Lecture impossible : {os.path.basename(f)} "
-                             + " ".join(list(err)[-2:]))
-                self.ev.wait(1)
+                             + " ".join(list(err)[-2:]) + " · titre suivant.")
+                self.ev.wait(0.3)
 
-    # --- horloge de diffusion
+    # --- horloge du moteur
     def feeder_loop(self):
-        """Détecte le signal, choisit direct ou secours avec un fondu enchaîné,
-        applique cartouches / mute / retard, puis distribue un bloc de 20 ms aux sorties."""
-        fb = self.prof["fallback"]
-        try:
-            thr = float(fb["threshold"])
-            delay = float(fb["silence_s"]) * 1000
-            rec = float(fb["recover_s"]) * 1000
-        except ValueError:
-            thr, delay, rec = -50.0, 10000.0, 2000.0
-        use_pl = bool(fb["playlist"])  # le secours manuel marche même sans bascule automatique
-        self.rec_ms = rec
-        if not self.standalone:
-            self.log(f"Bascule automatique activée : seuil {thr:g} dB, délai {delay / 1000:g} s, "
-                     f"{len(fb['playlist'])} fichier(s)." if (use_pl and fb["enabled"]) else
-                     "Bascule automatique désactivée.")
-        idle = 0.0
+        """Toutes les 20 ms : prend l'entrée, détecte le silence, choisit direct ou secours avec un fondu enchaîné,
+        ajoute les cartouches, applique mute / retard, puis distribue le bloc aux flux (pendant l'antenne) et au casque.
+        Les réglages du secours (seuil, délais, fondus, marche/arrêt) sont relus à chaque bloc."""
         zero = bytes(CH)
         starved = live_ok = False
         g, phase = 0.0, 0.0  # g : 0 = direct, 1 = playlist de secours
-        def fade_steps():
-            try:
-                fi = max(0.05, min(30.0, float(str(fb.get("fade_in", "0.5")).replace(",", "."))))
-                fo = max(0.05, min(30.0, float(str(fb.get("fade_out", "1.2")).replace(",", "."))))
-            except ValueError:
-                fi, fo = 0.5, 1.2
-            return 0.02 / fi, 0.02 / fo
-        step_in, step_out = fade_steps()  # fondu réglable (par défaut 0,5 s vers secours, 1,2 s retour)
-        nfade = 0
+        loud_run = quiet_run = 0
+        by_hand = False                         # la playlist en cours a été lancée à la main
+        was_air = False
+        empty_warned = False
         nxt = time.perf_counter()
         while not self.ev.is_set():
             nxt += 0.02
@@ -1530,7 +1724,14 @@ class Engine:
                 if wait < -0.08:                  # un vrai trou (80 ms et plus), pas une simple gigue
                     self.late_hist = [x for x in self.late_hist if self.late_t - x < 30] + [self.late_t]
             t0 = time.perf_counter()
+            p = self.fb_params()
+            air = self.air
+            if air != was_air:                      # début / fin d'antenne : on repart du direct, compteurs à zéro
+                was_air = air
+                g, starved, loud_run, quiet_run, empty_warned, by_hand = 0.0, False, 0, 0, False, False
+            self.rec_ms = p["rec"]
             live, pl = zero, zero
+            cap = self.capture_wanted()
             with self.lock:
                 if not live_ok and len(self.live_buf) >= 4 * CH:
                     live_ok = True  # réserve de 80 ms contre les irrégularités de capture
@@ -1540,7 +1741,7 @@ class Engine:
                         del self.live_buf[:CH]
                     else:
                         live_ok = False
-                if self.backup or g > 0:
+                if air and (self.backup or g > 0):
                     if len(self.pl_buf) >= CH * (10 if starved else 1):
                         pl = bytes(self.pl_buf[:CH])
                         del self.pl_buf[:CH]
@@ -1552,69 +1753,106 @@ class Engine:
                             self.pl_cur = {"i": m[2], "path": m[3], "start": m[0], "dur": m[4]}
                     else:
                         starved = True  # attend 200 ms d'avance avant de reprendre
-            if self.tone:
+            if self.tone and air:
                 live, phase = tone_block(phase)
-            lv = peak_db(live)
-            if max(lv) > thr:
-                self.silent_ms = 0
-                self.loud_ms += 20
+            # --- détection du signal (seulement quand l'entrée est ouverte)
+            if cap:
+                lv = peak_db(live)
+                if max(lv) > p["thr"]:
+                    loud_run += 1
+                    quiet_run = 0
+                    if loud_run >= 3:               # un vrai retour du son (60 ms), pas un simple clic
+                        self.silent_ms = 0
+                    self.loud_ms += 20
+                else:
+                    quiet_run += 1
+                    loud_run = 0
+                    self.silent_ms += 20
+                    if quiet_run >= 25:             # 0,5 s de silence : le retour au direct repart de zéro
+                        self.loud_ms = 0
             else:
-                self.silent_ms += 20
-                if self.silent_ms >= max(delay, 1000):
-                    self.loud_ms = 0
-            if use_pl:
+                self.silent_ms = self.loud_ms = 0
+            # --- bascule direct / secours (antenne seulement)
+            if air:
+                has = bool(p["files"])
+                if self.manual:
+                    by_hand = True
                 if self.manual and not self.backup:
+                    if has:
+                        self.backup = True
+                        self.log("Bascule manuelle sur la playlist de secours.")
+                    else:
+                        self.manual = False
+                        self.log("Playlist de secours vide : rien à lancer.")
+                elif self.backup and not self.manual and by_hand:   # fin du lancement manuel
+                    by_hand = False
+                    if p["enabled"] and has and self.silent_ms >= p["delay"]:
+                        self.log("Toujours pas de son en entrée : la playlist de secours continue (retour automatique dès que le son revient).")
+                    else:
+                        self.backup = False
+                elif (p["enabled"] and has and not self.manual and not self.backup and self.silent_ms >= p["delay"]):
                     self.backup = True
-                    self.log("Bascule manuelle sur la playlist de secours.")
-                elif fb["enabled"] and not self.manual and not self.backup and self.silent_ms >= delay:
-                    self.backup = True
-                    msg = (f"Aucun signal depuis {delay / 1000:g} s : "
-                           "bascule sur la playlist de secours.")
+                    msg = f"Aucun signal depuis {p['delay'] / 1000:g} s : la playlist de secours prend le relais."
                     self.log(msg)
                     self.alert(msg, "fallback")
-                elif self.backup and not self.manual and self.loud_ms >= rec:
+                elif self.backup and not self.manual and (self.loud_ms >= p["rec"] or not p["enabled"] or not has):
                     self.backup = False
-                    self.log("Signal retrouvé : retour au direct (fondu).")
-                    self.alert("Signal retrouvé : retour au direct.", "fallback-back")
-                self.pl_active = (self.backup or self.manual or g > 0 or
-                                  (fb["enabled"] and self.silent_ms >= max(delay * 0.3, delay - 3000)))
-            nfade += 1
-            if nfade % 50 == 0:
-                step_in, step_out = fade_steps()
-            target = 1.0 if self.backup else 0.0
+                    if not has:
+                        self.log("Playlist de secours vidée : retour au direct.")
+                    elif not p["enabled"]:
+                        self.log("Playlist de secours désactivée : retour au direct.")
+                    else:
+                        self.log("Signal retrouvé : retour au direct (fondu).")
+                        self.alert("Signal retrouvé : retour au direct.", "fallback-back")
+                if p["enabled"] and not has and self.silent_ms >= p["delay"] and not empty_warned:
+                    empty_warned = True
+                    self.log("⚠ Silence à l'antenne, mais la playlist de secours est vide : rien ne peut prendre le relais.")
+                elif self.silent_ms < p["delay"]:
+                    empty_warned = False
+                self.pl_active = has and (self.backup or self.manual or g > 0 or
+                                          (p["enabled"] and self.silent_ms >= max(p["delay"] * 0.3, p["delay"] - 3000)))
+            else:
+                self.backup = self.manual = self.pl_active = False
+            target = 1.0 if (air and self.backup) else 0.0
             g0 = g
             if g < target:
-                g = min(target, g + step_in)
+                g = min(target, g + 0.02 / p["fi"])
             elif g > target:
-                g = max(target, g - step_out)
+                g = max(target, g - 0.02 / p["fo"])
             self.mix_g = g
             if g0 == 0.0 and g == 0.0:
-                prog = live
+                prog = live if air else zero      # hors antenne : rien ne part, seules les cartouches jouent (casque)
             elif g0 == 1.0 and g == 1.0:
                 prog = pl
             else:
                 prog = mix_blocks(live, pl, g0, g)
-            prog = self.apply_carts(prog, zero)
-            if self.mute:
+            prog, pre = self.apply_carts(prog, zero)
+            if self.mute and air:
                 prog = zero
             dq = self.delay_q
-            dq.append(prog)
-            n = self.delay_blocks
-            while len(dq) > n + 1:
-                dq.popleft()
-            out = dq.popleft() if len(dq) > n else zero
+            if air:
+                dq.append(prog)
+                n = self.delay_blocks
+                while len(dq) > n + 1:
+                    dq.popleft()
+                out = dq.popleft() if len(dq) > n else zero
+            else:
+                out = prog
             lv = peak_db(out)
             if max(lv) > -0.3:
                 self.clip_t = time.time()
             for ch in (0, 1):
                 self.peak[ch] = max(self.peak[ch], lv[ch])
-            self.distribute(out)
+            if air:
+                self.distribute(out)
+            if self.cmon.stream:                   # casque : antenne écoutée (si demandé) + pré-écoute des cartouches
+                parts = []
+                if self.listen and air:
+                    parts.append(np.frombuffer(out, dtype="<i2").astype(np.float32) if np is not None else array("h", out))
+                parts += pre
+                if parts:
+                    self.cmon.push(self.clip_mix(parts))
             self.proc_ms += ((time.perf_counter() - t0) * 1000 - self.proc_ms) * 0.05
-            if self.standalone:  # cartoucheur hors antenne : s'éteint après 2 min sans lecture
-                idle = 0.0 if self.voices else idle + 0.02
-                if idle > 120:
-                    self.stop()
-                    return
 
     @staticmethod
     def clip_mix(parts):
@@ -1633,6 +1871,7 @@ class Engine:
             voices = list(self.voices)
         duck = 1.0
         air, dev = [], []
+        listen = self.listen and self.air
         master = self.cart_master()
         for v in voices:
             if v.get("paused") and v["g"] <= 0.0:
@@ -1671,7 +1910,8 @@ class Engine:
             except Exception:
                 pk = 0.0
             v["pk"] = max(pk, v.get("pk", 0.0) * 0.8)
-            dev.append(sc)
+            if not (listen and v["pre"] is False):
+                dev.append(sc)                   # casque : toutes les tuiles, ou seulement la pré-écoute si on écoute l'antenne
             if not v["pre"]:
                 air.append(sc)
                 if v["mode"] == "Remplace":
@@ -1685,17 +1925,15 @@ class Engine:
                 with self.lock:
                     if v in self.voices:
                         self.voices.remove(v)
-        if dev and self.cmon.stream:
-            self.cmon.push(self.clip_mix(dev))
         g0 = self.duck_g
         step = 0.02 / (0.15 if duck < g0 else 0.6)
         g = max(duck, g0 - step) if duck < g0 else min(duck, g0 + step)
         self.duck_g = g
         if not air and g0 == 1.0 and g == 1.0:
-            return prog
+            return prog, dev
         if not air:
-            return gain_mix(prog, zero, g0, g)
-        return gain_mix(prog, self.clip_mix(air), g0, g)
+            return gain_mix(prog, zero, g0, g), dev
+        return gain_mix(prog, self.clip_mix(air), g0, g), dev
 
     def duck_amount(self):
         try:
@@ -2544,6 +2782,7 @@ class EngineWorker:
     def __init__(self, conn):
         self.conn, self.eng, self.out_q = conn, None, queue.Queue()
         self.cfg_sig, self.done = None, threading.Event()
+        self.counts_sent = 0
         self.ps = None
         try:
             import psutil
@@ -2568,7 +2807,12 @@ class EngineWorker:
         if sig != self.cfg_sig:                    # configuration des sorties : envoyée seulement quand elle change
             self.cfg_sig = sig
             self.out_q.put(("outcfg", [json.loads(json.dumps(o.cfg)) for o in outs]))
+        if e.counts_ver != self.counts_sent:       # nombre de lectures des titres du secours (affiché dans la liste)
+            self.counts_sent = e.counts_ver
+            self.out_q.put(("counts", dict(e.counts())))
         return {"t": time.time(), "running": e.running, "started": e.started, "backup": e.backup, "manual": e.manual,
+                "air": e.air, "monitor": e.monitor, "listen": e.listen, "cap_state": e.cap_state, "cap_err": e.cap_err,
+                "src_dev": e.src_dev,
                 "mute": e.mute, "tone": e.tone, "silent_ms": e.silent_ms, "loud_ms": e.loud_ms, "rec_ms": e.rec_ms,
                 "track": e.track, "meta": e.meta, "meta_manual": e.meta_manual, "pl_cur": dict(e.pl_cur) if e.pl_cur else None,
                 "pl_out": e.pl_out, "in_peak": pin, "peak": pout, "clip_t": e.clip_t, "proc_ms": e.proc_ms, "late": e.late,
@@ -2580,7 +2824,9 @@ class EngineWorker:
         """Seul fil qui écrit vers l'interface (une connexion ne supporte pas deux écritures simultanées)."""
         nxt = time.perf_counter()
         while not self.done.is_set():
-            nxt += SNAP_S
+            e = self.eng
+            busy = e is None or e.air or e.monitor or bool(e.voices) or bool(e.loading)
+            nxt += SNAP_S if busy else 0.1            # au repos (rien ne joue) : 10 états par seconde suffisent
             d = nxt - time.perf_counter()
             if d > 0:
                 time.sleep(d)
@@ -2611,7 +2857,7 @@ class EngineWorker:
         if k == "start":
             _, prof, standalone, alerts, fx = m
             FX.update(fx)
-            self.eng = Engine(prof, self.log, self.alert if alerts else None, standalone)
+            self.eng = Engine(prof, self.log, self.alert if alerts else None)
             self.eng.start()
         elif e is None:
             return
@@ -2622,7 +2868,7 @@ class EngineWorker:
         elif k == "set":
             setattr(e, m[1], m[2])
         elif k == "prof":
-            _merge(e.prof.setdefault(m[1], {}), m[2])
+            e.prof_update(m[1], **m[2])
         elif k == "out":
             o = e.output(m[1])
             if o:
@@ -2669,6 +2915,7 @@ def _engine_worker_main():
             import ctypes
             ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
             ctypes.windll.winmm.timeBeginPeriod(1)  # blocs de 20 ms réguliers (pas de 15,6 ms par défaut sous Windows)
+            globals()["_ENGINE_MUTEX"] = ctypes.windll.kernel32.CreateMutexW(None, False, "BevRadioEngine")  # vu par l'installateur
         except Exception:
             pass
     try:
@@ -2689,6 +2936,75 @@ def _engine_worker_main():
 
 if WORKER_ARG in sys.argv and __name__ in ("__main__", "__mp_main__"):
     _engine_worker_main()
+
+
+def clean_env(splash=True, reset=True):
+    """Environnement propre pour relancer Bev (ou son moteur). Une application PyInstaller « un seul fichier » transmet sinon
+    à l'enfant le dossier temporaire où elle s'est décompressée, effacé à sa fermeture : l'application relancée plantait
+    (bug du redémarrage après un réglage d'Apparence)."""
+    env = dict(os.environ)
+    if not splash:
+        env.pop("QT_QPA_PLATFORM", None)
+    if reset:                                   # (le moteur, lui, réutilise le dossier de l'application qui le lance)
+        for k in list(env):
+            if k.startswith("_PYI_") or k == "_MEIPASS2":
+                env.pop(k, None)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    if not splash:
+        env["PYINSTALLER_SUPPRESS_SPLASH_SCREEN"] = "1"
+    return env
+
+
+def relaunch_self():
+    """Relance l'application (après un réglage d'Apparence, une réinitialisation…) : la nouvelle fenêtre attend que
+    l'ancienne soit complètement fermée avant de s'ouvrir (--after <pid>)."""
+    args, skip = [], False
+    for a in (sys.argv[1:] if getattr(sys, "frozen", False) or "__compiled__" in globals() else sys.argv[1:]):
+        if skip:
+            skip = False
+            continue
+        if a == "--after":
+            skip = True
+            continue
+        if a in ("--selftest", WORKER_ARG):
+            continue
+        args.append(a)
+    base = [sys.executable] if (getattr(sys, "frozen", False) or "__compiled__" in globals()) else [sys.executable, os.path.abspath(sys.argv[0])]
+    kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {"start_new_session": True}
+    subprocess.Popen(base + args + ["--after", str(os.getpid())], env=clean_env(True), close_fds=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+def wait_pid_gone(pid, timeout=20.0):
+    """Attend la fin d'un processus (l'ancienne fenêtre lors d'un redémarrage, l'application lors d'une mise à jour)."""
+    t0 = time.time()
+    try:
+        import psutil
+        try:
+            psutil.Process(pid).wait(timeout)
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            pass
+        return
+    except ImportError:
+        pass
+    while time.time() - t0 < timeout:
+        try:
+            if SYS == "Windows":
+                import ctypes
+                h = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+                if not h:
+                    return
+                r = ctypes.windll.kernel32.WaitForSingleObject(h, 250)
+                ctypes.windll.kernel32.CloseHandle(h)
+                if r == 0:
+                    return
+            else:
+                os.kill(pid, 0)
+                time.sleep(0.2)
+        except Exception:
+            return
 
 
 def worker_cmd():
@@ -2715,8 +3031,7 @@ class WorkerSlot:
             from multiprocessing.connection import Listener
             key = os.urandom(16)
             lst = Listener(authkey=key)
-            env = dict(os.environ)
-            env.pop("QT_QPA_PLATFORM", None)
+            env = clean_env(splash=False, reset=False)   # pas d'écran de démarrage pour le moteur (processus invisible)
             try:
                 log = open(os.path.join(os.path.expanduser("~"), ".bev_moteur.log"), "ab")
             except OSError:
@@ -2819,7 +3134,7 @@ class EngineProxy:
     """Le moteur vu depuis l'interface : mêmes attributs et mêmes commandes qu'Engine, mais le travail se fait dans le
     processus moteur. Les valeurs changées ici (coupure, tonalité…) sont prises en compte tout de suite à l'écran."""
     SETTABLE = ("tone", "mute", "meta_manual", "manual")
-    HOLD = 0.6
+    HOLD = 0.8
 
     def __init__(self, slot, prof, log, alert=None, standalone=False, on_dead=None):
         d = self.__dict__
@@ -2829,11 +3144,15 @@ class EngineProxy:
         d["_hold"], d["_hold_out"], d["_pred_load"] = {}, {}, {}
         d["_stopping"], d["_fx"] = False, None
         d["cmon"] = _CmonProxy(self)
-        d["outputs"] = [_OutProxy(self, c) for c in prof.get("outputs", [])]
+        d["outputs"] = []
+        d["counts_in"] = None
+        d["_fbp"], d["_fbp_ver"], d["fb_ver"] = None, -1, 0
         d["_s"] = {"t": time.time(), "running": True, "started": time.time(), "backup": False, "manual": False, "mute": False,
                    "tone": False, "silent_ms": 0, "loud_ms": 0, "rec_ms": 2000.0, "track": "", "meta": "",
                    "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
-                   "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": []}
+                   "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": [],
+                   "air": False, "monitor": False, "listen": False, "cap_state": "off", "cap_err": "",
+                   "src_dev": (prof.get("source") or {}).get("device", "")}
         d["in_peak"], d["peak"] = [-90.0, -90.0], [-90.0, -90.0]
         d["pid"] = slot.pid
 
@@ -2891,6 +3210,8 @@ class EngineProxy:
                         self.alert(m[1], m[2])
                 elif k == "outcfg":
                     self._outcfg(m[1])
+                elif k == "counts":
+                    self.__dict__["counts_in"] = m[1]
             except Exception:
                 pass
         s = self._s
@@ -2943,11 +3264,58 @@ class EngineProxy:
 
     def start(self):
         self.__dict__["_fx"] = json.loads(json.dumps(FX))
-        for o in self.outputs:
-            if o.cfg.get("enabled", True):
-                o.state = "connecting"
-        self._raw_send(("start", self.prof, self.standalone, self.alert is not None, self._fx))
+        self._raw_send(("start", self.prof, False, True, self._fx))
         threading.Thread(target=self._reader, daemon=True).start()
+
+    def _hold_set(self, k, v):
+        self._hold[k] = (v, time.time())
+        self._s[k] = v
+
+    def set_air(self, on, prof=None):
+        """Antenne marche / arrêt : l'écran change tout de suite, le moteur suit (sans couper les cartouches)."""
+        on = bool(on)
+        with self._lk:
+            if on:
+                if prof is not None:
+                    self.__dict__["prof"] = prof
+                outs = []
+                for c in self.prof.get("outputs", []):
+                    o = _OutProxy(self, c)
+                    if c.get("enabled", True):
+                        o.state = "connecting"
+                        self._hold_out[c.get("id")] = time.time()
+                    outs.append(o)
+                self.__dict__["outputs"] = outs
+                for k, v in (("started", time.time()), ("backup", False), ("manual", False), ("mute", False), ("tone", False),
+                             ("silent_ms", 0), ("loud_ms", 0), ("track", ""), ("pl_cur", None)):
+                    self._s[k] = v
+            else:
+                self.__dict__["outputs"] = []
+                for k in ("backup", "manual", "mute", "tone"):
+                    self._hold_set(k, False)
+            self._hold_set("air", on)
+        self._call("set_air", on, prof if on else None)
+
+    def set_monitor(self, on):
+        self._hold_set("monitor", bool(on))
+        self._call("set_monitor", bool(on))
+
+    def set_listen(self, on):
+        self._hold_set("listen", bool(on))
+        self._call("set_listen", bool(on))
+
+    def set_source(self, dev):
+        self._hold_set("src_dev", dev or "")
+        self.prof.setdefault("source", {})["device"] = dev or ""
+        self._call("set_source", dev or "")
+
+    def set_prof(self, prof):
+        self.__dict__["prof"] = prof
+        self._hold_set("src_dev", (prof.get("source") or {}).get("device", ""))
+        self._call("set_prof", prof)
+
+    def fb_params(self):
+        return Engine.fb_params(self)
 
     def stop(self):
         self.__dict__["_stopping"] = True
@@ -2988,6 +3356,8 @@ class EngineProxy:
 
     def prof_update(self, section, **kw):
         _merge(self.prof.setdefault(section, {}), kw)
+        if section == "fallback":
+            self.__dict__["fb_ver"] = self.fb_ver + 1
         self._send(("prof", section, kw))
 
     def slow_now(self):
@@ -3532,6 +3902,103 @@ class Flow(QLayout):
                 it.setGeometry(QRect(r.x() + g + (k % cols) * (tw + g), r.y() + g + (k // cols) * (th + g), tw, th))
         rows = (len(self.items) + cols - 1) // cols
         return g + rows * (th + g)
+
+
+class WrapRow(QLayout):
+    """Rangée de boutons qui passe à la ligne quand la fenêtre est étroite (écran vertical) au lieu de couper les boutons.
+    S'utilise comme un QHBoxLayout : addWidget, addStretch (l'espace libre se place là quand tout tient sur une ligne),
+    addSpacing, setSpacing."""
+
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self.items, self.sp, self.stretch_at, self.vsp = [], spacing, None, 6
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, it):
+        self.items.append(it)
+
+    def addWidget(self, w, stretch=0, alignment=None):
+        super().addWidget(w)
+
+    def addStretch(self, s=1):
+        if self.stretch_at is None:
+            self.stretch_at = len(self.items)
+
+    def addSpacing(self, px):
+        from PySide6.QtWidgets import QSpacerItem
+        self.items.append(QSpacerItem(int(px), 1))
+
+    def setSpacing(self, s):
+        self.sp = s
+
+    def spacing(self):
+        return self.sp
+
+    def count(self):
+        return len(self.items)
+
+    def itemAt(self, i):
+        return self.items[i] if 0 <= i < len(self.items) else None
+
+    def takeAt(self, i):
+        return self.items.pop(i) if 0 <= i < len(self.items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._lay(QRect(0, 0, w, 0), True)
+
+    def _vis(self):
+        return [it for it in self.items if not (it.widget() is not None and it.widget().isHidden())]
+
+    def sizeHint(self):
+        v = self._vis()
+        w = sum(it.sizeHint().width() for it in v) + self.sp * max(0, len(v) - 1)
+        h = max([it.sizeHint().height() for it in v] or [0])
+        return QSize(w, h)
+
+    def minimumSize(self):
+        v = self._vis()
+        return QSize(max([it.minimumSize().width() for it in v] or [0]), max([it.sizeHint().height() for it in v] or [0]))
+
+    def setGeometry(self, r):
+        super().setGeometry(r)
+        self._lay(r, False)
+
+    def _lay(self, r, test):
+        v = self._vis()
+        if not v:
+            return 0
+        sizes = [it.sizeHint() for it in v]
+        lines, cur, cw = [], [], 0
+        for it, sz in zip(v, sizes):
+            w = sz.width()
+            if cur and cw + self.sp + w > r.width():
+                lines.append(cur)
+                cur, cw = [], 0
+            cw += (self.sp if cur else 0) + w
+            cur.append((it, sz))
+        lines.append(cur)
+        y = r.y()
+        for ln in lines:
+            lh = max(sz.height() for _, sz in ln)
+            used = sum(sz.width() for _, sz in ln) + self.sp * (len(ln) - 1)
+            extra = max(0, r.width() - used) if (len(lines) == 1 and self.stretch_at is not None) else 0
+            x = r.x()
+            for it, sz in ln:
+                idx = self.items.index(it)
+                if extra and idx >= self.stretch_at:
+                    x += extra
+                    extra = 0
+                if not test:
+                    it.setGeometry(QRect(int(x), int(y + (lh - sz.height()) / 2), sz.width(), sz.height()))
+                x += sz.width() + self.sp
+            y += lh + self.vsp
+        return y - r.y() - self.vsp
 
 
 class WaveLoader(QObject):
@@ -5072,9 +5539,11 @@ class Rail(NavBase):
               ("sec", "Contrôle"), ("mon", "Monitoring"), ("net", "Réseau"), ("sos", "SOS"),
               ("sec", "Application"), ("set", "Réglages"), ("about", "À propos"))
     W, RH = 214, 40
+    W_COMPACT = 72
 
     def __init__(self):
         super().__init__()
+        self.compact = False
         self.setFixedWidth(self.W)
         self.pos = {}
         y = 84
@@ -5104,8 +5573,25 @@ class Rail(NavBase):
         self.gael = GaelView("rail", self)
         self.gael.hide()
 
+    def set_compact(self, on):
+        """Fenêtre étroite (écran vertical) : menu réduit aux icônes (le nom de l'onglet s'affiche au survol)."""
+        on = bool(on)
+        if on == self.compact:
+            return
+        self.compact = on
+        self.W = self.W_COMPACT if on else Rail.W
+        self.setFixedWidth(self.W)
+        self._it_sig = None
+        self.resizeEvent(None)
+        self.update()
+
     def resizeEvent(self, e):
         H = self.height()
+        if self.compact:
+            if self.sea:
+                self.sea.hide()
+            self.gael.hide()
+            return
         sea = bool(self.sea) and H >= 695
         if self.sea:
             self.sea.move(0, H - 120)
@@ -5149,7 +5635,15 @@ class Rail(NavBase):
                 return k
 
     def mouseMoveEvent(self, e):
-        self.set_hover(self.key_at(e.position().y()))
+        k = self.key_at(e.position().y())
+        self.set_hover(k)
+        if self.compact:
+            from PySide6.QtWidgets import QToolTip
+            lbl = dict((kk, ll) for kk, ll in self.LAYOUT if kk != "sec").get(k)
+            if lbl:
+                QToolTip.showText(e.globalPosition().toPoint(), lbl, self)
+            else:
+                QToolTip.hideText()
 
     def mouseReleaseEvent(self, e):
         x, y = e.position().x(), e.position().y()
@@ -5192,7 +5686,7 @@ class Rail(NavBase):
             # pour la respiration des ondes
             if self.air and ANIM and t - getattr(self, "_logo_t", 0.0) >= .029:
                 self._logo_t = t
-                self.update(QRect(14, 20, 50, 50))
+                self.update(QRect(int(self.W / 2) - 25 if self.compact else 14, 20, 50, 50))
             return False
         if self.gael.isVisible():
             g = self.gael.geometry()
@@ -5218,6 +5712,11 @@ class Rail(NavBase):
         sf.setBold(True)
         for k, lab in self.LAYOUT:
             if k == "sec":
+                if self.compact:                            # menu réduit : un simple trait entre les groupes
+                    y = self.pos[("sec", lab)]
+                    p.setPen(QPen(QColor(SECT_C), 1))
+                    p.drawLine(QPointF(22, y + 8), QPointF(w - 22, y + 8))
+                    continue
                 p.setFont(sf)
                 p.setPen(QColor(SECT_C))
                 y = self.pos[("sec", lab)]
@@ -5228,9 +5727,17 @@ class Rail(NavBase):
             if hv:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(HOVER_C))
-                p.drawRoundedRect(QRectF(12, y, w - 24, self.RH), 14, 14)
+                p.drawRoundedRect(QRectF(10 if self.compact else 12, y, w - (20 if self.compact else 24), self.RH), 14, 14)
             hu = HUE.get(k, ACC) if PSYCHE else ACC
             col = hu if on else (mixc(ICON_C, hu, .65) if hv else ICON_C)
+            if self.compact:
+                draw_icon(p, k, w / 2, y + self.RH / 2, col)
+                bc = self.badges.get(k)
+                if bc:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(bc))
+                    p.drawEllipse(QPointF(w / 2 + 13, y + 9), 4, 4)
+                continue
             draw_icon(p, k, 38 + (2 if hv else 0), y + self.RH / 2, col)
             lf = QFont(self.font())
             lf.setPointSizeF(10.5)
@@ -5290,9 +5797,10 @@ class Rail(NavBase):
             p.drawPixmap(QRectF(er), self._bg_pm, QRectF(er.x() * dpr, er.y() * dpr, er.width() * dpr, er.height() * dpr))
         else:
             p.fillRect(er, QColor(RAIL))
-        if er.intersects(QRect(14, 20, 50, 50)):       # le logo n'est dessiné que si sa zone est à repeindre
-            draw_logo_fast(p, 38, 42, 19, self.ang if self.air else 0.0)
-        if er.top() < 70:
+        lx = w / 2 if self.compact else 38
+        if er.intersects(QRect(int(lx) - 24, 20, 50, 50)):       # le logo n'est dessiné que si sa zone est à repeindre
+            draw_logo_fast(p, lx, 42, 19, self.ang if self.air else 0.0)
+        if er.top() < 70 and not self.compact:
             f = QFont(self.font())
             f.setPointSizeF(12.5)
             f.setBold(True)
@@ -5308,7 +5816,7 @@ class Rail(NavBase):
             p.setFont(f2)
             p.setPen(QColor(MUT))
             p.drawText(QRectF(66, 46, w - 74, 16), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "BROADCAST TOOL")
-        if not OCEAN and not PHARE and H > 60 and not self.gael.isVisible():
+        if not OCEAN and not PHARE and H > 60 and not self.gael.isVisible() and not self.compact:
             for x, y, a in self.erm:
                 draw_ermine(p, x, H - y, mixc(RAIL, TXT, a), .95)
         now = time.time()
@@ -5324,7 +5832,7 @@ class Rail(NavBase):
         if er.top() >= self.items_bottom + 4:
             return
         hue = HUE.get(self.active, ACC) if PSYCHE else ACC
-        r = QRectF(12, self.ind_y, w - 24, self.RH)
+        r = QRectF(10, self.ind_y, w - 20, self.RH) if self.compact else QRectF(12, self.ind_y, w - 24, self.RH)
         if PSYCHE:
             soft_pill(p, r, mixc(RAIL, hue, .26), mixc(RAIL, hue, .08), 14)
         else:
@@ -7048,7 +7556,9 @@ class Alerts:
     def cfg(self):
         return self.app.data["alerts"]
 
-    def send(self, text, key=None, force=False, urgent=False):
+    def send(self, text, key=None, force=False, urgent=False, sound=False):
+        """Alerte : journal + message / mail / SMS selon les réglages. Le bip est réservé aux vraies pannes (sound=True) :
+        une reconnexion, une bascule automatique sur le secours ou un retour à la normale ne bipent pas."""
         c = self.cfg()
         if key and not force:
             if time.time() - self.last.get(key, 0) < 120:
@@ -7060,7 +7570,7 @@ class Alerts:
         if key:
             self.last[key] = time.time()
         self.app.log("" + text)
-        if c.get("sound", True):
+        if sound and c.get("sound", True):
             self.app.ui(self.beep)
         url = (c.get("url") or "").strip()
         if url:
@@ -7084,7 +7594,12 @@ class Alerts:
         return out
 
     def beep(self):
-        """Bip d'alerte joué en arrière-plan (winsound.Beep bloquait l'interface 0,3 s à chaque alerte)."""
+        """Bip d'alerte joué en arrière-plan (winsound.Beep bloquait l'interface 0,3 s à chaque alerte).
+        Jamais plus d'un bip toutes les 20 s, même si plusieurs pannes arrivent en même temps."""
+        now = time.time()
+        if now - getattr(self, "_last_beep", 0.0) < 20:
+            return
+        self._last_beep = now
         if SYS == "Windows":
             def b():
                 try:
@@ -7317,7 +7832,7 @@ Problèmes fréquents
 """
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
 
 
@@ -7325,6 +7840,11 @@ def parse_ver(s):
     """'v1.2.3-beta' -> (1, 2, 3) ; comparaison de versions."""
     nums = re.findall(r"\d+", str(s).split("-")[0])[:4]
     return tuple(int(n) for n in nums) or (0,)
+
+
+def installed_copy():
+    """Bev installé par l'installateur Windows (désinstalleur présent à côté de l'exécutable) : mise à jour automatique possible."""
+    return bool(getattr(sys, "frozen", False)) and os.path.isfile(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
 
 
 def check_update(repo, timeout=10):
@@ -7350,8 +7870,12 @@ def check_update(repo, timeout=10):
                 return {"error": "Aucune version n'est publiée sur ce dépôt (ou le dépôt est privé : il doit être public). Crée une Release GitHub pour que les mises à jour soient détectées."}
             js = lst[0]
         exts = (".exe",) if SYS == "Windows" else ((".dmg", ".zip") if SYS == "Darwin" else ())
-        asset = next((a.get("browser_download_url") for a in js.get("assets", []) if str(a.get("name", "")).lower().endswith(exts)), "") if exts else ""
-        return {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(), "asset": asset}
+        assets = [a for a in js.get("assets", []) if exts and str(a.get("name", "")).lower().endswith(exts)]
+        assets.sort(key=lambda a: "setup" not in str(a.get("name", "")).lower())     # l'installateur d'abord
+        a = assets[0] if assets else {}
+        return {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(),
+                "asset": a.get("browser_download_url", ""), "asset_name": a.get("name", ""), "size": int(a.get("size") or 0),
+                "digest": str(a.get("digest") or "")}
     except urllib.error.HTTPError as ex:
         if ex.code == 404:
             return {"error": f"Dépôt « {repo} » introuvable. Vérifie son nom, et qu'il est public."}
@@ -7402,7 +7926,9 @@ class AssistantKB:
         L = []
         L.append(("OK" if shutil.which("ffmpeg") else "Problème") + " : ffmpeg " + ("trouvé" if shutil.which("ffmpeg") else "introuvable"))
         L.append("OK : entrée audio « %s »" % (a.device_name() or "?") if a.device_name() else "Problème : aucune entrée choisie")
-        if e:
+        if e and getattr(e, "cap_state", "") == "error":
+            L.append("Problème : entrée audio indisponible (" + (getattr(e, "cap_err", "") or "?") + ")")
+        if e and a.on_air:
             bad = [o for o in e.outputs if o.cfg.get("enabled", True) and o.state == "error"]
             L.append(("Problème : %d flux en erreur (%s)" % (len(bad), ", ".join(o.cfg["name"] for o in bad))) if bad
                      else "OK : flux actifs sans erreur")
@@ -10333,13 +10859,66 @@ class FitScroll(QScrollArea):
         if w is None:
             return
         vp = self.viewport().size()
-        sz = (max(100, vp.width()), max(vp.height(), w.minimumSizeHint().height()))
+        need = w.minimumSizeHint().height()
+        lay = w.layout()
+        if lay is not None and lay.hasHeightForWidth():      # textes qui passent à la ligne : leur vraie hauteur à cette largeur
+            need = max(need, lay.totalHeightForWidth(max(100, vp.width())))
+        sz = (max(100, vp.width()), max(vp.height(), need))
         if (w.width(), w.height()) != sz:
             w.resize(*sz)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.fit()
+
+
+def regrid(g, narrow, cols=1):
+    """Fenêtre étroite (écran vertical) : les cartes d'une grille passent les unes sous les autres (sur `cols` colonnes),
+    dans l'ordre de lecture ; fenêtre large : la disposition d'origine revient à l'identique."""
+    if not hasattr(g, "_wide"):
+        if not narrow:
+            return
+        items = []
+        for i in range(g.count()):
+            r, c, rs, cs = g.getItemPosition(i)
+            it = g.itemAt(i)
+            obj = it.widget() if it.widget() is not None else it.layout()
+            if obj is not None:
+                items.append((obj, r, c, rs, cs, it.alignment()))
+        g._wide = items
+        g._cs = [g.columnStretch(c) for c in range(g.columnCount())]
+        g._rs = [g.rowStretch(r) for r in range(g.rowCount())]
+    if getattr(g, "_is_narrow", False) == narrow:
+        return
+    g._is_narrow = narrow
+    while g.count():
+        g.takeAt(0)
+    for c in range(g.columnCount()):
+        g.setColumnStretch(c, 0)
+    for r in range(g.rowCount()):
+        g.setRowStretch(r, 0)
+
+    def put(obj, r, c, rs, cs, al):
+        if isinstance(obj, QWidget):
+            g.addWidget(obj, r, c, rs, cs, al)
+        else:
+            g.addLayout(obj, r, c, rs, cs, al)
+    if narrow:
+        order = sorted(g._wide, key=lambda x: (x[1], x[2]))
+        for k, (obj, r, c, rs, cs, al) in enumerate(order):
+            put(obj, k // cols, k % cols, 1, 1, al)
+            if r < len(g._rs) and g._rs[r]:
+                g.setRowStretch(k // cols, g._rs[r])
+        for c in range(cols):
+            g.setColumnStretch(c, 1)
+    else:
+        for obj, r, c, rs, cs, al in g._wide:
+            put(obj, r, c, rs, cs, al)
+        for c, v in enumerate(g._cs):
+            g.setColumnStretch(c, v)
+        for r, v in enumerate(g._rs):
+            g.setRowStretch(r, v)
+    g.invalidate()
 
 
 class Page(FitScroll):
@@ -11217,7 +11796,7 @@ class CartMixin:
         self.cb_cdev.activated.connect(self.cart_dev_changed)
         self.b_cdev = btn("Casque : aucun")
         self.b_cdev.setToolTip("Carte son de pré-écoute : là où les tuiles se jouent hors antenne ou avec Maj + clic")
-        self.b_cdev.setMinimumWidth(120)
+        self.b_cdev.setMinimumWidth(150)
         self.b_cdev.setMaximumWidth(210)
         self.m_cdev = QMenu(self.b_cdev)
         self.m_cdev.aboutToShow.connect(self.cdev_menu)
@@ -11291,7 +11870,9 @@ class CartMixin:
         hb.addWidget(self.l_midi)
         mid.addLayout(hb)
         body.addLayout(mid, 1)
-        body.addWidget(self._cart_inspector())
+        self.cart_ins = self._cart_inspector()
+        body.addWidget(self.cart_ins)
+        self._cart = (body, side, mid, self.cart_ins)
         v.addLayout(body, 1)
         self.setAcceptDrops(True)
         return w
@@ -11597,11 +12178,10 @@ class CartMixin:
             QMessageBox.information(self, "Carte son", "Choisis d'abord la carte son de pré-écoute (en haut à droite du cartoucheur) : "
                                     "c'est là que les sons se jouent hors antenne.")
             return None
-        if not self.engine:
-            self.start_cart_engine()
-        elif self.standalone and self.engine.cmon.label != dev:
-            self.engine.cmon.set_device(dev)
-        return self.engine
+        e = self.ensure_engine()
+        if e is not None and dev and e.cmon.label != dev:
+            e.cmon.set_device(dev)
+        return e
 
     def voice_state(self, cid):
         e = self.engine
@@ -12141,7 +12721,7 @@ class PagesMixin1:
             pass
         if self._crashed and S.get("resume_crash") and not self.data.get("autostart"):
             self.log("Fermeture brutale détectée : reprise de l'antenne.")
-            QTimer.singleShot(2500, lambda: None if self.engine else self.start())
+            QTimer.singleShot(3000, lambda: None if self.on_air else self.start())
         self.prop_n, self._disk_t = 0, 0.0
         self.prop_tm = QTimer(self)
         self.prop_tm.timeout.connect(self.props_tick)
@@ -12474,7 +13054,7 @@ class PagesMixin1:
         except Exception:
             pass
         try:
-            subprocess.Popen([sys.executable] + (sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv))
+            relaunch_self()
         except Exception as e:
             return err(self, "Redémarrer", f"Impossible de relancer : {e}")
         self._closing = True
@@ -12588,7 +13168,7 @@ class PagesMixin1:
         self.tb_rec.setMinimumHeight(90)
         self.tb_rec.doubleClicked.connect(lambda *_: self.rec_play())
         fl.lay.addWidget(self.tb_rec)
-        h = QHBoxLayout()
+        h = WrapRow()
         self.b_recall = btn("Tout sélectionner", "", self.rec_select_all)
         h.addWidget(self.b_recall)
         self.l_recsel = lab("", "")
@@ -13179,7 +13759,7 @@ class PagesMixin2:
         self.fxw, self._fx_loading, self.fx_dirty, self._fx_proc = {}, False, False, None
         self.fx_names = list(FX_PRESETS)
         top = Card("Traitement son", "Quatre préréglages A–D, attribuables flux par flux")
-        h = QHBoxLayout()
+        h = WrapRow()
         h.addWidget(lab("Page", "mut"))
         self.seg_page = Segmented(list(FX_LETTERS), 52, 28)
         self.seg_page.setValue(FX_LETTERS.index(self.fx_page))
@@ -13194,7 +13774,7 @@ class PagesMixin2:
         self.l_fx = lab("", "mut")
         h.addWidget(self.l_fx)
         top.lay.addLayout(h)
-        h = QHBoxLayout()
+        h = WrapRow()
         h.addWidget(lab("Style", "mut"))
         short = {"Neutre": "Neutre", "Voix parlée": "Voix", "Musique": "Musique", "Radio punchy": "Punchy", "Doux (nuit)": "Nuit"}
         self.seg_fx = Segmented([short.get(n, n) for n in self.fx_names], 78, 28)
@@ -13446,6 +14026,130 @@ def log_html(ts, msg):
     return f"<span style='color:{col}'>●</span> <span style='color:{MUT}'>{esc(ts)}</span>&nbsp; <span style='color:{col}'>{esc(msg)}</span>"
 
 
+class StreamWatch:
+    """Veille CONTINUE d'un flux (onglet Monitoring) : un petit décodage ffmpeg permanent (mono 8 kHz, très léger) écoute le
+    flux en direct. Une coupure est vue en ~5 s (plus aucune donnée), un silence au-delà du délai choisi ; reconnexion
+    automatique toutes les 5 s. Avant, une vérification de 5 s toutes les 30 s pouvait laisser passer plus d'une minute."""
+    CHUNK = 1600                                   # 0,1 s de son (8 kHz, mono, 16 bits)
+
+    def __init__(self, url, params):
+        self.url, self.params = url, params        # params() -> (seuil dB, silence toléré s, coupure s)
+        self.state, self.detail, self.level = "wait", "Connexion au flux…", -90.0
+        self.t_state = time.time()
+        self.last_data = self.last_sound = 0.0
+        self.stop_ev, self.kick_ev = threading.Event(), threading.Event()
+        self.proc = None
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def set(self, state, detail):
+        if state != self.state:
+            self.t_state = time.time()
+        self.state, self.detail = state, detail
+
+    def stop(self):
+        self.stop_ev.set()
+        self.kick_ev.set()
+        self._kill()
+
+    def kick(self):
+        """« Vérifier maintenant » : reconnexion immédiate."""
+        self.kick_ev.set()
+        self._kill()
+
+    def _kill(self):
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            self.kick_ev.clear()
+            err = deque(maxlen=6)
+            t0 = time.time()
+            connected = False
+            try:
+                p = self.proc = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-rw_timeout", "8000000",
+                                       "-i", self.url, "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                threading.Thread(target=Engine.drain, args=(p, err), daemon=True).start()
+                threading.Thread(target=self.watchdog, args=(p, t0), daemon=True).start()
+                while not self.stop_ev.is_set() and not self.kick_ev.is_set():
+                    b = p.stdout.read(self.CHUNK)
+                    if not b:
+                        break
+                    now = time.time()
+                    if not connected:
+                        connected = True
+                        self.last_sound = now
+                    self.last_data = now
+                    lv = pcm_level_mono(b)
+                    self.level = lv
+                    thr, sil, _ = self.params()
+                    if lv > thr:
+                        self.last_sound = now
+                        self.set("ok", f"Audio présent (crête {lv:.0f} dB)")
+                    elif now - self.last_sound >= sil:
+                        self.set("silence", f"Connecté mais pas d'audio (silence depuis {now - self.last_sound:.0f} s)")
+                    elif self.state != "ok":
+                        self.set("ok", "Audio présent")
+            except Exception as ex:
+                err.append(str(ex))
+            self._kill()
+            self.proc = None
+            self.level = -90.0
+            if self.stop_ev.is_set():
+                break
+            if not self.kick_ev.is_set():
+                why = next((re.sub(r"^(\[[^\]]*\]\s*)+", "", l) for l in reversed(list(err)) if l), "")
+                if getattr(self, "_cut", False):
+                    why, self._cut = "plus aucune donnée reçue", False
+                self.set("down", "Flux inactif : " + friendly_net_error(why, connected))
+                self.kick_ev.wait(5)
+
+    def watchdog(self, p, t0):
+        while p.poll() is None and not self.stop_ev.is_set():
+            time.sleep(0.5)
+            _, _, cut = self.params()
+            now = time.time()
+            if self.last_data >= t0 and now - self.last_data > cut:
+                self._cut = True                       # plus de données : coupure
+                self._kill()
+            elif self.last_data < t0 and now - t0 > 12:
+                self._kill()                           # ne répond pas du tout
+
+
+def friendly_net_error(why, connected=False):
+    """Erreur ffmpeg -> phrase claire pour l'onglet Monitoring."""
+    w = (why or "").lower()
+    for pat, txt in (("404", "aucune source sur cette adresse (le serveur répond 404)"), ("401", "accès refusé (401)"),
+                     ("403", "accès interdit (403)"), ("refused", "serveur injoignable (connexion refusée)"),
+                     ("timed out", "pas de réponse du serveur"), ("timeout", "pas de réponse du serveur"),
+                     ("name or service", "adresse du serveur introuvable"), ("getaddrinfo", "adresse du serveur introuvable"),
+                     ("no route", "réseau injoignable"), ("network is unreachable", "pas d'accès Internet"),
+                     ("plus aucune donnée", "le flux s'est coupé (plus aucune donnée reçue)"),
+                     ("input/output error", "le flux s'est coupé"), ("end of file", "le flux s'est arrêté"),
+                     ("invalid data", "ce n'est pas un flux audio lisible")):
+        if pat in w:
+            return txt
+    return (why or "")[:90] or ("le flux s'est arrêté" if connected else "aucune réponse")
+
+
+def pcm_level_mono(b):
+    n = len(b) // 2 * 2
+    if not n:
+        return -90.0
+    if np is not None:
+        v = int(np.abs(np.frombuffer(b[:n], dtype="<i2").astype(np.int32)).max())
+    else:
+        a = array("h")
+        a.frombytes(b[:n])
+        v = max(map(abs, a)) if a else 0
+    return 20 * math.log10(v / 32768) if v else -90.0
+
+
 class PagesMixin3:
     def _page_mon(self):
         w = QWidget()
@@ -13456,31 +14160,26 @@ class PagesMixin3:
         m.setdefault("streams", [])
         m.setdefault("interval", 30)
         m.setdefault("threshold", -50)
+        m.setdefault("silence_s", 15)
+        m.setdefault("cut_s", 4)
         self.mon_streams = m["streams"]
         self.mon_iv, self.mon_thr = m["interval"], m["threshold"]
-        add = Card("Surveiller un flux", "Alerte en cas de coupure ou de silence")
+        self.mon_sil, self.mon_cut = m["silence_s"], m["cut_s"]
+        self.mon_watch = {}
+        add = Card("Surveiller un flux", "Écoute continue : alerte en quelques secondes en cas de coupure ou de silence")
         h = QHBoxLayout()
         self.ed_mon_url = QLineEdit()
         self.ed_mon_url.setPlaceholderText("Adresse du flux (http://…)")
         self.ed_mon_url.returnPressed.connect(lambda: self.mon_add())
         h.addWidget(self.ed_mon_url, 1)
         h.addWidget(btn("Ajouter", "primary", lambda: self.mon_add()))
-        more = btn("Plus")
-        mm = QMenu(more)
-        for txt, cmd in (("Coller des adresses", self.mon_paste), ("Ajouter mes flux Internet", self.mon_add_mine),
-                         ("Vérifier maintenant", lambda: [self.mon_check(s["url"]) for s in self.mon_streams]),
-                         ("Copier la liste des flux", self.mon_copy_list), ("Exporter la liste (page web, texte, CSV)…", self.mon_export),
-                         ("Réglages de vérification…", self.mon_settings)):
-            mm.addAction(txt, cmd)
-        more.setMenu(mm)
-        h.addWidget(more)
         add.lay.addLayout(h)
         h = QHBoxLayout()
         h.addWidget(lab("Écouter sur", "mut"))
         self.cb_listen = QComboBox()
-        self.cb_listen.setMinimumWidth(280)
+        self.cb_listen.setMinimumWidth(200)
         self.cb_listen.addItem(NODEV)
-        h.addWidget(self.cb_listen)
+        h.addWidget(self.cb_listen, 1)
         self.l_listen = lab("Clique « Écouter » sur un flux.", "mut")
         h.addWidget(self.l_listen, 1)
         self.btn_lstop = btn("Arrêter", "", self.mon_listen_stop)
@@ -13489,6 +14188,15 @@ class PagesMixin3:
         v.addWidget(add)
         self.listen_proc, self.listen_url, self.listen_mon, self.mon_listen_btns = None, None, None, {}
         sf = Card("Flux surveillés", "État en temps réel · vert : audio présent")
+        sf.hl.addWidget(btn("Vérifier maintenant", "", self.mon_check_all, "Reconnecte tout de suite la veille de chaque flux."))
+        more = btn("Plus")
+        mm = QMenu(more)
+        for txt, cmd in (("Ajouter mes flux Internet", self.mon_add_mine),
+                         ("Copier la liste des flux", self.mon_copy_list), ("Exporter la liste (page web, texte, CSV)…", self.mon_export),
+                         ("Réglages de la surveillance…", self.mon_settings)):
+            mm.addAction(txt, cmd)
+        more.setMenu(mm)
+        sf.hl.addWidget(more)
         sa = QScrollArea()
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.Shape.NoFrame)
@@ -13520,33 +14228,40 @@ class PagesMixin3:
 
     def mon_settings(self):
         d = QDialog(self)
-        d.setWindowTitle("Réglages de vérification")
+        d.setWindowTitle("Réglages de la surveillance")
         f = QFormLayout(d)
-        a = QLineEdit(str(self.mon_iv))
+        f.setContentsMargins(20, 16, 20, 16)
+        ex = lab("Chaque flux est écouté en continu (cela consomme son débit, par exemple 128 kbit/s par flux).", "mut", True)
+        ex.setMaximumWidth(380)
+        f.addRow(ex)
         b = QLineEdit(str(self.mon_thr))
-        a.setMaximumWidth(80)
-        b.setMaximumWidth(80)
-        f.addRow("Vérifier toutes les (secondes)", a)
+        c = QLineEdit(str(self.mon_sil))
+        k = QLineEdit(str(self.mon_cut))
+        for x in (b, c, k):
+            x.setMaximumWidth(80)
         f.addRow("Silence sous (dB)", b)
+        f.addRow("Alerte silence après (s)", c)
+        f.addRow("Alerte coupure après (s)", k)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         bb.accepted.connect(d.accept)
         f.addRow(bb)
         d.exec()
-        try:
-            self.mon_iv = max(5, int(float(a.text())))
-        except ValueError:
-            self.mon_iv = 30
-        try:
-            self.mon_thr = float(b.text())
-        except ValueError:
-            self.mon_thr = -50.0
+        num = lambda t, dft, lo, hi: max(lo, min(hi, float(t.text().replace(",", ".")))) if t.text().strip() else dft
+        for attr, w_, dft, lo, hi in (("mon_thr", b, -50.0, -90.0, -1.0), ("mon_sil", c, 15.0, 2.0, 600.0), ("mon_cut", k, 4.0, 2.0, 60.0)):
+            try:
+                setattr(self, attr, num(w_, dft, lo, hi))
+            except ValueError:
+                setattr(self, attr, dft)
         self.sync_alerts()
 
     def mon_params(self):
         return self.mon_iv, self.mon_thr
 
+    def mon_watch_params(self):
+        return float(self.mon_thr), float(self.mon_sil), float(self.mon_cut)
+
     def sync_alerts(self):
-        self.data["monitor"].update(interval=self.mon_iv, threshold=self.mon_thr)
+        self.data["monitor"].update(interval=self.mon_iv, threshold=self.mon_thr, silence_s=self.mon_sil, cut_s=self.mon_cut)
 
     def mon_rows(self):
         out = []
@@ -13615,18 +14330,6 @@ class PagesMixin3:
         self.rebuild_mon()
         self.mon_check(url)
 
-    def mon_paste(self):
-        txt = QApplication.clipboard().text()
-        if not txt.strip():
-            return self.log("Presse-papiers vide.")
-        urls = [u.strip() for u in re.split(r"[\s,;]+", txt) if u.strip()]
-        urls = [u for u in urls if "." in u or "://" in u or "localhost" in u]
-        if not urls:
-            return self.log("Aucune adresse trouvée dans le presse-papiers.")
-        for u in urls:
-            self.mon_add(None, u)
-        self.log(f"{len(urls)} adresse(s) collée(s) dans le monitoring.")
-
     def mon_add_mine(self):
         n = 0
         for c in self.outputs_cfg:
@@ -13640,6 +14343,9 @@ class PagesMixin3:
     def mon_remove(self, url):
         self.mon_streams[:] = [s for s in self.mon_streams if s["url"] != url]
         self.mon_state.pop(url, None)
+        w = self.mon_watch.pop(url, None)
+        if w:
+            w.stop()
         self.rebuild_mon()
 
     def rebuild_mon(self):
@@ -13651,7 +14357,7 @@ class PagesMixin3:
                 it.widget().deleteLater()
         self.mon_widgets, self.mon_listen_btns = {}, {}
         if not self.mon_streams:
-            g.addWidget(lab("Aucun flux surveillé : colle une adresse ci-dessus, ou « Plus » > « Ajouter mes flux Internet ».", "mut"), 0, 0, 1, 5)
+            g.addWidget(lab("Aucun flux surveillé : saisis une adresse ci-dessus, ou « Plus » > « Ajouter mes flux Internet ».", "mut", True), 0, 0, 1, 5)
         for r, s in enumerate(self.mon_streams):
             dot = GaelHead(40)
             g.addWidget(dot, r, 0)
@@ -13828,33 +14534,39 @@ class PagesMixin3:
                     pass
 
     def mon_check(self, url):
-        if url in self.mon_running:
-            return
-        self.mon_running.add(url)
+        """Lance (ou relance tout de suite) la veille continue d'un flux."""
+        w = self.mon_watch.get(url)
+        if w is None:
+            self.mon_watch[url] = StreamWatch(url, self.mon_watch_params)
+        else:
+            w.kick()
         self.mon_started[url] = time.time()
-        thr = self.mon_params()[1]
 
-        def work():
-            with self.sem:
-                st, det = probe_stream(url, thr)
-                lis = fetch_listeners(url)
-            self.bridge.call.emit(lambda: self.mon_result(url, st, det, lis))
-        threading.Thread(target=work, daemon=True).start()
+    def mon_check_all(self):
+        for s in self.mon_streams:
+            self.mon_check(s["url"])
+            self.mon_lis_t = {}
+        self.log("Monitoring : vérification immédiate de tous les flux.")
+
+    def mon_stop_all(self):
+        for w in list(getattr(self, "mon_watch", {}).values()):
+            w.stop()
+        self.mon_watch = {}
 
     def mon_result(self, url, status, detail, lis):
-        self.mon_running.discard(url)
+        """Changement d'état d'un flux surveillé : journal des incidents + alerte (bip seulement quand il tombe)."""
         name = next((s["name"] for s in self.mon_streams if s["url"] == url), None)
         if name is None:
             return
-        stats = self.mon_stats.setdefault(url, {"n": 0, "ok": 0, "since": time.time()})
         before = self.mon_state.get(url)
-        stats["n"] += 1
-        stats["ok"] += status == "ok"
+        stats = self.mon_stats.setdefault(url, {"n": 0, "ok": 0, "since": time.time()})
         if before and before[0] != status:
             stats["since"] = time.time()
             txt = f"« {name} » : " + ("audio rétabli" if status == "ok" else "INACTIF") + f" ({detail})"
             self.mon_incident(txt)
-            self.alerts.send("Flux " + txt, "mon-" + url + status)
+            self.alerts.send("Flux " + txt, "mon-" + url + status, sound=(status != "ok"))
+        elif before is None and status != "ok":
+            self.mon_incident(f"« {name} » : INACTIF ({detail})")
         self.mon_state[url] = (status, detail, lis)
         self.update_mon_row(url)
 
@@ -13869,21 +14581,56 @@ class PagesMixin3:
             return
         dot, lb, _, dis = w
         dot.set_mood("ok" if st[0] == "ok" else ("warn" if "silence" in (st[1] or "") else "bad"))
-        m = re.search(r"cr[êe]te (-?\d+)", st[1] or "")
-        dot.set_level(float(m.group(1)) if m else None)
+        wa = self.mon_watch.get(url)
+        dot.set_level(wa.level if (wa and st[0] == "ok") else None)
         set_ss(lb, f"color:{OKC if st[0] == 'ok' else BADC};font-weight:600;")
-        lb.setText(f"{st[1]}  [{time.strftime('%H:%M:%S')}]")
+        since = time.strftime('%H:%M:%S', time.localtime(wa.t_state)) if wa else time.strftime('%H:%M:%S')
+        txt = f"{st[1]}  [depuis {since}]"
+        if lb.text() != txt:
+            lb.setText(txt)
         s = self.mon_stats.get(url)
         parts = ([f"{st[2]} auditeurs"] if st[2] is not None else []) + (
-            [f"dispo {100 * s['ok'] // max(1, s['n'])} % depuis {time.strftime('%H:%M', time.localtime(s['since']))}"] if s else [])
-        dis.setText(" · ".join(parts))
+            [f"dispo {100 * s['ok'] // max(1, s['n'])} % depuis {time.strftime('%H:%M', time.localtime(s['since0']))}"] if s and s.get("since0") else [])
+        t = " · ".join(parts)
+        if dis.text() != t:
+            dis.setText(t)
 
     def mon_tick(self):
-        iv = self.mon_params()[0]
+        """Une fois par seconde : état de chaque veille (affichage, incidents), disponibilité, nombre d'auditeurs (toutes les 30 s)."""
         now = time.time()
+        lis_t = self.__dict__.setdefault("mon_lis_t", {})
         for s in self.mon_streams:
-            if now - self.mon_started.get(s["url"], 0) >= iv:
-                self.mon_check(s["url"])
+            u = s["url"]
+            w = self.mon_watch.get(u)
+            if w is None:
+                self.mon_check(u)
+                continue
+            if w.state == "wait":
+                continue
+            status = "ok" if w.state == "ok" else "down"
+            st = self.mon_stats.setdefault(u, {"n": 0, "ok": 0, "since": now})
+            st.setdefault("since0", now)
+            st["n"] += 1
+            st["ok"] += status == "ok"
+            lis = (self.mon_state.get(u) or (None, None, None))[2]
+            if status == "ok" and now - lis_t.get(u, 0) > 30:
+                lis_t[u] = now
+
+                def fetch(u=u):
+                    n = fetch_listeners(u)
+                    self.bridge.call.emit(lambda: self.mon_lis(u, n))
+                threading.Thread(target=fetch, daemon=True).start()
+            cur = self.mon_state.get(u)
+            if cur is None or cur[0] != status or cur[1] != w.detail:
+                self.mon_result(u, status, w.detail, lis)
+            elif self.page_key == "mon":
+                self.update_mon_row(u)
+
+    def mon_lis(self, u, n):
+        cur = self.mon_state.get(u)
+        if cur is not None:
+            self.mon_state[u] = (cur[0], cur[1], n)
+            self.update_mon_row(u)
 
 # ------------------------------------------------------------------ Gaël : assistant qui comprend une demande et propose un réglage
 # Tout est local (aucune connexion, aucune clé) : Gaël repère l'intention dans la phrase, extrait les valeurs utiles
@@ -15268,7 +16015,7 @@ class PagesMixin4:
         self.net_links, self.net_stats, self.net_speed, self.net_rate, self.net_io = [], {}, {}, {}, {}
         self.net_busy, self.net_last, self.net_active, self.net_last_switch = False, 0.0, None, 0.0
         self.net_bad, self.net_good_since, self.net_info, self.net_scan_until, self.net_scan_who = {}, {}, {}, 0.0, ""
-        bar = QHBoxLayout()
+        bar = WrapRow()
         for txt, cmd in (("↻ Détecter", self.net_refresh), ("Tester le débit", self.net_speedtest), ("Monter", lambda: self.net_move(-1)),
                          ("Descendre", lambda: self.net_move(1)), ("Nommer", self.net_rename), ("↪ Utiliser celle-ci maintenant", self.net_use_now)):
             b = btn(txt, "", cmd)
@@ -15336,6 +16083,7 @@ class PagesMixin4:
             cell.addWidget(self.net_det[k], 1)
             gd.addLayout(cell, r, cc)
             gd.setColumnStretch(cc, 1)
+        self.net_gd = gd
         left = QVBoxLayout()
         left.addLayout(gd)
         left.addWidget(btn("Actualiser les détails", "", lambda: self.net_details(True)), 0, Qt.AlignmentFlag.AlignLeft)
@@ -16000,7 +16748,9 @@ class PagesMixin4:
         self.log("Rapport copié dans le presse-papiers (sans mots de passe).")
 
     def reset_settings(self):
-        if self.engine or not yes(self, "Réinitialiser", "Remettre le profil actuel à zéro ? (une copie est gardée)"):
+        if self.on_air:
+            return info(self, "Réinitialiser", "Arrête d'abord la diffusion.")
+        if not yes(self, "Réinitialiser", "Remettre le profil actuel à zéro ? (une copie est gardée)"):
             return
         try:
             shutil.copy(CONF, CONF + ".sauvegarde")
@@ -16031,7 +16781,7 @@ class PagesMixin4:
     def alert_test(self):
         if not self.alerts.channels():
             return self.alert_dialog()
-        self.alerts.send("Test d'alerte : si tu reçois ce message, les alertes fonctionnent.", force=True, urgent=True)
+        self.alerts.send("Test d'alerte : si tu reçois ce message, les alertes fonctionnent.", force=True, urgent=True, sound=True)
         self.log("Alerte de test envoyée.")
 
     def alert_card_update(self):
@@ -16093,7 +16843,7 @@ class PagesMixin4:
                 self.prob_sent[k] = txt
                 due.append(txt)
         if due:
-            self.alerts.send(f"PANNE depuis {Alerts.OUTAGE_S} s : " + " ; ".join(due) + ".", force=True, urgent=True)
+            self.alerts.send(f"PANNE depuis {Alerts.OUTAGE_S} s : " + " ; ".join(due) + ".", force=True, urgent=True, sound=True)
         for k in list(self.prob_since):
             if k not in probs:
                 self.prob_since.pop(k)
@@ -16777,9 +17527,17 @@ class CLabel(QLabel):
         p.setFont(self.font())
         p.setPen(QColor(self._col))
         fl = int(self.alignment().value if hasattr(self.alignment(), "value") else self.alignment())
+        txt = self.text()
         if self.wordWrap():
             fl |= int(Qt.TextFlag.TextWordWrap.value if hasattr(Qt.TextFlag.TextWordWrap, "value") else Qt.TextFlag.TextWordWrap)
-        p.drawText(self.contentsRect(), fl, self.text())
+        elif getattr(self, "elide", False):           # une seule ligne : « … » si la place manque (texte complet en infobulle)
+            el = self.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, self.contentsRect().width())
+            if el != txt:
+                txt = el
+            tip = self.text() if el != self.text() else ""
+            if self.toolTip() != tip:
+                self.setToolTip(tip)
+        p.drawText(self.contentsRect(), fl, txt)
 
 
 class Banner(QLabel):
@@ -16787,7 +17545,8 @@ class Banner(QLabel):
 
     def __init__(self):
         super().__init__("")
-        self.setStyleSheet("font-weight:800;font-size:14px;")
+        self.setStyleSheet("font-weight:800;font-size:14px;padding:6px 10px;")
+        self.setWordWrap(True)                      # fenêtre étroite (écran vertical) : le texte passe à la ligne
         self.bg, self.fg = QColor("#c4263a"), QColor("white")
 
     def set_colors(self, bg, fg):
@@ -16804,7 +17563,7 @@ class Banner(QLabel):
         p.drawRoundedRect(QRectF(self.rect()), 10, 10)
         p.setFont(self.font())
         p.setPen(self.fg)
-        p.drawText(QRectF(self.rect()).adjusted(8, 0, -8, 0), Qt.AlignmentFlag.AlignCenter, self.text())
+        p.drawText(QRectF(self.rect()).adjusted(10, 2, -10, -2), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.text())
 
 
 class RootWidget(QWidget):
@@ -16839,11 +17598,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         st = (S.get("station") or "").strip()
         self.setWindowTitle((st + " · " if st else "") + APP)
         self.resize(1360, 880)
-        self.setMinimumSize(1100 if NAVTOP else 1240, 680)   # en dessous, certaines pages devraient défiler
+        self.setMinimumSize(640, 600)   # écran vertical (portrait) compris : les pages se réorganisent en une colonne
         self.cur = self.data["last"]
         self.prof = upgrade(json.loads(json.dumps(self.data["profiles"][self.cur])))
         norm_carts(self.prof["carts"])
-        self.engine, self.preview = None, False
+        self.engine = None
+        self._out_down, self._air_beeped = {}, set()
         self.bridge = Bridge()
         self.bridge.logged.connect(self.add_log)
         self.bridge.call.connect(lambda fn: fn())
@@ -16865,6 +17625,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.bot_t, self.bot_talk, self.upd_info, self.upd_bubble = 0, 0, None, None
         self._closing = False
         self._proc_off, self.slot = False, None
+        self._boot_t0 = time.time()
         self._build()
         self.apply_profile(self.prof)
         self.timer = QTimer(self)
@@ -16889,8 +17650,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         QTimer.singleShot(1500, lambda: (self.midi_start(), self.midi_label_update()))
         QTimer.singleShot(400, self.refresh_devices)
         QTimer.singleShot(0, self.prewarm)                 # processus moteur prêt avant le premier « Démarrer »
+        QTimer.singleShot(60, self.core_boot)              # moteur permanent : cartouches et Démarrer instantanés
         if self.data.get("autostart"):
-            QTimer.singleShot(2000, lambda: None if self.engine else self.start())
+            QTimer.singleShot(2500, lambda: None if self.on_air else self.start())
         if (UPDATE_REPO or S.get("update_repo")) and S.get("update_check", True):
             QTimer.singleShot(4000, lambda: self.update_start(False))
         if not self.data.get("np_tried") and np is None:
@@ -17107,11 +17869,19 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     @property
     def on_air(self):
-        return bool(self.engine and self.engine.running and not self.preview)
+        e = self.engine
+        return bool(e and e.running and e.air)
+
+    @property
+    def preview(self):
+        """Contrôle d'entrée (hors antenne)."""
+        e = self.engine
+        return bool(e and e.running and not e.air and e.monitor)
 
     @property
     def standalone(self):
-        return bool(self.engine and self.engine.standalone)
+        """Hors antenne et sans contrôle d'entrée (le cartoucheur reste jouable au casque)."""
+        return not (self.on_air or self.preview)
 
     def device_name(self):
         return self.cur_device
@@ -17207,11 +17977,75 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.compact_header()
         QTimer.singleShot(0, self.apply_compact)
 
+    NARROW_W = 1180
+
+    def apply_narrow(self):
+        """Fenêtre étroite (écran vertical, demi-écran) : menu réduit aux icônes, en-tête allégé, et chaque page passe sur une
+        seule colonne qui défile. Au-delà de 1180 px de large, la disposition habituelle revient."""
+        on = self.width() < self.NARROW_W
+        if on == getattr(self, "_narrow", None):
+            return
+        self._narrow = on
+        if hasattr(self.rail, "set_compact"):
+            self.rail.set_compact(on)
+        self.l_date.setVisible(not on)
+        self.l_net.setVisible(not on)
+        self.btn_prof.setMaximumWidth(170 if on else 230)
+        self.btn_prof.setMinimumWidth(110 if on else 130)
+        self.prof_label()
+        self.l_title.setStyleSheet("font-size:%dpx;font-weight:800;" % (19 if on else 24))
+        for pg in self.findChildren(Page):
+            regrid(pg.grid, on)
+        if hasattr(self, "net_gd"):
+            regrid(self.net_gd, on, 2)
+        d = getattr(self, "_diff", None)
+        if d:
+            h, left, right, src, fb, outf, air, facts = d
+            for wdg in (src, fb, outf, air, facts):
+                left.removeWidget(wdg)
+                right.removeWidget(wdg)
+            if on:
+                h.setDirection(QHBoxLayout.Direction.TopToBottom)
+                for wdg, st in ((src, 0), (outf, 0), (fb, 1), (air, 0), (facts, 0)):
+                    left.addWidget(wdg, st)
+                h.setStretch(0, 1)
+                h.setStretch(1, 0)
+                fb.setMinimumHeight(440)
+                outf.setMinimumHeight(210)
+            else:
+                h.setDirection(QHBoxLayout.Direction.LeftToRight)
+                left.addWidget(src)
+                left.addWidget(fb, 1)
+                right.addWidget(outf, 1)
+                right.addWidget(air)
+                right.addWidget(facts)
+                h.setStretch(0, 1)
+                h.setStretch(1, 1)
+                fb.setMinimumHeight(0)
+                outf.setMinimumHeight(0)
+        c = getattr(self, "_cart", None)
+        if c:
+            body, side, mid, ins = c
+            if on:
+                body.removeWidget(ins)
+                mid.insertWidget(1, ins)
+                ins.setMinimumWidth(0)
+                ins.setMaximumWidth(16777215)
+                side.setFixedWidth(140)
+            else:
+                mid.removeWidget(ins)
+                body.addWidget(ins)
+                ins.setFixedWidth(300)
+                side.setFixedWidth(170)
+            QTimer.singleShot(0, self.resize_tiles)
+        self.compact_header()
+
     def apply_compact(self):
         """Adapte toutes les pages à la hauteur disponible : en dessous de 720 px de page, cartes plus serrées et
         sous-titres masqués ; en dessous de 600 px, on range aussi les éléments décoratifs (anecdote, forme d'onde…)."""
         if not hasattr(self, "stack"):
             return
+        self.apply_narrow()
         avail = self.stack.height()
         lvl = 0 if avail >= 720 else (1 if avail >= 600 else 2)
         if lvl == getattr(self, "_compact_lvl", -1):
@@ -17315,6 +18149,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.fb_summary()
         self.sync_cart_device()
         self.cover_shown = "?"
+        e = self.engine
+        if e is not None and e.running and not e.air:     # profil changé hors antenne : le moteur suit (cartouches, entrée…)
+            e.set_prof(json.loads(json.dumps(self.collect_profile())))
 
     def save_all(self):
         self.collect_profile()
@@ -17336,7 +18173,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def prof_label(self):
         t = self.cb_prof.currentText() or self.cur
-        self.btn_prof.setText("Profil · " + (t if len(t) <= 16 else t[:15] + "…"))
+        short = t if len(t) <= 16 else t[:15] + "…"
+        self.btn_prof.setText(short if getattr(self, "_narrow", False) else "Profil · " + short)
         self.btn_prof.setToolTip("Profil de réglages : " + t)
 
     def prof_menu(self):
@@ -17363,7 +18201,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def rename_profile(self):
         n, ok = QInputDialog.getText(self, "Renommer le profil", "Nouveau nom :", text=self.cur)
         n = n.strip()
-        if not (ok and n) or n == self.cur or self.engine:
+        if not (ok and n) or n == self.cur or self.on_air:
             return
         self.collect_profile()
         self.data["profiles"][n] = self.data["profiles"].pop(self.cur)
@@ -17377,7 +18215,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.prof_label()
 
     def on_profile(self, *_):
-        if self.engine:
+        if self.on_air:
             self.cb_prof.setCurrentText(self.cur)
             return info(self, "Profil", "Arrête la diffusion avant de changer de profil.")
         name = self.cb_prof.currentText()
@@ -17406,7 +18244,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def delete_profile(self):
         name = self.cb_prof.currentText()
-        if name not in self.data["profiles"] or self.engine:
+        if name not in self.data["profiles"] or self.on_air:
             return
         if not yes(self, "Supprimer", f"Supprimer le profil « {name} » ?"):
             return
@@ -17446,6 +18284,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         src.lay.addLayout(r)
         self.l_devst = lab("Recherche...", "mut")
         self.l_devst.setTextFormat(Qt.TextFormat.RichText)
+        self.l_devst.setWordWrap(True)
         src.lay.addWidget(self.l_devst)
         mr = QHBoxLayout()
         self.meter_in = LevelMeter("ENTRÉE")
@@ -17481,7 +18320,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         fb = Card("3 · Playlist de secours", "Relève automatique en cas de silence")
         hd = QHBoxLayout()
         self.sw_fb = Switch("Prendre le relais après 10 s de silence")
-        self.sw_fb.toggled.connect(lambda *_: self.fb_summary())
+        self.sw_fb.toggled.connect(lambda *_: self.live_fb())
         hd.addWidget(self.sw_fb)
         hd.addStretch(1)
         self.btn_adv = btn("Options", "", self.toggle_fb_adv)
@@ -17588,9 +18427,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.meter = LevelMeter("ANTENNE")
         col.addWidget(self.meter)
         self.l_sig = CLabel("Signal : -", "mut", False, MUT)
-        col.addWidget(self.l_sig)
-        self.l_now = CLabel("Titre : -", "mut", True, MUT)
-        col.addWidget(self.l_now)
+        self.l_now = CLabel("Titre : -", "mut", False, MUT)
+        for l_ in (self.l_sig, self.l_now):
+            l_.elide = True
+            l_.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            l_.setMinimumWidth(40)
+            col.addWidget(l_)
         r.addLayout(col, 1)
         air.lay.addLayout(r)
         self.wave = Wave(28)
@@ -17606,6 +18448,13 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.sw_follow = Switch("Pendant la playlist, afficher le titre du morceau joué")
         self.sw_follow.toggled.connect(lambda *_: self.live_meta())
         air.lay.addWidget(self.sw_follow)
+        lr = QHBoxLayout()
+        self.btn_listen = btn("Écouter l'antenne au casque", "", self.toggle_listen,
+                              "Entends au casque ce qui part vraiment à l'antenne (direct, playlist de secours, cartouches), "
+                              "sur la carte son choisie dans le cartoucheur.")
+        lr.addWidget(self.btn_listen)
+        lr.addStretch(1)
+        air.lay.addLayout(lr)
         self.l_last = lab("", "mut")
         self.l_last.setCursor(Qt.CursorShape.PointingHandCursor)
         self.l_last.mouseReleaseEvent = lambda _e: self.go_tab("sos")
@@ -17613,6 +18462,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         right.addWidget(air)
         self.facts = FactCard()
         right.addWidget(self.facts)
+        self._diff = (h, left, right, src, fb, outf, air, self.facts)
+        QTimer.singleShot(0, lambda: air.setMinimumHeight(air.minimumSizeHint().height()))   # jamais écrasée par la carte « Flux »
         self.cur_device = ""
         self.show_cover(None)
         sa = FitScroll()                         # fenêtre basse : la page défile au lieu de se chevaucher
@@ -17628,15 +18479,31 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         d.setWindowTitle("Options de la playlist de secours")
         f = QFormLayout(d)
         f.setContentsMargins(20, 16, 20, 16)
+        expl = lab("Quand l'entrée reste plus basse que le seuil pendant le délai, la playlist de secours prend le relais "
+                   "avec un fondu. Dès que le son revient (pendant la durée indiquée), l'antenne repasse au direct.\n"
+                   "Chaque changement s'applique immédiatement, même pendant la diffusion.", "mut", True)
+        expl.setMaximumWidth(420)
+        f.addRow(expl)
         self.fb_ed = {}
-        for k, t in (("threshold", "Seuil de silence (dB)"), ("silence_s", "Délai avant bascule (s)"), ("recover_s", "Retour au direct après (s)"),
-                     ("fade_in", "Fondu vers la playlist (s)"), ("fade_out", "Fondu retour direct (s)")):
+        from PySide6.QtGui import QDoubleValidator
+        for k, t, lo, hi, tip in (("threshold", "Seuil de silence (dB)", -90, -1, "En dessous de ce niveau, l'entrée est considérée comme silencieuse (par défaut -50)."),
+                                  ("silence_s", "Délai avant bascule (s)", 1, 3600, "Durée de silence avant que la playlist prenne le relais (par défaut 10 s)."),
+                                  ("recover_s", "Retour au direct après (s)", 0.2, 600, "Durée pendant laquelle le son doit être revenu pour repasser au direct (par défaut 2 s)."),
+                                  ("fade_in", "Fondu vers la playlist (s)", 0.05, 30, "Durée du fondu enchaîné direct → playlist."),
+                                  ("fade_out", "Fondu retour direct (s)", 0.05, 30, "Durée du fondu enchaîné playlist → direct.")):
             e = QLineEdit()
             e.setMaximumWidth(90)
+            v = QDoubleValidator(lo, hi, 2, e)
+            v.setNotation(QDoubleValidator.Notation.StandardNotation)
+            from PySide6.QtCore import QLocale
+            v.setLocale(QLocale.c())                     # point décimal (0.5), comme dans le reste des réglages
+            e.setValidator(v)
+            e.setToolTip(tip)
             e.textChanged.connect(lambda *_: (self.fb_summary(), self.live_fb()))
             self.fb_ed[k] = e
             f.addRow(t, e)
         self.sw_shuf = Switch("Lecture aléatoire")
+        self.sw_shuf.toggled.connect(lambda *_: self.live_fb())
         f.addRow("", self.sw_shuf)
         jr = QHBoxLayout()
         self.sw_jingle = Switch("Jingle toutes les")
@@ -17675,12 +18542,17 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.live_fb()
 
     def live_fb(self):
+        """Tout réglage de la playlist de secours est envoyé au moteur immédiatement (marche/arrêt, seuil, délais, fondus,
+        aléatoire, jingles) : il compte tout de suite, même pendant l'antenne."""
         self.fb_summary()
         if self.engine and not getattr(self, "_loading", False):
             e = self.fb_ed
-            self.engine.prof_update("fallback", jingle=dict(enabled=self.sw_jingle.isChecked(), every=str(self.sp_jevery.value()),
-                                                            files=list(self.jingles)),
-                                    fade_in=e["fade_in"].text(), fade_out=e["fade_out"].text())
+            self.engine.prof_update("fallback", enabled=self.sw_fb.isChecked(), shuffle=self.sw_shuf.isChecked(),
+                                    threshold=e["threshold"].text().strip(), silence_s=e["silence_s"].text().strip(),
+                                    recover_s=e["recover_s"].text().strip(),
+                                    jingle=dict(enabled=self.sw_jingle.isChecked(), every=str(self.sp_jevery.value()),
+                                                files=list(self.jingles)),
+                                    fade_in=e["fade_in"].text().strip(), fade_out=e["fade_out"].text().strip())
 
     # --- entrées audio
     def refresh_devices(self):
@@ -17697,7 +18569,54 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         threading.Thread(target=scan, daemon=True).start()
 
     def dev_status(self, text, col):
-        self.l_devst.setText(f"<span style='color:{col}'>●</span>&nbsp;&nbsp;<span style='color:{MUT}'>{text}</span>")
+        self._dev_scan = (text, col)
+        self.source_state(self.engine)
+
+    def source_state(self, e):
+        """État de l'entrée, en clair : active, en panne (avec la raison), ou résultat de la détection des entrées."""
+        if not hasattr(self, "l_devst"):
+            return
+        st = getattr(e, "cap_state", "off") if (e and (self.on_air or self.preview)) else "off"
+        if st == "ok":
+            text, col = f"Entrée active : {dev_short_name(self.cur_device)}", OKC
+        elif st == "error":
+            text, col = f"Entrée indisponible : {getattr(e, 'cap_err', '') or '?'} · nouvel essai automatique toutes les 2 s", BADC
+        elif st == "starting":
+            text, col = "Ouverture de l'entrée…", ACC2
+        else:
+            text, col = getattr(self, "_dev_scan", ("Recherche des entrées…", ACC2))
+        key = (text, col)
+        if key != getattr(self, "_devst_key", None):
+            self._devst_key = key
+            esc = str(text).replace("&", "&amp;").replace("<", "&lt;")
+            self.l_devst.setText(f"<span style='color:{col}'>●</span>&nbsp;&nbsp;<span style='color:{MUT if st == 'off' else col}'>{esc}</span>")
+
+    def listen_state(self, e):
+        b = getattr(self, "btn_listen", None)
+        if b is None:
+            return
+        on = bool(e and getattr(e, "listen", False))
+        self.set_kind(b, "■ Arrêter l'écoute" if on else "Écouter l'antenne au casque", "primary" if on else "")
+
+    def toggle_listen(self):
+        """Écoute de contrôle : ce qui part à l'antenne (direct, playlist de secours, cartouches) au casque du cartoucheur."""
+        e = self.ensure_engine()
+        if e is None:
+            return
+        if not e.listen and not self.prof["carts"].get("device"):
+            self.set_cart_devices()
+            m = QMenu(self)
+            m.addSection("Écouter sur quelle carte son ?")
+            for i in range(1, self.cb_cdev.count()):
+                m.addAction(self.cb_cdev.itemText(i), lambda i=i: (self.cb_cdev.setCurrentIndex(i), self.cart_dev_changed(i), self.toggle_listen()))
+            if self.cb_cdev.count() <= 1:
+                return info(self, "Écoute", "Aucune carte son de sortie trouvée (module sounddevice requis, voir SOS).")
+            return m.exec(QCursor.pos())
+        e.set_listen(not e.listen)
+        if e.listen:
+            self.log("Écoute de l'antenne au casque : " + (self.prof["carts"].get("device") or "?") +
+                     ("" if self.on_air else " (le son arrivera dès le démarrage de la diffusion)"))
+        self.listen_state(e)
 
     def apply_devices(self, devs, raw, err_):
         self.dev_list = devs
@@ -17710,7 +18629,13 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.btn_loop.setVisible(SYS == "Windows" and not loop)
         if devs:
             n = len(devs)
-            self.dev_status(f"{n} entrée{'s' if n > 1 else ''} détectée{'s' if n > 1 else ''}", OKC)
+            cur = (self.cur_device or "").strip()
+            if cur and cur not in self.dev_map.values() and not cur.startswith("lavfi:"):
+                self.dev_status(f"L'entrée enregistrée « {dev_short_name(cur)} » n'existe pas sur cet ordinateur : choisis-en une dans la liste", BADC)
+            elif not cur:
+                self.dev_status(f"{n} entrée{'s' if n > 1 else ''} détectée{'s' if n > 1 else ''} · choisis celle à diffuser", ACC2)
+            else:
+                self.dev_status(f"{n} entrée{'s' if n > 1 else ''} détectée{'s' if n > 1 else ''}", OKC)
             self.sync_device_selection()
             self.set_cart_devices()
             return
@@ -17740,7 +18665,18 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def on_dev_select(self, txt=""):
         txt = (txt or "").strip()
         if txt:
-            self.cur_device = self.dev_map.get(txt, txt)
+            new = self.dev_map.get(txt, txt)
+            changed = new != self.cur_device
+            self.cur_device = new
+            if self.engine is not None:
+                self.engine.set_source(new)               # changement d'entrée immédiat, même pendant l'antenne
+            if changed:
+                self.prof.setdefault("source", {})["device"] = new
+                self._devst_key = None
+                n = len(self.dev_map)
+                self.dev_status(f"{n} entrée{'s' if n > 1 else ''} détectée{'s' if n > 1 else ''}" if n else "Entrée choisie", OKC)
+                if self.on_air:
+                    self.log(f"Entrée changée pendant l'antenne : {dev_short_name(new)}")
 
     def live_gain(self):
         g = self.sl_gain.value()
@@ -18010,7 +18946,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def pl_menu(self, i, pos):
         m = QMenu(self)
-        m.addAction("Jouer maintenant", lambda: self.pl_play(i))
+        m.addAction("Jouer maintenant à l'antenne", lambda: self.pl_play(i))
+        m.addAction("Pré-écouter au casque", lambda: self.pl_prelisten(i))
         m.addAction("Infos…", lambda: self.pl_infos(i))
         m.addAction("Chercher la pochette…", lambda: self.pl_cover_diag(i))
         m.addAction("Tout sélectionner", lambda: self.pl_tv.select_all(True))
@@ -18055,9 +18992,24 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def pl_play(self, i):
         if not self.on_air:
-            return info(self, "Playlist", "Démarre la diffusion pour jouer un morceau ou une émission à l'antenne.")
+            return self.pl_prelisten(i)            # hors antenne : double-clic = pré-écoute au casque
         self.live_pl()
         self.engine.play_now(self.playlist[i])
+
+    def pl_prelisten(self, i):
+        """Pré-écoute d'un titre de la playlist de secours au casque (carte son du cartoucheur), sans rien diffuser."""
+        f = self.playlist[i]
+        e = self.cart_engine(True)
+        if e is None:
+            return
+        inf = self.pl_info.get(f) or {}
+        name = "Pré-écoute · " + (inf.get("title") or os.path.splitext(os.path.basename(f))[0])
+        if e.cart_playing(-2):
+            e.stop_cart(-2, 0.05)
+            QTimer.singleShot(120, lambda: e.play_cart(-2, {"file": f, "name": name, "mode": "Par-dessus", "vol": 100, "loop": False}, True))
+        else:
+            e.play_cart(-2, {"file": f, "name": name, "mode": "Par-dessus", "vol": 100, "loop": False}, True)
+        self.log(f"Pré-écoute au casque : {os.path.basename(f)} (Échap ou clic sur la pastille en haut pour arrêter)")
 
     def pl_import_folder(self, d, paths):
         name = os.path.basename(d.rstrip("/\\")) or d
@@ -18257,7 +19209,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def live_remove(self, oid):
         """Retire tout de suite un flux de l'antenne en cours : bandeau, compteurs et alertes sont à jour immédiatement."""
         e = self.engine
-        if not (e and not self.preview):
+        if not (e and self.on_air):
             return
         o = e.output(oid)
         if o:
@@ -18294,39 +19246,55 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.start()
 
     def start(self):
-        if self.preview:
-            self.stop()
         prof = json.loads(json.dumps(self.collect_profile()))
         if not shutil.which("ffmpeg"):
-            return err(self, "ffmpeg", "ffmpeg est introuvable dans le PATH (voir onglet SOS).")
+            return err(self, "ffmpeg", "ffmpeg est introuvable (voir onglet SOS).")
         outs = [o for o in prof["outputs"] if o.get("enabled", True)]
         if not outs:
-            return info(self, "Flux", "Ajoute et coche (Actif) au moins un flux.")
+            return info(self, "Flux", "Ajoute et coche (Actif) au moins un flux dans « 2 · Flux ».")
         for o in outs:
             if o["type"] == "internet" and not o["password"]:
-                return info(self, "Mot de passe", f"Renseigne le mot de passe de « {o['name']} ».")
-        if prof["fallback"]["enabled"] and not prof["fallback"]["playlist"]:
-            return info(self, "Playlist", "Ajoute des fichiers à la playlist de secours ou désactive la bascule.")
+                return info(self, "Mot de passe", f"Renseigne le mot de passe de « {o['name']} » (bouton Modifier).")
+        if prof["fallback"]["enabled"] and not [f for f in prof["fallback"]["playlist"] if f not in set(prof["fallback"].get("off") or [])]:
+            return info(self, "Playlist de secours", "La relève automatique est activée mais la playlist de secours est vide : "
+                                                     "ajoute des titres (bouton ＋ Ajouter), ou désactive la relève.")
+        dev = (prof["source"].get("device") or "").strip()
+        if not dev:
+            return info(self, "Entrée audio", "Choisis d'abord l'entrée audio à diffuser dans « 1 · Source audio ».")
+        known = set(self.dev_map.values())
+        if known and dev not in known and not dev.startswith("lavfi:"):
+            if not yes(self, "Entrée audio introuvable",
+                       f"L'entrée « {dev_short_name(dev)} » n'existe pas sur cet ordinateur (ou elle est débranchée).\n\n"
+                       "Sans elle, les flux partiront en silence. Choisis la bonne entrée dans « 1 · Source audio ».\n\n"
+                       "Démarrer quand même ?"):
+                return
         self.save_all()
-        self.engine = self.make_engine(prof, self.alerts.send)
-        self.engine.start()
+        e = self.ensure_engine()
+        if e is None:
+            return err(self, "Moteur audio", "Le moteur audio n'a pas pu démarrer (voir SOS > Journal).")
+        self._out_down, self._air_beeped = {}, set()
+        if e.monitor:                                   # pendant l'antenne l'entrée est affichée de toute façon
+            e.set_monitor(False)
+        e.set_air(True, prof)
         self.log(f"Diffusion démarrée ({len(outs)} flux). Mat eo, bonne émission !")
+        self.update_ui(e)
 
     def stop(self):
-        if self.engine:
-            self.engine.stop()
-            self.log("Diffusion arrêtée. Kenavo !" if not self.preview else "Contrôle d'entrée arrêté.")
-        self.engine, self.preview = None, False
+        e = self.engine
+        if e and self.on_air:
+            e.set_air(False)
+            self.log("Diffusion arrêtée. Kenavo !")
+            self.update_ui(e)
 
-    # ------------------------------------------------------------ moteur audio séparé
+    # ------------------------------------------------------------ moteur audio (permanent, dans un processus séparé)
     def prewarm(self):
-        """Prépare en arrière-plan le prochain processus moteur (pour que « Démarrer » soit instantané)."""
+        """Prépare en arrière-plan le processus moteur (lancé une seule fois, au démarrage de l'application)."""
         if self._closing or self._proc_off or not self.data.get("settings", {}).get("engine_proc", True):
             return
         if getattr(self, "slot", None) is None or (self.slot.ready.is_set() and not self.slot.alive()):
             self.slot = WorkerSlot()
 
-    def take_slot(self):
+    def take_slot(self, wait=10):
         sl = getattr(self, "slot", None)
         if sl is None:
             self.prewarm()
@@ -18335,7 +19303,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             return None
         if not sl.ready.is_set():
             t0 = time.time()
-            while not sl.ready.is_set() and time.time() - t0 < 8:       # premier lancement juste après l'ouverture
+            while not sl.ready.is_set() and time.time() - t0 < wait:       # premier lancement juste après l'ouverture
                 QApplication.processEvents()
                 sl.ready.wait(.03)
         self.slot = None
@@ -18344,21 +19312,39 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         sl.close()
         self._proc_fail = getattr(self, "_proc_fail", 0) + 1
         why = sl.error or ("toujours en préparation" if not sl.ready.is_set() else "arrêté")
-        if self._proc_fail >= 2:
-            self._proc_off = True
-            self.log(f"Moteur audio séparé indisponible ({why}) : le moteur tourne dans l'application pour cette session.")
-        else:
-            self.log(f"Moteur audio séparé indisponible ({why}) : le moteur tourne dans l'application.")
+        self._proc_off = True
+        self.log(f"Moteur audio séparé indisponible ({why}) : le moteur tourne dans l'application pour cette session.")
         return None
 
     def make_engine(self, prof, alert, standalone=False):
         if self.data.get("settings", {}).get("engine_proc", True) and not self._proc_off:
             sl = self.take_slot()
             if sl is not None:
-                eng = EngineProxy(sl, prof, self.log, alert, standalone, on_dead=lambda p: self.ui(self.engine_died, p))
-                QTimer.singleShot(12000, self.prewarm)   # le suivant se prépare plus tard : rien ne ralentit le lancement
-                return eng
-        return Engine(prof, self.log, alert, standalone)
+                return EngineProxy(sl, prof, self.log, alert, False, on_dead=lambda p: self.ui(self.engine_died, p))
+        return Engine(prof, self.log, alert)
+
+    def ensure_engine(self):
+        """Le moteur permanent (créé au premier besoin s'il n'est pas déjà là)."""
+        e = self.engine
+        if e is not None and e.running:
+            return e
+        if self._closing:
+            return None
+        prof = json.loads(json.dumps(self.collect_profile()))
+        e = self.make_engine(prof, self.alerts.send)
+        self.engine = e
+        e.start()
+        return e
+
+    def core_boot(self):
+        """Au lancement : dès que le processus moteur est prêt, le moteur démarre (Démarrer et cartouches sont instantanés)."""
+        if self.engine is not None or self._closing:
+            return
+        sl = getattr(self, "slot", None)
+        if sl is not None and not sl.ready.is_set() and time.time() - self._boot_t0 < 25:
+            QTimer.singleShot(150, self.core_boot)
+            return
+        self.ensure_engine()
 
     def worker_pids(self):
         pids = set()
@@ -18372,47 +19358,54 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         return pids
 
     def engine_died(self, p, why="arrêté brutalement"):
-        """Le processus moteur a disparu (ou ne répond plus) pendant l'antenne : on relance aussitôt l'antenne, cette fois
-        avec le moteur dans l'application, pour ne pas laisser les auditeurs sans son."""
+        """Le processus moteur a disparu (ou ne répond plus) : on le remplace aussitôt (moteur dans l'application), et si
+        l'antenne était en cours, elle repart tout de suite pour ne pas laisser les auditeurs sans son."""
         if self.engine is not p:
             return
-        air = not self.preview
+        s = getattr(p, "_s", None) or {}
+        air = bool(s.get("air", getattr(p, "air", False)))
+        mon = bool(s.get("monitor", getattr(p, "monitor", False)))
+        lis = bool(s.get("listen", getattr(p, "listen", False)))
         try:
             p._slot.close()
         except Exception:
             pass
-        self.engine, self.preview = None, False
+        try:
+            p.stop()
+        except Exception:
+            pass
+        self.engine = None
         self._proc_off = True
-        if air and not self._closing:
+        if self._closing:
+            return
+        e = self.ensure_engine()
+        if e is None:
+            return
+        if mon:
+            e.set_monitor(True)
+        if lis:
+            e.set_listen(True)
+        if air:
             self.log(f"⚠ Le moteur audio s'est {why} : redémarrage immédiat de l'antenne.")
-            self.alerts.send(f"Moteur audio {why} : antenne relancée automatiquement.", "engine-crash")
-            self.start()
+            self.alerts.send(f"Moteur audio {why} : antenne relancée automatiquement.", "engine-crash", sound=True)
+            self._out_down = {}
+            e.set_air(True, json.loads(json.dumps(self.collect_profile())))
+        else:
+            self.log(f"Le moteur audio s'est {why} : il a été relancé.")
 
     def toggle_preview(self):
         if self.on_air:
-            return info(self, "Contrôle", "Arrête la diffusion pour utiliser le contrôle d'entrée.")
-        if self.engine and not self.standalone:
-            return self.stop()
-        if self.standalone:
-            if self.engine and any(not v["stopping"] for v in list(self.engine.voices)):
-                return self.log("Une cartouche est en cours : attends la fin ou arrête-la avant de regarder l'entrée.")
-            self.stop()
-        prof = json.loads(json.dumps(self.collect_profile()))
-        prof["outputs"] = []
-        prof["fallback"]["enabled"] = False
-        self.engine = self.make_engine(prof, None)
-        self.preview = True
-        self.engine.start()
-        self.log("Contrôle d'entrée : le niveau s'affiche sans rien diffuser.")
+            return info(self, "Contrôle d'entrée", "Pendant la diffusion, l'entrée est déjà affichée en permanence.")
+        e = self.ensure_engine()
+        if e is None:
+            return
+        on = not e.monitor
+        e.set_monitor(on)
+        self.log("Contrôle d'entrée : le niveau s'affiche, rien n'est diffusé." if on else "Contrôle d'entrée arrêté.")
+        self.update_ui(e)
 
     def start_cart_engine(self):
-        prof = json.loads(json.dumps(self.collect_profile()))
-        prof["outputs"] = []
-        prof["fallback"]["enabled"] = False
-        self.engine = self.make_engine(prof, None, standalone=True)
-        self.preview = True
-        self.engine.start()
-        self.log("Cartoucheur hors antenne : lecture sur la carte son choisie.")
+        return self.ensure_engine()
 
     def toggle_manual(self):
         e = self.engine
@@ -18473,7 +19466,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         Ticker.get().tick()
         e = self.engine
         if e and not e.running:
-            self.engine, self.preview = None, False
+            if not self._closing:
+                QTimer.singleShot(0, lambda e=e: self.engine_died(e))
             e = None
         self.slow_n += 1
         pin, pout, clip = [-90.0, -90.0], [-90.0, -90.0], False
@@ -18544,15 +19538,16 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 self.fit_air_label(head)
             self.set_kind(self.btn_start, "Arrêter", "stop")
         else:
-            self.set_label(self.l_air, ("Cartoucheur hors antenne" if self.standalone else "Contrôle d'entrée") if self.preview else "○ Hors antenne",
-                           ACCT if self.preview else MUT)
+            self.set_label(self.l_air, "Contrôle d'entrée" if self.preview else "○ Hors antenne", ACCT if self.preview else MUT)
             self.set_kind(self.btn_start, "Démarrer", "primary")
         if self.on_air:
-            self.btn_prev.setText("● Entrée visible")
+            self.btn_prev.setText("● Entrée affichée")
             self.btn_prev.setEnabled(False)
         else:
-            self.btn_prev.setText("■ Arrêter" if (self.preview and not self.standalone) else "Voir l'entrée")
+            self.btn_prev.setText("■ Arrêter le contrôle" if self.preview else "Voir l'entrée")
             self.btn_prev.setEnabled(True)
+        self.source_state(e)
+        self.listen_state(e)
         for r, c in enumerate(self.outputs_cfg):
             if r >= self.tb_out.rowCount():
                 break
@@ -18577,19 +19572,37 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.set_label(self.l_now, "Titre : -", MUT)
             self.btn_manual.setText("Lancer la playlist")
             return
-        self.btn_manual.setText("Revenir au direct" if e.manual else "Lancer la playlist")
-        if e.backup:
+        self.btn_manual.setText("Revenir au direct" if (e.manual and self.on_air) else "Lancer la playlist")
+        p = e.fb_params()
+        covered = bool(p["enabled"] and p["files"])
+        cap = getattr(e, "cap_state", "ok")
+        if not (self.on_air or self.preview):
+            self.set_label(self.l_sig, "Signal : entrée fermée (clique « Voir l'entrée » pour la contrôler)", MUT)
+        elif cap == "error":
+            self.set_label(self.l_sig, "✕ Entrée audio indisponible : voir « 1 · Source audio »", BADC)
+        elif e.backup and self.on_air:
             if e.manual:
-                txt = "Playlist de secours (manuel)"
-            elif e.silent_ms < 1000:
-                txt = f"Playlist de secours - direct détecté, retour dans {max(0.0, e.rec_ms - e.loud_ms) / 1000:.0f} s"
+                txt = "Playlist de secours lancée à la main · « Revenir au direct » pour reprendre l'entrée"
+            elif e.silent_ms < 1000 and e.loud_ms > 0:
+                txt = f"Playlist de secours · le son revient : retour au direct dans {max(0.0, e.rec_ms - e.loud_ms) / 1000:.0f} s"
             else:
-                txt = "Playlist de secours - direct : aucun signal"
+                txt = "Playlist de secours à l'antenne · retour au direct dès que le son revient"
             self.set_label(self.l_sig, txt, ACCT)
         elif e.silent_ms >= 1000:
-            self.set_label(self.l_sig, f"● Aucun signal depuis {e.silent_ms // 1000} s", BADC)
+            sec = e.silent_ms // 1000
+            if not self.on_air:
+                txt = f"● Aucun signal depuis {sec} s"
+            elif covered:
+                left = max(0, int(math.ceil((p["delay"] - e.silent_ms) / 1000)))
+                txt = f"● Aucun signal depuis {sec} s · la playlist de secours prend le relais dans {left} s"
+            elif p["enabled"]:
+                txt = f"● Aucun signal depuis {sec} s · playlist de secours vide : rien ne prendra le relais"
+            else:
+                txt = f"● Aucun signal depuis {sec} s · relève automatique désactivée"
+            self.set_label(self.l_sig, txt, BADC)
         else:
-            self.set_label(self.l_sig, "● Signal détecté", OKC)
+            self.set_label(self.l_sig, "● Signal détecté" + ("" if not self.on_air else
+                           (f" · relève après {p['delay'] / 1000:g} s de silence" if covered else " · pas de relève automatique")), OKC)
         flags = ("  MUTE" if e.mute else "") + ("  TON" if e.tone else "")
         self.set_label(self.l_now, ("Titre : " + (e.meta or "-")) + flags, TXT)
         if self.slow_n % 20 == 0 and self.page_key == "rec":
@@ -18600,6 +19613,13 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def update_ui2(self, e):
         if e:
             self.check_outages(e)
+            ci = getattr(e, "counts_in", None) if isinstance(e, EngineProxy) else (dict(e.counts()) if self.on_air else None)
+            if ci and ci is not getattr(self, "_counts_seen", None):
+                self._counts_seen = ci
+                d = self.data.setdefault("counts", {})
+                for k, v in ci.items():
+                    if v > d.get(k, 0):
+                        d[k] = v
         self.update_playlist_visuals(e)
         self.update_enabled(e)
         self.update_health(e)
@@ -18616,12 +19636,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def update_enabled(self, e):
         """Grise ce qu'on ne peut pas modifier dans la situation présente."""
-        running = bool(e)
         air = self.on_air
-        self.en(self.btn_prof, not running, "Arrête la diffusion pour changer de profil")
-        self.en(self.btn_prof, not running, "Arrête la diffusion pour gérer les profils")
-        self.en(self.dev_pick, not running, "Arrête la diffusion (ou le contrôle d'entrée) pour changer d'entrée")
-        self.en(self.btn_devref, not running, "Arrête la diffusion pour actualiser les entrées")
+        self.en(self.btn_prof, not air, "Arrête la diffusion pour changer de profil")
         sel = self.sel_output() is not None
         for b in getattr(self, "flux_btns", []):
             self.en(b, sel, "Choisis d'abord un flux dans la liste")
@@ -18661,33 +19677,54 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             b.style().polish(b)
 
     def rupture_ui(self, e, n_live, n_all):
-        """Deux alertes bien distinctes : ROUGE = rupture de flux (le son ne sort plus vers les auditeurs),
-        AMBRE = pas de son en entrée (les flux sont en ligne mais diffusent du silence, ou le secours a pris le relais)."""
-        bad = []
-        silent = None
+        """Deux alertes bien distinctes, stables (pas de clignotement, un seul bip par panne) :
+        ROUGE = rupture de flux (un flux actif n'est plus en ligne depuis 6 s : les auditeurs ne reçoivent plus l'antenne) ;
+        AMBRE = silence à l'antenne (plus de son en entrée et rien ne prend le relais).
+        BLEU (calme) = la playlist de secours a pris le relais : c'est prévu, tout est sous contrôle."""
+        now = time.time()
+        bad, silent = [], None
+        down = self._out_down
         if self.on_air and e:
-            bad = [o.cfg["name"] for o in e.outputs if o.cfg.get("enabled", True) and o.state == "error"]
-            if not bad and n_all and n_live == 0 and time.time() - e.started > 8 and not any(o.state == "connecting" for o in e.outputs):
-                bad = ["aucun flux en ligne"]
-            if not e.mute and e.silent_ms >= 5000 and time.time() - e.started > 6:
-                silent = "backup" if e.backup else "dead"
+            ids = set()
+            for o in e.outputs:
+                if not o.cfg.get("enabled", True):
+                    continue
+                oid = o.cfg.get("id")
+                ids.add(oid)
+                seen = self._air_beeped                     # (on y range aussi les flux déjà passés en ligne)
+                if o.state == "live":
+                    down.pop(oid, None)
+                    seen.add("live-" + oid)
+                elif now - down.setdefault(oid, now) >= (6 if "live-" + oid in seen else 15):
+                    bad.append(o.cfg.get("name") or "flux")   # 6 s après une coupure ; 15 s pour la toute première connexion
+            for k in [k for k in down if k not in ids]:
+                down.pop(k, None)
+            p = e.fb_params()
+            covered = bool(p["enabled"] and p["files"])
+            if e.backup:
+                silent = "backup"
+            elif not e.mute and e.silent_ms >= 5000 and (not covered or e.silent_ms >= p["delay"] + 4000):
+                silent = "dead"
+        else:
+            down.clear()
         kind = "flux" if bad else ("son" if silent == "dead" else ("secours" if silent == "backup" else None))
         if kind:
-            pulse = (math.sin(time.time() * 5) + 1) / 2
             if kind == "flux":
-                c = mixc("#c4263a", "#ff4d5e", pulse).name()
-                txt = "⚠  RUPTURE DE FLUX  ·  " + ", ".join(bad[:3]) + "  ·  les auditeurs ne reçoivent plus l'antenne  ·  reconnexion automatique"
+                c, fg = "#c4263a", "white"
+                txt = ("⚠  RUPTURE DE FLUX  ·  " + ", ".join(bad[:3]) + "  ·  les auditeurs ne reçoivent plus l'antenne  ·  "
+                       "reconnexion automatique en cours")
                 if silent == "dead":
                     txt += "  ·  et pas de son en entrée"
-                fg = "white"
             elif kind == "son":
-                c = mixc("#b86e00", "#ffb020", pulse).name()
-                txt = f"⚠  PAS DE SON À L'ANTENNE  ·  aucun signal en entrée depuis {e.silent_ms // 1000} s  ·  les flux sont en ligne mais diffusent du silence"
-                fg = "#1d0d03"
+                c, fg = "#d08a00", "#1d0d03"
+                p = e.fb_params()
+                why = ("la playlist de secours est désactivée" if not p["enabled"] else
+                       "la playlist de secours est vide" if not p["files"] else "la playlist de secours n'a pas pu démarrer")
+                txt = f"⚠  SILENCE À L'ANTENNE  ·  aucun son en entrée depuis {e.silent_ms // 1000} s  ·  {why}"
             else:
-                c = mixc("#7a5a10", "#a07a18", pulse * .4).name()
-                txt = f"PLAYLIST DE SECOURS À L'ANTENNE  ·  plus de signal en entrée depuis {e.silent_ms // 1000} s  ·  la playlist de secours a pris le relais"
-                fg = "white"
+                c, fg = "#24527d", "white"
+                txt = ("PLAYLIST DE SECOURS À L'ANTENNE  ·  plus de son en entrée  ·  "
+                       "retour au direct automatique dès que le son revient")
             self.banner.set_colors(c, fg)
             if self.banner.text() != txt:
                 self.banner.setText(txt)
@@ -18697,16 +19734,19 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.banner.setVisible(bool(kind))
             border = {"flux": "#ff4d5e", "son": "#ffb020"}.get(kind)
             self.centralWidget().set_border(border)
-            if kind == "flux":
-                QApplication.beep()
-                self.log("⚠ Rupture de flux : " + ", ".join(bad))
-            elif kind == "son":
-                QApplication.beep()
-                self.log(f"⚠ Pas de son à l'antenne depuis {e.silent_ms // 1000} s (les flux sont en ligne).")
+            if kind in ("flux", "son"):
+                if kind not in self._air_beeped:            # un seul bip par panne (la sirène, si elle est cochée, répète)
+                    self._air_beeped.add(kind)
+                    if self.data.get("alerts", {}).get("sound", True):
+                        self.alerts.beep()
+                self.log("⚠ Rupture de flux : " + ", ".join(bad) if kind == "flux" else
+                         f"⚠ Silence à l'antenne depuis {e.silent_ms // 1000} s : rien ne prend le relais.")
             elif prev in ("flux", "son"):
                 self.log("Antenne rétablie.")
+            if kind not in ("flux", "son"):
+                self._air_beeped.difference_update({"flux", "son"})
         self.alert_on = kind == "flux"
-        air = bool(self.on_air and not self.preview)     # contrôle d'entrée / cartoucheur seul : le phare reste éteint et immobile
+        air = bool(self.on_air)                           # hors antenne : le phare reste éteint et immobile
         self.air_fx.set(bool(air and n_live > 0), ("flux" if kind == "flux" else ("son" if kind == "son" else False)) if air else False)
 
     def update_playlist_visuals(self, e):
@@ -18724,9 +19764,18 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.set_cover(cur["path"] if cur else (self.cover_path or None))
 
     def update_nowbar(self, e):
-        if not e:
-            self.set_label(self.now_main, "○ Rien en lecture", MUT)
+        if not e or not (self.on_air or self.preview):
+            self.set_label(self.now_main, "○ Hors antenne" if e else "○ Rien en lecture", MUT)
             self.now_sub.setText("")
+            return
+        if self.preview:
+            ok = getattr(e, "cap_state", "") == "ok"
+            self.set_label(self.now_main, "Contrôle d'entrée (rien n'est diffusé)", ACCT if ok else BADC)
+            self.now_sub.setText("" if ok else "entrée indisponible : voir Source audio")
+            return
+        if getattr(e, "cap_state", "ok") == "error" and not e.backup:
+            self.set_label(self.now_main, "✕ ENTRÉE AUDIO INDISPONIBLE", "#ff6b5e")
+            self.now_sub.setText("voir « 1 · Source audio »")
             return
         if e.mute:
             txt, col = "ANTENNE COUPÉE", "#ff6b5e"
@@ -18738,8 +19787,6 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             txt, col = f"● Direct : aucun signal depuis {e.silent_ms // 1000} s", "#ff6b5e"
         else:
             txt, col = "DIRECT" + (" · " + e.meta if e.meta else ""), "#58d68d"
-        if self.preview:
-            txt = "Cartoucheur hors antenne" if e.standalone else "Contrôle d'entrée (rien n'est diffusé)"
         self.set_label(self.now_main, txt, col)
         self.now_sub.setText("audio ralenti (voir SOS)" if e.slow_now() else "")
 
@@ -18825,7 +19872,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         m.setMaximumWidth(320)
         b.lay.addWidget(m)
         h = QHBoxLayout()
-        h.addWidget(btn("Télécharger", "primary", lambda: (webbrowser.open(r.get("asset") or r["url"]), self.update_bubble_close())))
+        inst = SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy()
+        h.addWidget(btn("Installer" if inst else "Télécharger", "primary",
+                        lambda: (self.update_bubble_close(), self.update_install(r) if inst else webbrowser.open(r.get("asset") or r["url"]))))
 
         def later():
             self.data.setdefault("settings", {})["update_skip"] = r["tag"]
@@ -18838,10 +19887,86 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if NAVTOP:
             b.move(self.width() - b.width() - 14, TopNav.H + 14)
         else:
-            b.move(Rail.W + 10, 14)
+            b.move(self.rail.width() + 10, 14)
         b.show()
         b.raise_()
         self.upd_bubble = b
+
+    def update_install(self, r):
+        """Télécharge l'installateur de la nouvelle version, vérifie le fichier, puis le lance et ferme Bev : l'installateur
+        remplace l'ancienne version et rouvre Bev tout seul (réglages, playlists et cartouches sont conservés)."""
+        url = r.get("asset") or ""
+        if not url:
+            return webbrowser.open(r.get("url") or "")
+        if self.on_air and not yes(self, "Mise à jour", "La diffusion est en cours : l'installation coupe l'antenne une trentaine de secondes.\n\n"
+                                                         "Installer maintenant ?"):
+            return
+        import tempfile
+        dst = os.path.join(tempfile.gettempdir(), r.get("asset_name") or "Bev-Setup.exe")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Mise à jour")
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(22, 18, 22, 16)
+        t = lab(f"Téléchargement de Bev {r.get('tag', '')}…", "")
+        t.setStyleSheet("font-weight:700;")
+        v.addWidget(t)
+        from PySide6.QtWidgets import QProgressBar
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setMinimumWidth(360)
+        v.addWidget(bar)
+        note = lab("Bev se fermera puis se rouvrira tout seul après l'installation.", "mut", True)
+        v.addWidget(note)
+        stop = threading.Event()
+        cancel = btn("Annuler", "", lambda: (stop.set(), dlg.reject()))
+        v.addWidget(cancel, 0, Qt.AlignmentFlag.AlignRight)
+        res = {}
+
+        def work():
+            try:
+                rq = urllib.request.Request(url, headers={"User-Agent": "Bev-update"})
+                h = hashlib.sha256()
+                got = 0
+                with urllib.request.urlopen(rq, timeout=30) as resp, open(dst + ".part", "wb") as fh:
+                    total = int(resp.headers.get("Content-Length") or r.get("size") or 0)
+                    while not stop.is_set():
+                        b = resp.read(256 * 1024)
+                        if not b:
+                            break
+                        fh.write(b)
+                        h.update(b)
+                        got += len(b)
+                        if total:
+                            self.ui(bar.setValue, int(1000 * got / total))
+                if stop.is_set():
+                    return
+                if r.get("size") and got != r["size"]:
+                    raise RuntimeError(f"fichier incomplet ({got} octets sur {r['size']})")
+                dg = r.get("digest", "")
+                if dg.startswith("sha256:") and dg[7:].lower() != h.hexdigest():
+                    raise RuntimeError("le fichier téléchargé est abîmé (empreinte différente)")
+                os.replace(dst + ".part", dst)
+                res["ok"] = True
+            except Exception as ex:
+                res["err"] = str(ex)
+            self.ui(dlg.accept)
+        threading.Thread(target=work, daemon=True).start()
+        dlg.exec()
+        if stop.is_set():
+            return
+        if not res.get("ok"):
+            return err(self, "Mise à jour", "Téléchargement impossible : " + (res.get("err") or "?") +
+                       "\n\nTu peux aussi télécharger l'installateur à la main depuis la page des versions.")
+        try:
+            kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {}
+            subprocess.Popen([dst, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
+                              "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")],
+                             env=clean_env(True), close_fds=True, **kw)
+        except Exception as ex:
+            return err(self, "Mise à jour", f"Impossible de lancer l'installateur : {ex}")
+        self.log(f"Installation de Bev {r.get('tag', '')} : Bev se ferme et se rouvrira tout seul.")
+        self._closing = True
+        self.close()
 
     def update_bubble_close(self):
         if self.upd_bubble is not None:
@@ -18851,6 +19976,11 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     # ------------------------------------------------------------ fermeture
     def closeEvent(self, ev):
+        if self.on_air and not self._closing:
+            if not yes(self, "Quitter Bev", "La diffusion est en cours : quitter coupera l'antenne.\n\nQuitter quand même ?"):
+                ev.ignore()
+                return
+        self._closing = True
         try:
             os.remove(self.MARK)                  # fermeture normale : pas de reprise automatique au prochain lancement
         except OSError:
@@ -18861,6 +19991,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             pass
         try:
             self.mon_listen_stop()
+        except Exception:
+            pass
+        try:
+            self.mon_stop_all()
         except Exception:
             pass
         try:
@@ -18905,21 +20039,63 @@ def win_timer_1ms():
             pass
 
 
+def close_boot_splash():
+    """Ferme l'image de démarrage affichée par l'exécutable dès le double-clic (avant même que Python ne démarre)."""
+    if "_PYI_SPLASH_IPC" not in os.environ or globals().get("_SPLASH_DONE"):
+        return
+    globals()["_SPLASH_DONE"] = True
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
+_INSTANCE_MUTEX = None
+
+
 def main():
     try:
         sys.setswitchinterval(0.002)  # le moteur audio reprend la main plus vite que l'interface
     except Exception:
         pass
+    if "--after" in sys.argv:          # relance (Apparence, mise à jour…) : on attend la fermeture complète de l'ancienne fenêtre
+        try:
+            wait_pid_gone(int(sys.argv[sys.argv.index("--after") + 1]), 20)
+        except (ValueError, IndexError):
+            pass
     win_timer_1ms()
+    selftest = "--selftest" in sys.argv
     if SYS == "Windows":
         try:
             import ctypes
+            global _INSTANCE_MUTEX
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fr.radio.bev")
+            if not selftest:           # l'installateur attend la fermeture de Bev grâce à ce repère
+                _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "BevRadioApp")
         except Exception:
             pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setStyle("Fusion")
+    srv = None
+    if not selftest:                   # une seule fenêtre Bev : un second lancement ramène simplement la fenêtre ouverte
+        try:
+            from PySide6.QtNetwork import QLocalServer, QLocalSocket
+            name = "bev-" + hashlib.md5(os.path.expanduser("~").encode("utf-8", "replace")).hexdigest()[:12]
+            sock = QLocalSocket()
+            sock.connectToServer(name)
+            if sock.waitForConnected(500):
+                sock.write(b"show")
+                sock.waitForBytesWritten(500)
+                sock.disconnectFromServer()
+                close_boot_splash()
+                return
+            QLocalServer.removeServer(name)
+            srv = QLocalServer()
+            srv.listen(name)
+        except Exception:
+            srv = None
     load_fonts()
     try:
         pm = QPixmap()
@@ -18929,27 +20105,39 @@ def main():
     except Exception:
         pass
     app.setStyleSheet(qss())
-    selftest = "--selftest" in sys.argv
     errs = []
     if selftest:                       # vérification automatique (construction GitHub) : tout ouvrir, puis quitter
         import traceback
         sys.excepthook = lambda *a: errs.append("".join(traceback.format_exception(*a)))
     sp = None
-    if not selftest and not MINI:
+    if not selftest:
         try:
             sp = Splash()
             sp.show()
-            sp.spin(1100)
+            close_boot_splash()        # l'écran de chargement animé prend le relais de l'image de démarrage
+            sp.spin(450)
         except Exception:
             sp = None
+    close_boot_splash()
     w = MainWindow()
     if sp is not None:
         try:
-            sp.spin(500)
+            sp.spin(150)
             sp.close()
         except Exception:
             pass
     w.show()
+    if srv is not None:
+        def front():
+            c = srv.nextPendingConnection()
+            if c is not None:
+                c.close()
+            if w.isMinimized():
+                w.showNormal()
+            w.show()
+            w.raise_()
+            w.activateWindow()
+        srv.newConnection.connect(front)
     if selftest:
         for k, key in enumerate(PAGE_KEYS):
             QTimer.singleShot(1500 + k * 500, lambda key=key: w.go_tab(key))
@@ -18960,8 +20148,8 @@ def main():
                    "numpy : " + ("oui" if np is not None else "non"), "sounddevice : " + ("oui" if have_module("sounddevice") else "non"),
                    "psutil : " + ("oui" if have_module("psutil") else "non"),
                    "capture son de l'ordinateur : " + ("oui" if have_loopback() else ("non" if SYS == "Windows" else "sans objet")),
-                   "moteur audio séparé : " + (("oui (pid %s)" % w.slot.pid) if (w.slot is not None and w.slot.alive())
-                                               else "non (" + ((w.slot.error if w.slot is not None else "") or "pas lancé") + ")"),
+                   "moteur audio séparé : " + (("oui (pid %s)" % w.engine.pid) if (isinstance(w.engine, EngineProxy) and w.engine.alive())
+                                               else ("non (moteur dans l'application)" if w.engine is not None else "non (pas lancé)")),
                    f"erreurs : {len(errs)}"] + errs
             try:
                 with open("selftest.txt", "w", encoding="utf-8") as fh:
