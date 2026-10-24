@@ -1,0 +1,18980 @@
+#!/usr/bin/env python3
+"""Bev (« direct » en breton) - diffusion radio multi-sorties (Internet / FM / DAB+ /
+enregistrement), playlist de secours, cartoucheur, monitoring et outils SOS.
+
+Prérequis : Python 3.9+ avec PySide6 et ffmpeg dans le PATH.
+Optionnel : sounddevice (sortie FM sur carte son), PyAudioWPatch (capture du
+son de l'ordinateur sous Windows), odr-audioenc (DAB+).
+"""
+import base64
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import platform
+import queue
+import random
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+from array import array
+from collections import deque
+from urllib.parse import quote, urlencode
+
+try:  # calcul audio rapide (installé automatiquement si absent)
+    import numpy as np
+except Exception:
+    np = None
+
+APP = "Bev"
+CONF = os.path.expanduser("~/.broadcast_tool.json")
+SYS = platform.system()
+
+# --- App empaquetée : ffmpeg / ffplay / icône cherchés d'abord à côté de l'application ---
+APP_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
+_EXE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else APP_DIR
+for _d in (os.path.join(_EXE_DIR, "bin"), _EXE_DIR, os.path.join(APP_DIR, "bin"), APP_DIR):
+    if os.path.isdir(_d) and any(os.path.isfile(os.path.join(_d, n)) for n in ("ffmpeg", "ffmpeg.exe")):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+        break
+if SYS == "Windows":
+    try:  # icône propre dans la barre des tâches (et non celle de Python)
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("studio.radio.diffusion")
+    except Exception:
+        pass
+SR = 44100
+CH = 3528  # 20 ms de PCM 44,1 kHz, stéréo, 16 bits
+DEFAULT_DEVICE = {"Windows": "Microphone", "Darwin": "0"}.get(SYS, "default")
+
+# nom: (options codec, muxer, content-type, fréquence d'échantillonnage)
+FORMATS = {
+    "MP3": (["-c:a", "libmp3lame", "-id3v2_version", "0", "-write_xing", "0"],
+            "mp3", "audio/mpeg", 44100),
+    "AAC": (["-c:a", "aac"], "adts", "audio/aac", 44100),
+    "Ogg Opus": (["-c:a", "libopus"], "ogg", "application/ogg", 48000),
+    "Ogg Vorbis": (["-c:a", "libvorbis"], "ogg", "application/ogg", 44100),
+    "FLAC": (["-c:a", "flac"], "ogg", "application/ogg", 44100),
+}
+SHOUT_FORMATS = ["MP3", "AAC"]
+BITRATES = ["32", "48", "64", "96", "128", "160", "192", "256", "320"]
+
+PROCESSING = {
+    "Aucun": "",
+    "Limiteur doux": "alimiter=limit=0.95:level=0",
+    "Voix (compresseur + limiteur)":
+        "highpass=f=80,acompressor=threshold=0.1:ratio=4:attack=5:release=150:makeup=2,"
+        "alimiter=limit=0.9:level=0",
+    "Radio FM (filtre 15 kHz + compresseur + limiteur)":
+        "highpass=f=30,lowpass=f=15000,"
+        "acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=2,"
+        "alimiter=limit=0.89:level=0",
+    "Normalisation EBU R128": "loudnorm=I=-16:TP=-1.5:LRA=11",
+}
+# --- Traitement du son (page « Traitement du son ») : 4 pages A-D, chacune une chaîne ffmpeg ; chaque flux choisit la sienne
+FX_NEW = dict(nr=0, deess=0, excite=0, width=100, mono=False, gain=0)
+FX_PRESETS = {
+    "Neutre": dict(hp=False, bass=0, mid=0, treble=0, agc=False, agc_lvl=50, comp=0, limit=-1.0, loud=False, **FX_NEW),
+    "Voix parlée": dict(hp=True, bass=-1, mid=2, treble=2, agc=True, agc_lvl=45, comp=45, limit=-1.0, loud=False,
+                        **dict(FX_NEW, nr=25, deess=35)),
+    "Musique": dict(hp=False, bass=1, mid=0, treble=1, agc=False, agc_lvl=50, comp=22, limit=-1.0, loud=False,
+                    **dict(FX_NEW, width=110)),
+    "Radio punchy": dict(hp=True, bass=2, mid=1, treble=3, agc=False, agc_lvl=50, comp=72, limit=-1.5, loud=True,
+                         **dict(FX_NEW, excite=25, width=112, deess=20)),
+    "Doux (nuit)": dict(hp=True, bass=0, mid=0, treble=-1, agc=True, agc_lvl=70, comp=70, limit=-3.0, loud=False,
+                        **dict(FX_NEW, nr=20, deess=25, gain=-1)),
+}
+FX_DEFAULT = dict(FX_PRESETS["Voix parlée"], on=False, preset="Voix parlée", lufs=-16)
+FX_LETTERS = ("A", "B", "C", "D")
+FX_PAGES_DEFAULT = {"A": ("Voix parlée", True), "B": ("Musique", False), "C": ("Radio punchy", False), "D": ("Doux (nuit)", False)}
+FX = {"chain": "", "chains": {}}
+FX_PAGE = "Page A"
+FX_NONE = "Aucun traitement"
+FX_CHOICES = ["Page " + k for k in FX_LETTERS]
+
+
+def build_fx_chain(c, force=False):
+    """Chaîne de filtres ffmpeg : coupe-bas, bruit, de-esser, égaliseur, exciter, AGC, compresseur, largeur, gain, normalisation, limiteur."""
+    if not c or not (c.get("on") or force):
+        return ""
+    f = []
+    num = lambda k, d=0.0: float(c.get(k, d) or 0)
+    if c.get("hp"):
+        f.append("highpass=f=70")
+    if num("nr") > 0:  # réduction de bruit (souffle, ventilateur) : 0-100 % -> 3 à 24 dB
+        f.append(f"afftdn=nr={3 + num('nr') * .21:.0f}:nf=-45:tn=1")
+    if num("deess") > 0:  # atténue les « sss » trop aigus
+        f.append(f"deesser=i={min(1.0, num('deess') / 100):.2f}:m=0.5:f=0.5")
+    if abs(num("bass")) >= .1:
+        f.append(f"bass=g={num('bass'):.1f}:f=110:w=0.7")
+    if abs(num("mid")) >= .1:
+        f.append(f"equalizer=f=1600:t=q:w=0.9:g={num('mid'):.1f}")
+    if abs(num("treble")) >= .1:
+        f.append(f"treble=g={num('treble'):.1f}:f=7500:w=0.7")
+    if num("excite") > 0:  # présence / brillance harmonique
+        f.append(f"aexciter=amount={1 + num('excite') / 100 * 3:.1f}:freq=6500:drive=6:blend=0")
+    if c.get("agc"):  # contrôle automatique de gain : ramène voix fortes et faibles au même niveau
+        f.append(f"dynaudnorm=f=500:g=15:p=0.9:m={3 + num('agc_lvl', 50) * .17:.1f}:s=5")
+    cp = num("comp")
+    if cp > 0:
+        f.append(f"acompressor=threshold={10 ** (-(10 + cp * .18) / 20):.4f}:ratio={1.5 + cp / 100 * 5.5:.2f}"
+                 f":attack=12:release=220:makeup={1 + cp / 100 * 2.5:.2f}")
+    if c.get("mono"):
+        f.append("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
+    elif abs(num("width", 100) - 100) >= 2:  # largeur stéréo : 0 % mono, 100 % normal, 150 % large
+        f.append(f"extrastereo=m={max(0.0, num('width', 100)) / 100:.2f}:c=1")
+    if abs(num("gain")) >= .1:
+        f.append(f"volume={num('gain'):.1f}dB")
+    ceil = max(-9.0, min(0.0, num("limit", -1)))
+    if c.get("loud"):
+        f.append(f"loudnorm=I={num('lufs', -16):.0f}:TP={ceil:.1f}:LRA=9,aresample={SR}")
+    f.append(f"alimiter=limit={10 ** (ceil / 20):.3f}:level=0")
+    return ",".join(f)
+
+
+def fx_chain_for(cfg):
+    """Chaîne de traitement d'un flux : une page A-D, aucun traitement, ou un style choisi pour ce flux."""
+    mode = cfg.get("fxmode", FX_PAGE)
+    if mode == FX_NONE:
+        return ""
+    if mode in FX_PRESETS:
+        return build_fx_chain(dict(FX_PRESETS[mode], lufs=-16), True)
+    if mode.startswith("Page "):
+        return FX["chains"].get(mode[5:6], "")
+    return FX["chains"].get("A", "")  # ancien « réglage de la page »
+
+
+FM_PROC = "Radio FM (filtre 15 kHz + compresseur + limiteur)"
+
+KINDS = {"internet": ("", "Internet"), "fm": ("", "FM"),
+         "dab": ("", "DAB+"), "record": ("", "Enregistrement")}
+METER_W = 300
+MINI_W = 176
+NODEV = "(aucune sortie choisie)"
+ROUTES = ["Antenne", "Antenne + carte son", "Sortie audio seulement"]
+CART_PER = 12                        # F1 à F12 : les 12 premières tuiles du set affiché
+CID = 1000                           # identifiant de lecture d'une tuile = set * 1000 + rang
+CART_MODES = {"Par-dessus": "Par-dessus (baisse l'antenne)",
+              "Remplace": "Remplace l'antenne (coupe le direct)",
+              "Mixé": "Mixé (sans baisser l'antenne)"}
+CART_COLORS = {"Bleu": "#4f63f0", "Vert": "#12a678", "Orange": "#f26a35", "Rouge": "#e5485a",
+               "Violet": "#8650e0", "Turquoise": "#1aa9bd", "Rose": "#d63f7c", "Gris": "#4b5568"}
+
+
+# ------------------------------------------------------------------ outils
+def popen(cmd, **kw):
+    if SYS == "Windows":
+        kw.setdefault("creationflags", 0x08000000)  # pas de fenêtre console
+    return subprocess.Popen(cmd, **kw)
+
+
+def stop_proc(p):
+    """Arrête un processus sans bloquer ; un encodeur bloqué sur un tube plein est tué après 1 s."""
+    try:
+        if p.poll() is not None:
+            return
+        p.terminate()
+    except Exception:
+        return
+
+    def reap():
+        try:
+            p.wait(1.0)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+                p.wait(3.0)
+            except Exception:
+                pass
+    threading.Thread(target=reap, daemon=True).start()
+
+
+def run(cmd, timeout=15):
+    kw = {"creationflags": 0x08000000} if SYS == "Windows" else {}
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+    return r.stdout + "\n" + r.stderr
+
+
+def have_module(name):
+    try:
+        if importlib.util.find_spec(name) is not None:
+            return True
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):  # application empaquetée : on essaie vraiment d'importer
+        try:
+            importlib.import_module(name)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def fine_timer():
+    """Windows : horloge système à 1 ms (sinon time.sleep arrondit à ~16 ms)."""
+    if SYS == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
+
+def peak_db(chunk):
+    """Niveau crête (dBFS) des canaux gauche et droit d'un bloc PCM."""
+    if np is not None:
+        n = len(chunk) // 4 * 4
+        a = np.frombuffer(chunk, dtype="<i2", count=n // 2).reshape(-1, 2)
+        if not len(a):
+            return [-90.0, -90.0]
+        p = np.abs(a.astype(np.int32)).max(axis=0)
+        return [20 * math.log10(v / 32768) if v else -90.0 for v in p]
+    a = array("h")
+    a.frombytes(chunk[:len(chunk) // 4 * 4])
+    res = []
+    for ch in (0, 1):
+        s = a[ch::2]
+        p = max(map(abs, s)) if s else 0
+        res.append(20 * math.log10(p / 32768) if p else -90.0)
+    return res
+
+
+def mix_blocks(a, b, g0, g1):
+    """Fondu enchaîné à puissance constante : g=0 -> a seul, g=1 -> b seul."""
+    h = math.pi / 2
+    l0, l1 = math.cos(g0 * h), math.cos(g1 * h)
+    p0, p1 = math.sin(g0 * h), math.sin(g1 * h)
+    if np is not None:
+        x = np.frombuffer(a, dtype="<i2").astype(np.float32)
+        y = np.frombuffer(b, dtype="<i2").astype(np.float32)
+        r = np.arange(len(x), dtype=np.float32) / len(x)
+        out = x * (l0 + (l1 - l0) * r) + y * (p0 + (p1 - p0) * r)
+        return np.clip(out, -32768, 32767).astype("<i2").tobytes()
+    x, y = array("h"), array("h")
+    x.frombytes(a)
+    y.frombytes(b)
+    n = len(x)
+    dl, dp = (l1 - l0) / n, (p1 - p0) / n
+    out = array("h", (max(-32768, min(32767, int(u * (l0 + dl * i) + v * (p0 + dp * i))))
+                      for i, (u, v) in enumerate(zip(x, y))))
+    return out.tobytes()
+
+
+def gain_mix(a, b, g0, g1):
+    """a * gain (g0 -> g1 sur le bloc) + b."""
+    if np is not None:
+        x = np.frombuffer(a, dtype="<i2").astype(np.float32)
+        y = np.frombuffer(b, dtype="<i2").astype(np.float32)
+        r = np.arange(len(x), dtype=np.float32) / len(x)
+        return np.clip(x * (g0 + (g1 - g0) * r) + y, -32768, 32767).astype("<i2").tobytes()
+    x, y = array("h"), array("h")
+    x.frombytes(a)
+    y.frombytes(b)
+    n = len(x)
+    d = (g1 - g0) / n
+    out = array("h", (max(-32768, min(32767, int(u * (g0 + d * i) + v)))
+                      for i, (u, v) in enumerate(zip(x, y))))
+    return out.tobytes()
+
+
+def tone_block(phase, freq=1000.0, amp=0.125):
+    n = CH // 4
+    inc = 2 * math.pi * freq / SR
+    a = array("h", bytes(CH))
+    for i in range(n):
+        v = int(32767 * amp * math.sin(phase + inc * i))
+        a[2 * i] = v
+        a[2 * i + 1] = v
+    return a.tobytes(), (phase + inc * n) % (2 * math.pi)
+
+
+def trim(buf, hi=50, lo=10):
+    """Limite un tampon PCM en gardant les `lo` derniers blocs."""
+    if len(buf) > hi * CH:
+        del buf[:(len(buf) - lo * CH) // CH * CH]
+
+
+def track_info(path):
+    """(titre affichable, durée en secondes) d'un fichier audio."""
+    base, dur = os.path.splitext(os.path.basename(path))[0], 0.0
+    if shutil.which("ffprobe"):
+        try:
+            out = run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                       "format=duration:format_tags", path], timeout=8)
+            fmt = json.loads(out[:out.rindex("}") + 1])["format"]
+            dur = float(fmt.get("duration") or 0)
+            tags = {k.lower(): v for k, v in fmt.get("tags", {}).items()}
+            if tags.get("title"):
+                base = (tags["artist"] + " - " if tags.get("artist") else "") + tags["title"]
+        except Exception:
+            pass
+    return base, dur
+
+
+def track_title(path):
+    return track_info(path)[0]
+
+
+def _ff_png(src, size, extra=(), data=None, err=None):
+    """Image (fichier, ou octets `data` sur l'entrée standard) réduite en PNG ; `err` (liste) reçoit le message d'erreur de ffmpeg."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin" if data is None else "-y", "-loglevel", "error", *extra, "-i", src, "-an",
+             "-map", "0:v:0?", "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease,format=rgba",
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+            input=data, capture_output=True, stdin=subprocess.DEVNULL if data is None else None, timeout=20,
+            creationflags=0x08000000 if SYS == "Windows" else 0)
+        if r.stdout[:4] == b"\x89PNG":
+            return r.stdout
+        if err is not None:
+            err.append((r.stderr or b"").decode("utf-8", "replace").strip()[-300:] or "aucune image dans le fichier")
+    except Exception as ex:
+        if err is not None:
+            err.append(str(ex))
+    return None
+
+
+def _ogg_picture(path):
+    """Pochette des .ogg / .opus / .oga (étiquette METADATA_BLOCK_PICTURE, que ffmpeg n'extrait pas) : octets de l'image ou None."""
+    import base64
+    import struct
+    try:
+        out = run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries", "stream_tags:format_tags", path], timeout=15)
+        js = json.loads(out[:out.rindex("}") + 1])
+        tags = dict(js.get("format", {}).get("tags", {}))
+        for st in js.get("streams", []):
+            tags.update(st.get("tags", {}))
+        raw = next((v for k, v in tags.items() if k.lower() == "metadata_block_picture"), None)
+        if not raw:
+            return None
+        b = base64.b64decode(raw)
+        o = 4  # type
+        n = struct.unpack(">I", b[o:o + 4])[0]
+        o += 4 + n  # type MIME
+        n = struct.unpack(">I", b[o:o + 4])[0]
+        o += 4 + n  # description
+        o += 16  # largeur, hauteur, profondeur, couleurs
+        n = struct.unpack(">I", b[o:o + 4])[0]
+        return b[o + 4:o + 4 + n]
+    except Exception:
+        return None
+
+
+def _cover_extract(path, size=96, err=None):
+    png = _ff_png(path, size, err=err)
+    if png:
+        return png
+    if path.lower().endswith((".ogg", ".opus", ".oga")):
+        img = _ogg_picture(path)
+        if img:
+            png = _ff_png("pipe:0", size, extra=("-f", "image2pipe"), data=img, err=err)
+            if png:
+                return png
+    try:  # image du dossier : cover / folder / front / album… ; ou l'unique image du dossier
+        d = os.path.dirname(path)
+        imgs = [f for f in os.listdir(d) if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))]
+        low = {f.lower(): f for f in imgs}
+        pick = None
+        for stem in ("cover", "folder", "front", "album", "albumart", "artwork", "albumartsmall", "thumb"):
+            for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                if stem + ext in low:
+                    pick = low[stem + ext]
+                    break
+            if pick:
+                break
+        if not pick:
+            pick = next((f for f in imgs if any(k in f.lower() for k in ("cover", "front", "folder", "album", "pochette"))), None)
+        if not pick and len(imgs) == 1:
+            pick = imgs[0]
+        if pick:
+            return _ff_png(os.path.join(d, pick), size, err=err)
+    except Exception:
+        pass
+    return None
+
+
+def cover_png(path, size=96):
+    """Pochette d'un fichier avec cache disque (~/.broadcast_tool_covers) : instantanée aux lancements suivants."""
+    try:
+        stt = os.stat(path)
+        key = hashlib.sha1(f"v3|{path}|{stt.st_mtime_ns}|{stt.st_size}|{size}".encode("utf-8", "replace")).hexdigest()
+        d = os.path.expanduser("~/.broadcast_tool_covers")
+        fp = os.path.join(d, key + ".png")
+        if os.path.isfile(fp):
+            with open(fp, "rb") as fh:
+                b = fh.read()
+            if b[:4] == b"\x89PNG":
+                return b
+            # fichier vide = « pas de pochette » : on ne s'y fie que 10 min (un échec ponctuel ne doit pas masquer la pochette)
+            if time.time() - os.path.getmtime(fp) < 600:
+                return None
+    except OSError:
+        fp = None
+    if not shutil.which("ffmpeg"):
+        return None                     # sans ffmpeg on ne conclut rien : on réessaiera plus tard
+    png = _cover_extract(path, size)
+    if not png:
+        png = _cover_extract(path, size)          # un second essai : un échec isolé (disque occupé, délai) ne doit pas masquer la pochette
+    if fp and png:                                # on ne mémorise jamais un échec
+        try:
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "wb") as fh:
+                fh.write(png or b"")
+        except OSError:
+            pass
+    return png
+
+
+def scale_pcm(chunk, g):
+    if np is not None:
+        a = np.frombuffer(chunk, dtype="<i2").astype(np.float32) * g
+        return np.clip(a, -32768, 32767).astype("<i2").tobytes()
+    a = array("h")
+    a.frombytes(chunk)
+    return array("h", (max(-32768, min(32767, int(x * g))) for x in a)).tobytes()
+
+
+def pcm_process(pcm, trim=False, maxi=False):
+    """Cartouche : coupe les blancs de début/fin et/ou amène le pic à -1 dBFS."""
+    if not pcm or not (trim or maxi):
+        return pcm
+    margin, thr = 220, 80  # 5 ms de marge ; seuil d'environ -52 dB
+    if np is not None:
+        a = np.frombuffer(pcm, dtype="<i2").reshape(-1, 2)
+        if trim:
+            idx = np.flatnonzero(np.abs(a.astype(np.int32)).max(axis=1) > thr)
+            if len(idx):
+                a = a[max(0, idx[0] - margin): idx[-1] + margin + 1]
+        if maxi and len(a):
+            pk = int(np.abs(a.astype(np.int32)).max())
+            g = min(16.0, 29200 / pk) if pk else 1.0
+            if g > 1.02:
+                a = np.clip(a.astype(np.float32) * g, -32768, 32767).astype("<i2")
+        return a.tobytes()
+    s = array("h")
+    s.frombytes(pcm)
+    if trim:
+        n = len(s) // 2
+        i = 0
+        while i < n and abs(s[2 * i]) <= thr and abs(s[2 * i + 1]) <= thr:
+            i += 1
+        if i < n:
+            j = n - 1
+            while j > i and abs(s[2 * j]) <= thr and abs(s[2 * j + 1]) <= thr:
+                j -= 1
+            s = s[2 * max(0, i - margin): 2 * min(n, j + margin + 1)]
+    if maxi and s:
+        pk = max(max(s), -min(s))
+        g = min(16.0, 29200 / pk) if pk else 1.0
+        if g > 1.02:
+            s = array("h", (max(-32768, min(32767, int(x * g))) for x in s))
+    return s.tobytes()
+
+
+def wave_bins(pcm, n=240):
+    """Forme d'onde : n valeurs de 0 à 1 (crête de chaque tranche)."""
+    if not pcm:
+        return [0.0] * n
+    if np is not None:
+        a = np.abs(np.frombuffer(pcm, dtype="<i2")[::6].astype(np.int32))
+        if len(a) < n:
+            a = np.pad(a, (0, n - len(a)))
+        return [float(c.max()) / 32768 for c in np.array_split(a, n)]
+    s = array("h")
+    s.frombytes(pcm)
+    L = max(1, len(s) // n)
+    out = []
+    for k in range(n):
+        seg = s[k * L:(k + 1) * L:8]
+        out.append(max(map(abs, seg)) / 32768 if seg else 0.0)
+    return out
+
+
+def fmt_ms(sec):
+    """Durée courte : MM:SS, ou H:MM:SS pour les émissions de plus d'une heure."""
+    sec = int(sec)
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60:02d}:{sec % 60:02d}"
+
+
+def fmt_cs(sec):
+    """Temps de cartouche à la Farrago : 0:04.8 (dixièmes de seconde)."""
+    sec = max(0.0, float(sec))
+    t = int(sec * 10 + .5)
+    return f"{t // 600}:{t // 10 % 60:02d}.{t % 10}"
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+# --------------------------------------------------- périphériques d'entrée
+def input_args(device):
+    if SYS == "Windows":
+        return ["-f", "dshow", "-i", f"audio={device}"]
+    if SYS == "Darwin":
+        return ["-f", "avfoundation", "-i", f":{device}"]
+    return ["-f", "pulse", "-i", device]
+
+
+def have_loopback():
+    return SYS == "Windows" and have_module("pyaudiowpatch")
+
+
+def loopback_devices():
+    """Entrées « son de l'ordinateur » (WASAPI loopback), Windows uniquement."""
+    if not have_loopback():
+        return []
+    import pyaudiowpatch as pa
+    pa_inst = pa.PyAudio()
+    try:
+        devs = [("Son de l'ordinateur (sortie par défaut)", "loopback:default")]
+        for d in pa_inst.get_loopback_device_info_generator():
+            devs.append((f"Son de l'ordinateur : {d['name']}", "loopback:" + d["name"]))
+        return devs
+    finally:
+        pa_inst.terminate()
+
+
+def list_devices():
+    """Retourne (liste de (libellé, valeur ffmpeg), texte brut de diagnostic)."""
+    devs, raw = [], ""
+    if SYS == "Linux":
+        if shutil.which("ffmpeg"):
+            raw = run(["ffmpeg", "-hide_banner", "-sources", "pulse"])
+            for line in raw.splitlines():
+                m = re.match(r"\s*\*?\s*(\S+)\s+\[(.*)\]\s*$", line)
+                if m:
+                    devs.append((m.group(2), m.group(1)))
+        if not devs and shutil.which("pactl"):
+            raw = run(["pactl", "list", "short", "sources"])
+            for line in raw.splitlines():
+                p = line.split("\t")
+                if len(p) > 1:
+                    devs.append((p[1], p[1]))
+        return devs, raw
+    fmt = "dshow" if SYS == "Windows" else "avfoundation"
+    raw = run(["ffmpeg", "-hide_banner", "-f", fmt, "-list_devices", "true",
+               "-i", "dummy" if SYS == "Windows" else ""])
+    section = None
+    for line in raw.splitlines():
+        if "audio devices" in line:
+            section = "audio"
+        elif "video devices" in line:
+            section = "video"
+        elif "Alternative name" in line:
+            continue
+        elif SYS == "Windows":
+            m = re.search(r'"([^"]+)"(?:\s+\(([^)]*)\))?', line)
+            if m and ("audio" in (m.group(2) or "") or
+                      (m.group(2) is None and section == "audio")):
+                devs.append((m.group(1), m.group(1)))
+        elif section == "audio":
+            m = re.search(r"\[(\d+)\]\s+(.+)$", line)
+            if m:
+                devs.append((m.group(2).strip(), m.group(1)))
+    if SYS == "Windows":
+        try:
+            devs = loopback_devices() + devs
+        except Exception as e:
+            raw += f"\nCapture du son de l'ordinateur indisponible : {e}"
+    return devs, raw
+
+
+def list_output_devices():
+    """Cartes son de sortie (pour la sortie FM) : [(libellé, index)]."""
+    import sounddevice as sd
+    apis = sd.query_hostapis()
+    out = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] >= 2:
+            out.append((f"{d['name']} [{apis[d['hostapi']]['name']}]", i))
+    return out
+
+
+# ---------------------------------------------------------- Shoutcast v1
+def shoutcast_connect(c):
+    """Protocole source Shoutcast v1/ICY : port du serveur + 1 par défaut."""
+    port = int(c.get("sc_port") or int(c["port"]) + 1)
+    s = socket.create_connection((c["host"], port), timeout=10)
+    s.sendall(c["password"].encode() + b"\n")
+    if b"OK" not in s.recv(1024):
+        s.close()
+        raise RuntimeError("Mot de passe refusé par le serveur Shoutcast")
+    ctype = FORMATS[c["format"]][2]
+    hdr = (f"content-type:{ctype}\r\nicy-name:{c['name']}\r\n"
+           f"icy-genre:{c['genre']}\r\nicy-br:{c['bitrate']}\r\n"
+           f"icy-pub:0\r\nicy-description:{c['desc']}\r\n\r\n")
+    s.sendall(hdr.encode("utf-8", "replace"))
+    s.settimeout(None)
+    return s
+
+
+# ------------------------------------------------------- modèle de données
+def listen_url(c):
+    """Adresse que les auditeurs utilisent pour écouter une sortie Internet."""
+    host, port = (c.get("host") or "").strip(), str(c.get("port") or "").strip()
+    scheme = "https" if port in ("443", "8443") else "http"
+    base = f"{scheme}://{host}" + ("" if port in ("", "80", "443") else f":{port}")
+    if c.get("protocol") == "Shoutcast":
+        return base + "/;"
+    return base + "/" + (c.get("mount") or "").lstrip("/")
+
+
+def slugify(text):
+    import unicodedata
+    t = "".join(ch for ch in unicodedata.normalize("NFD", str(text).lower()) if unicodedata.category(ch) != "Mn")
+    t = re.sub(r"[^a-z0-9._/-]+", "-", t).strip("-/")
+    return re.sub(r"-{2,}", "-", t)
+
+
+def new_output(kind, name=None):
+    o = {"id": uuid.uuid4().hex[:8], "type": kind, "enabled": True,
+         "name": name or KINDS[kind][1], "reconnect": True, "processing": "Aucun"}
+    if kind == "internet":
+        o.update(protocol="Icecast", host="localhost", port="8000", sc_port="",
+                 mount="/live", user="source", password="", format="MP3",
+                 bitrate="128", channels="2", genre="Various", desc="")
+    elif kind == "fm":
+        o.update(device="", processing=FM_PROC, rds=False, ps="RADIO",
+                 rds_mode="Fichier / pipe", rds_target="",
+                 rds_template="PS {PS}\\nRT {RT}\\n")
+    elif kind == "dab":
+        o.update(mode="ODR-AudioEnc", odr_path="odr-audioenc",
+                 dest="tcp://127.0.0.1:9000", bitrate="96", profile="HE-AAC (SBR)",
+                 extra="", dls_file="", net_url="udp://127.0.0.1:5004",
+                 net_format="mpegts", processing="Limiteur doux")
+    elif kind == "record":
+        o.update(folder=os.path.join(os.path.expanduser("~"), "Enregistrements radio"),
+                 format="MP3", bitrate="192", rotate="60", keep_days="0",
+                 prefix="", stamp="2026-10-23_16h30", pige="0", date="1")
+    return o
+
+
+def hist_path():
+    return os.path.join(os.path.dirname(CONF), "broadcast_history.csv")
+
+
+def new_cart():
+    return {"name": "", "file": "", "color": "Bleu", "mode": "Par-dessus", "loop": False, "vol": 100,
+            "trim": False, "maximize": False, "fade": 0.0, "fade_in": None, "fade_out": None, "fade_click": None, "group": 0,
+            "start": 0.0, "end": 0.0, "emoji": "", "key": "", "midi": "", "notes": "",
+            "solo": False, "pausable": False, "hold": False}
+
+
+def default_profile():
+    return {
+        "source": {"device": DEFAULT_DEVICE},
+        "fallback": {"enabled": False, "shuffle": False, "threshold": "-50",
+                     "silence_s": "10", "recover_s": "2", "fade_in": "0.5", "fade_out": "1.2", "playlist": [], "off": [],
+                     "jingle": {"enabled": False, "every": "15", "files": []}},
+        "outputs": [],
+        "meta": {"text": "", "follow": True},
+        "delay": "0", "gain": "0", "cover": "",
+        "carts": {"duck": 70, "fade_click": 2.5, "master": 100, "device": "", "route": ROUTES[0], "solo": False, "pages": [[], []],
+                  "names": ["Set 1", "Set 2"], "locks": ["", ""]},
+    }
+
+
+def norm_carts(c):
+    """Sets de tuiles : nombre libre de sets nommés (verrouillables), nombre libre de sons par set.
+    Ancien format (4 pages de 12 touches A à D) : converti, touches vides retirées."""
+    c.setdefault("duck", 70)
+    c.setdefault("fade_click", 2.5)
+    c.setdefault("master", 100)
+    pages = c.get("pages") if isinstance(c.get("pages"), list) else []
+    pages = [pg if isinstance(pg, list) else [] for pg in pages] or [[]]
+    legacy = not isinstance(c.get("names"), list)
+    for pg in pages:
+        pg[:] = [fill(x, new_cart()) for x in pg if isinstance(x, dict) and x.get("file")]
+        for x in pg:
+            f = x.get("fade") or 0
+            for k in ("fade_in", "fade_out"):
+                if x.get(k) is None:
+                    x[k] = f
+    if legacy:
+        while len(pages) > 1 and not pages[-1]:
+            pages.pop()
+    names = [str(n) for n in c.get("names") or []] if not legacy else [f"Page {chr(65 + k)}" for k in range(len(pages))]
+    locks = [str(n) for n in c.get("locks") or []] if not legacy else []
+    c["pages"] = pages
+    c["names"] = (names + [f"Set {k + 1}" for k in range(len(names), len(pages))])[:len(pages)]
+    c["locks"] = (locks + [""] * len(pages))[:len(pages)]
+    return c
+
+
+def upgrade(p):
+    """Profil v2 (Extras + Planning) -> v3 (titre, retard, cartoucheur)."""
+    c = p.get("carts")
+    if isinstance(c, dict):  # réglages d'édition globaux (ancienne version) -> propres à chaque cartouche
+        for pg in c.get("pages") or []:
+            for cart in pg if isinstance(pg, list) else []:
+                if isinstance(cart, dict):
+                    for k in ("trim", "maximize"):
+                        cart.setdefault(k, bool(c.get(k, False)))
+    j = (p.get("fallback") or {}).get("jingle")
+    if isinstance(j, dict) and "files" not in j:  # un seul jingle -> liste de jingles
+        j["files"] = [j["file"]] if j.get("file") else []
+    if isinstance(j, dict):
+        j.pop("file", None)
+    ex = p.pop("extras", None)
+    p.pop("schedule", None)
+    if ex:
+        m = ex.get("meta", {})
+        p.setdefault("meta", {"text": m.get("text", ""),
+                              "follow": m.get("mode") == "Suivre la playlist de secours"})
+        p.setdefault("delay", str(ex.get("delay", "0")))
+        old = [j for j in ex.get("jingles", []) if j.get("file")]
+        if old and "carts" not in p:
+            page = [dict(new_cart(), name=j.get("name", ""), file=j["file"],
+                         mode=j.get("mode") if j.get("mode") in CART_MODES else "Par-dessus")
+                    for j in old]
+            p["carts"] = {"duck": 70, "pages": [page]}
+    fill(p, default_profile())
+    norm_carts(p["carts"])
+    return p
+
+
+def fill(d, defaults):
+    """Complète d avec les clés manquantes de defaults (récursif)."""
+    for k, v in defaults.items():
+        if k not in d:
+            d[k] = json.loads(json.dumps(v))
+        elif isinstance(v, dict) and isinstance(d[k], dict):
+            fill(d[k], v)
+    return d
+
+
+def migrate_preset(old):
+    """Ancien réglage à plat (v1) -> profil v2 avec une sortie Internet."""
+    p = default_profile()
+    p["source"]["device"] = old.get("device", DEFAULT_DEVICE)
+    fb = p["fallback"]
+    fb["enabled"] = bool(old.get("fallback", False))
+    for k in ("shuffle", "threshold", "silence_s", "recover_s", "fade_in", "fade_out", "playlist"):
+        if k in old:
+            fb[k] = old[k]
+    if old.get("host") or old.get("password"):
+        o = new_output("internet", old.get("name") or "Internet")
+        for k in ("protocol", "host", "port", "mount", "user", "password", "format",
+                  "bitrate", "channels", "genre", "desc", "reconnect"):
+            if k in old:
+                o[k] = old[k]
+        p["outputs"].append(o)
+    return p
+
+
+def load_data():
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            d = json.load(f)
+        if "profiles" not in d:  # ancien format
+            bak = CONF + ".v1.bak"
+            if not os.path.exists(bak):
+                shutil.copy(CONF, bak)
+            old = d.get("presets") or {"Défaut": d}
+            d = {"last": d.get("last", "Défaut"),
+                 "profiles": {n: migrate_preset(v) for n, v in old.items()},
+                 "monitor": d.get("monitor", {})}
+        if not d["profiles"]:
+            d["profiles"] = {"Défaut": default_profile()}
+        for n in d["profiles"]:
+            upgrade(d["profiles"][n])
+        d.setdefault("monitor", {})
+        d.setdefault("alerts", {})
+        d.setdefault("counts", {})
+        if d.get("last") not in d["profiles"]:
+            d["last"] = next(iter(d["profiles"]))
+        return d
+    except Exception:
+        return {"last": "Défaut", "profiles": {"Défaut": default_profile()},
+                "monitor": {}, "alerts": {}}
+
+
+def save_data(d):
+    tmp = CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONF)
+
+# ------------------------------------------------------------------ moteur
+class CartMonitor:
+    """Envoie le son des cartouches vers une carte son locale (casque, pré-écoute)."""
+
+    def __init__(self, log):
+        self.log, self.label, self.stream = log, "", None
+        self.buf, self.lk, self.primed = bytearray(), threading.Lock(), False
+
+    def set_device(self, label):
+        if label == self.label:
+            return
+        self.close()
+        self.label = label
+        if label:
+            threading.Thread(target=self.open, args=(label,), daemon=True).start()
+
+    def open(self, label):
+        try:
+            import sounddevice as sd
+            idx = dict(list_output_devices()).get(label)
+            if idx is None:
+                raise RuntimeError("carte son introuvable")
+
+            def cb(outdata, frames, t, status):
+                need = frames * 4
+                with self.lk:
+                    if not self.primed and len(self.buf) >= 6 * CH:
+                        self.primed = True
+                    chunk = bytes(self.buf[:need]) if self.primed else b""
+                    del self.buf[:len(chunk)]
+                    if self.primed and not self.buf:
+                        self.primed = False
+                outdata[:need] = chunk + bytes(need - len(chunk))
+            extra = sd.WasapiSettings(auto_convert=True) if "WASAPI" in label else None
+            st = sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
+                                    callback=cb, latency="low", extra_settings=extra)
+            st.start()
+            if self.label != label:
+                return st.close()
+            self.stream = st
+            self.log(f"Cartoucheur : carte son « {label} » prête.")
+        except ImportError:
+            self.log("Cartoucheur : module sounddevice manquant (onglet SOS > Installer).")
+        except Exception as e:
+            self.log(f"Cartoucheur : carte son indisponible ({e}).")
+
+    def push(self, block):
+        if self.stream:
+            with self.lk:
+                self.buf += block
+                if len(self.buf) > 60 * CH:
+                    del self.buf[:len(self.buf) - 14 * CH]
+
+    def close(self):
+        st, self.stream, self.label = self.stream, None, ""
+        with self.lk:
+            self.buf.clear()
+            self.primed = False
+        if st:
+            try:
+                st.stop()
+                st.close()
+            except Exception:
+                pass
+
+
+class Engine:
+    """Moteur de diffusion (sans interface) : capture, détection de signal,
+    secours, fondus, cartouches, retard de sécurité et distribution aux sorties."""
+
+    def __init__(self, prof, log, alert=None, standalone=False):
+        self.prof, self.log, self.standalone = prof, log, standalone
+        self.alert = alert or (lambda text, key=None: None)
+        self.lock = threading.Lock()
+        self.ev = threading.Event()
+        self.running = False
+        self.started = 0.0
+        self.live_buf, self.pl_buf = bytearray(), bytearray()
+        self.pl_marks, self.pl_in, self.pl_out = deque(), 0, 0
+        self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+        self.silent_ms = self.loud_ms = 0
+        self.mix_g, self.rec_ms = 0.0, 2000.0
+        self.peak = [-90.0, -90.0]
+        self.track, self.meta = "", ""
+        self.meta_manual = prof["meta"].get("text", "")
+        self.delay_blocks = self.to_blocks(prof.get("delay", "0"))
+        self.delay_q = deque()
+        self.voices, self.loading, self.duck_g = [], set(), 1.0
+        self.pcm_cache = {}
+        self.in_peak, self.clip_t, self.pl_cur = [-90.0, -90.0], 0.0, None
+        self.proc_ms, self.late, self.late_t = 0.0, 0, 0.0
+        self.late_hist = []
+        self.next_file, self.pl_skip = None, False
+        self.gain = 1.0
+        self.set_gain(prof.get("gain", "0"))
+        self.cmon = CartMonitor(self.log)
+        self.buses, self.bus_bad, self.n_dist = {}, set(), 0
+        self.cap_proc = self.pl_proc = None
+        self.outputs = [make_output(c, self) for c in prof["outputs"]]
+
+    # --- démarrage / arrêt
+    def start(self):
+        self.running = True
+        self.ev.clear()
+        c = self.prof["carts"]
+        self.cmon.set_device(c.get("device", ""))
+        self.started = time.time()
+        fns = ((self.feeder_loop, self.preload_carts) if self.standalone else
+               (self.capture_loop, self.playlist_loop, self.feeder_loop, self.meta_loop,
+                self.preload_carts, self.jingle_loop))
+        for fn in fns:
+            threading.Thread(target=fn, daemon=True).start()
+        for o in self.outputs:
+            if o.cfg.get("enabled", True):
+                o.start()
+
+    def stop(self):
+        self.running = False
+        self.ev.set()
+        self.cmon.close()
+        for o in self.outputs:
+            o.stop()
+        for b in list(self.buses.values()):
+            b.stop()
+        self.buses = {}
+        for p in (self.cap_proc, self.pl_proc):
+            if p:
+                stop_proc(p)
+
+    def output(self, oid):
+        return next((o for o in self.outputs if o.cfg["id"] == oid), None)
+
+    # --- traitement du son partagé
+    def bus_wanted(self, chain):
+        """Un même traitement utilisé par au moins deux flux est calculé une seule fois (bus), puis partagé."""
+        if chain in self.bus_bad:
+            return False
+        return sum(1 for o in self.outputs if o.cfg.get("enabled", True) and fx_chain_for(o.cfg) == chain) >= 2
+
+    def distribute(self, out):
+        """Bloc de 20 ms vers les sorties : directement, ou via le bus de traitement qu'elles partagent."""
+        used = set()
+        for o in self.outputs:
+            bc = o.bus_chain
+            if bc is None:
+                o.push(out)
+            elif o.thread is not None and o.thread.is_alive():
+                used.add(bc)
+        for c in used:
+            if c in self.bus_bad:
+                continue
+            b = self.buses.get(c)
+            if b is None:
+                b = self.buses[c] = FxBus(self, c)
+            b.push(out)
+        self.n_dist += 1
+        if self.n_dist % 50 == 0:                  # une fois par seconde : bus devenus inutiles arrêtés
+            for c in [c for c in self.buses if c not in used]:
+                self.buses.pop(c).stop()
+
+    def remove_output(self, oid):
+        """Retire une sortie de l'antenne en cours (elle s'arrête en arrière-plan)."""
+        o = self.output(oid)
+        if o:
+            self.outputs = [x for x in self.outputs if x is not o]
+            threading.Thread(target=o.stop, daemon=True).start()
+
+    def prof_update(self, section, **kw):
+        """Réglage modifié pendant l'antenne (volume du cartoucheur, fondus du secours, titre…)."""
+        _merge(self.prof.setdefault(section, {}), kw)
+
+    def swap_output(self, cfg):
+        """Ajoute ou remplace une sortie en cours d'antenne (nouveau plateau, adresse modifiée)."""
+        old = self.output(cfg["id"])
+        new = make_output(cfg, self)
+        self.outputs = [o for o in self.outputs if o is not old] + [new]
+        if old:
+            old.stop()
+        if self.running and cfg.get("enabled", True):
+            new.start()
+
+    # --- commandes à chaud
+    @staticmethod
+    def to_blocks(sec):
+        try:
+            return max(0, min(2000, int(float(sec) * 50)))
+        except ValueError:
+            return 0
+
+    def set_gain(self, db):
+        try:
+            self.gain = 10 ** (max(-24.0, min(24.0, float(db))) / 20)
+        except (TypeError, ValueError):
+            self.gain = 1.0
+
+    def set_delay(self, sec):
+        self.delay_blocks = self.to_blocks(sec)
+
+    def dump_delay(self):
+        """Vide le retard de sécurité : le son retenu n'est jamais diffusé."""
+        self.delay_q.clear()
+        self.log("DUMP : audio retenu supprimé, le retard se reconstitue en silence.")
+
+    def play_now(self, path):
+        """Joue tout de suite ce morceau / cette émission de la playlist de secours."""
+        self.next_file, self.pl_skip, self.pl_active, self.manual = path, True, True, True
+        self.log("Lecture choisie : " + os.path.basename(path))
+
+    def set_manual(self, on):
+        self.manual = bool(on)
+        if not on:
+            self.log("Retour manuel au direct demandé.")
+
+    # --- métadonnées (titre en cours)
+    def desired_meta(self):
+        if self.backup and self.prof["meta"].get("follow") and self.track:
+            return self.track
+        return self.meta_manual
+
+    def meta_loop(self):
+        while not self.ev.is_set():
+            try:
+                text = self.desired_meta()
+            except Exception:
+                text = None
+            if text is not None and text != self.meta:
+                self.meta = text
+                self.push_meta()
+            self.ev.wait(1)
+
+    def push_meta(self):
+        for o in self.outputs:
+            threading.Thread(target=o.send_meta, args=(self.meta,), daemon=True).start()
+
+    def history(self, kind, name, path):
+        """Ajoute une ligne à l'historique des diffusions (CSV lisible dans Excel)."""
+        try:
+            p = hist_path()
+            new = not os.path.exists(p)
+            with open(p, "a", encoding="utf-8-sig", newline="") as f:
+                if new:
+                    f.write("Date;Heure;Type;Titre;Fichier\n")
+                clean = lambda x: str(x).replace(";", ",").replace("\n", " ")
+                f.write(";".join((time.strftime("%d/%m/%Y"), time.strftime("%H:%M:%S"), kind, clean(name), clean(path))) + "\n")
+        except OSError:
+            pass
+
+    def counts(self):
+        return self.prof["fallback"].setdefault("counts", {})
+
+    def least_played(self, files, rnd=False):
+        """Parmi les fichiers, un des moins lus (à égalité : le premier de la liste, ou au hasard)."""
+        c = self.counts()
+        low = min(c.get(f, 0) for f in files)
+        cand = [f for f in files if c.get(f, 0) == low]
+        return random.choice(cand) if rnd else cand[0]
+
+    def count_play(self, f, title=None):
+        c = self.counts()
+        c[f] = c.get(f, 0) + 1
+        self.history("Secours", title or os.path.splitext(os.path.basename(f))[0], f)
+
+    def jingle_loop(self):
+        """Pendant le secours, joue un jingle à intervalle régulier (le moins lu d'abord)."""
+        since = None
+        while not self.ev.wait(1):
+            j = self.prof["fallback"].get("jingle", {})
+            files = [f for f in j.get("files", []) if os.path.exists(f)]
+            if not (j.get("enabled") and files and self.backup):
+                since = None
+                continue
+            now = time.time()
+            since = since or now
+            try:
+                every = max(0.01, float(j.get("every", 15))) * 60
+            except (TypeError, ValueError):
+                every = 900.0
+            if now - since >= every:
+                since = now
+                f = self.least_played(files)
+                self.count_play(f)
+                self.play_cart(-1, {"file": f, "name": "Jingle secours", "mode": "Par-dessus",
+                                    "vol": 100, "loop": False})
+
+    # --- cartoucheur
+    def get_pcm(self, path, trim=False, maxi=False):
+        """Décode un fichier en PCM (cache ; coupe des blancs / maximisation selon les options)."""
+        trim, maxi = bool(trim), bool(maxi)
+        try:
+            key = (path, os.path.getmtime(path), trim, maxi)
+        except OSError:
+            return None
+        if key in self.pcm_cache:
+            return self.pcm_cache[key]
+        try:
+            pcm = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
+                 "-vn", "-t", "300", "-ar", str(SR), "-ac", "2", "-f", "s16le", "pipe:1"],
+                capture_output=True, stdin=subprocess.DEVNULL, timeout=90,
+                creationflags=0x08000000 if SYS == "Windows" else 0).stdout
+        except Exception:
+            return None
+        pcm = pcm[:len(pcm) // 4 * 4]
+        if not pcm:
+            return None
+        pcm = pcm_process(pcm, trim, maxi) or pcm
+        for k in [k for k in self.pcm_cache if k[0] == path]:
+            del self.pcm_cache[k]
+        if sum(len(v) for v in self.pcm_cache.values()) + len(pcm) > 400e6:
+            self.pcm_cache.clear()  # garde la mémoire raisonnable
+        self.pcm_cache[key] = pcm
+        return pcm
+
+    def preload_carts(self):
+        """Prépare les cartouches en arrière-plan pour qu'elles partent instantanément."""
+        for page in self.prof["carts"]["pages"]:
+            for c in page:
+                if self.ev.is_set():
+                    return
+                if c.get("file"):
+                    self.get_pcm(c["file"], c.get("trim"), c.get("maximize"))
+
+    def play_cart(self, cid, cart, pre=False, at=None):
+        """at : position de départ en secondes dans le fichier (tête de lecture placée à la main), sinon le point d'entrée."""
+        if cid in self.loading:
+            return
+        self.loading.add(cid)
+
+        def work():
+            try:
+                pcm = self.get_pcm(cart["file"], cart.get("trim"), cart.get("maximize"))
+                if not pcm:
+                    return self.log(f"Cartouche illisible : {os.path.basename(cart['file'])}")
+                try:
+                    vol = max(0, min(150, int(cart.get("vol", 100)))) / 100
+                except (TypeError, ValueError):
+                    vol = 1.0
+                def fd(k):
+                    try:
+                        v = cart.get(k)
+                        return max(0.0, min(10.0, float(cart.get("fade", 0) if v is None else v) or 0))
+                    except (TypeError, ValueError):
+                        return 0.0
+                fi, fo = fd("fade_in"), fd("fade_out")
+                grp = int(cart.get("group", 0) or 0)
+                with self.lock:
+                    if cart.get("solo"):  # tuile « solo » : coupe tout le reste en fondu
+                        for o in self.voices:
+                            if o["id"] != cid and not o["stopping"]:
+                                o["stopping"] = True
+                                o["sfade"] = min(self.fade_click(), 0.6)
+                    if grp:  # groupe exclusif : lancer une touche arrête les autres du groupe
+                        for o in self.voices:
+                            if o.get("group") == grp and o["id"] != cid and not o["stopping"]:
+                                o["stopping"] = True
+                                o["sfade"] = self.fade_click()
+                    try:
+                        st0 = int(max(0.0, float(cart.get("start", 0) or 0)) * 176400) // 4 * 4
+                    except (TypeError, ValueError):
+                        st0 = 0
+                    if st0 >= len(pcm) - 3528:
+                        st0 = 0
+                    try:
+                        en = int(max(0.0, float(cart.get("end", 0) or 0)) * 176400) // 4 * 4
+                    except (TypeError, ValueError):
+                        en = 0
+                    if en <= st0 + 3528 or en > len(pcm):
+                        en = len(pcm)
+                    p0 = st0
+                    if at is not None:
+                        try:
+                            p0 = int(max(0.0, float(at)) * 176400) // 4 * 4
+                        except (TypeError, ValueError):
+                            p0 = st0
+                        if not st0 <= p0 < en - 3528:
+                            p0 = st0
+                    try:
+                        own = cart.get("fade_click")
+                        own = None if own in (None, "") else max(0.0, min(10.0, float(own)))
+                    except (TypeError, ValueError):
+                        own = None
+                    self.voices.append({"id": cid, "pcm": pcm, "pos": p0, "paused": False, "vol": vol, "g": 0.0, "st0": st0, "end": en,
+                                        "fi": fi, "fo": fo, "group": grp, "own_stop": own, "pk": 0.0,
+                                        "loop": bool(cart.get("loop")), "stopping": False, "pre": pre,
+                                        "mode": cart.get("mode", "Par-dessus"),
+                                        "name": cart.get("name") or os.path.basename(cart["file"])})
+                self.log(f"Cartouche : {self.voices[-1]['name']}")
+                if not pre:
+                    self.history("Cartouche", self.voices[-1]["name"], cart["file"])
+            finally:
+                self.loading.discard(cid)
+        threading.Thread(target=work, daemon=True).start()
+
+    def slow_now(self):
+        """Vrai seulement si l'audio a eu au moins 3 trous de plus de 80 ms ces 30 dernières secondes."""
+        now = time.time()
+        return sum(1 for x in list(self.late_hist) if now - x < 30) >= 3
+
+    def fade_click(self):
+        try:
+            return max(0.0, min(10.0, float(self.prof["carts"].get("fade_click", 2.5))))
+        except (TypeError, ValueError, KeyError):
+            return 2.5
+
+    def stop_cart(self, cid=None, fade=None):
+        """Arrête une cartouche (ou toutes) avec un fondu : celui du réglage « Fondu au clic » (2,5 s par défaut)."""
+        base = self.fade_click()
+        with self.lock:
+            for v in self.voices:
+                if (cid is None or v["id"] == cid) and not v["stopping"]:
+                    v["stopping"] = True
+                    v["sfade"] = fade if fade is not None else (v["own_stop"] if v.get("own_stop") is not None else base)
+
+    def cart_master(self):
+        try:
+            return max(0.0, min(1.5, float(self.prof["carts"].get("master", 100)) / 100))
+        except (TypeError, ValueError, KeyError):
+            return 1.0
+
+    def seek_cart(self, cid, sec):
+        """Déplace la tête de lecture d'une cartouche en cours (secondes dans le fichier), avec un micro-fondu anti-clic."""
+        with self.lock:
+            for v in self.voices:
+                if v["id"] == cid and not v["stopping"]:
+                    lim = v.get("end") or len(v["pcm"])
+                    v["pos"] = max(v.get("st0", 0), min(lim - 4, int(max(0.0, sec) * 176400) // 4 * 4))
+                    v["g"], v["fi"] = 0.0, 0.015
+                    return True
+        return False
+
+    def pause_cart(self, cid=None, on=None):
+        """Met en pause / reprend une cartouche (ou toutes). Renvoie le nouvel état de la première trouvée."""
+        res = None
+        with self.lock:
+            for v in self.voices:
+                if (cid is None or v["id"] == cid) and not v["stopping"]:
+                    nv = (not v.get("paused")) if on is None else bool(on)
+                    if res is None:
+                        res = nv
+                    if cid is None and on is None:
+                        nv = res
+                    if v.get("paused") and not nv:
+                        v["fi"] = 0.03
+                    v["paused"] = nv
+        return res
+
+    def set_cart_live(self, cid, **kw):
+        """Volume / boucle modifiés pendant la lecture."""
+        with self.lock:
+            for v in self.voices:
+                if v["id"] == cid:
+                    if "vol" in kw:
+                        v["vol"] = max(0.0, min(1.5, kw["vol"]))
+                    if "loop" in kw:
+                        v["loop"] = bool(kw["loop"])
+                    if "fo" in kw:
+                        v["fo"] = kw["fo"]
+
+    def cart_playing(self, cid):
+        return any(v["id"] == cid and not v["stopping"] for v in list(self.voices))
+
+    def cart_status(self):
+        """{id: (position_s, durée_s, boucle, écoute, en_fondu)} des cartouches en cours, + ids en chargement."""
+        st = {v["id"]: (max(0.0, (v["pos"] - v.get("st0", 0)) / 176400), (v.get("end", len(v["pcm"])) - v.get("st0", 0)) / 176400,
+                        v["loop"], bool(v["pre"]), bool(v["stopping"]), v.get("pk", 0.0), bool(v.get("paused")),
+                        v.get("st0", 0) / 176400)
+              for v in list(self.voices)}
+        return st, set(self.loading)
+
+    # --- capture de l'entrée
+    @staticmethod
+    def drain(p, store):
+        """Vide la sortie d'erreur d'un processus (sinon il peut se bloquer)."""
+        try:
+            for line in p.stderr:
+                store.append(line.decode("utf-8", "replace").strip())
+        except Exception:
+            pass
+
+    def pump(self, proc, prefix=""):
+        buf = b""
+        while True:
+            chunk = proc.stderr.read(1024)
+            if not chunk:
+                break
+            parts = re.split(rb"[\r\n]+", buf + chunk)
+            buf = parts.pop()
+            for p in parts:
+                line = p.decode("utf-8", "replace").strip()
+                if line:
+                    self.log(prefix + line)
+
+    def open_loopback(self, device):
+        """Capture du son de l'ordinateur (WASAPI loopback, PyAudioWPatch) ;
+        ffmpeg convertit le flux en PCM 44,1 kHz stéréo."""
+        import pyaudiowpatch as pa
+        pa_inst = pa.PyAudio()
+        proc = None
+        try:
+            name = device[len("loopback:"):]
+            info = next((d for d in pa_inst.get_loopback_device_info_generator()
+                         if d["name"] == name), None) or pa_inst.get_default_wasapi_loopback()
+            rate, ch = int(info["defaultSampleRate"]), int(info["maxInputChannels"])
+            proc = popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "s16le",
+                 "-ar", str(rate), "-ac", str(ch), "-i", "pipe:0", "-ar", "44100",
+                 "-ac", "2", "-flush_packets", "1", "-f", "s16le", "pipe:1"],
+                bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+
+            wl = threading.Lock()
+            last = [time.perf_counter()]
+
+            def cb(data, frames, t, status):
+                last[0] = time.perf_counter()
+                try:
+                    with wl:
+                        proc.stdin.write(data)
+                except (OSError, ValueError):
+                    return (None, pa.paAbort)
+                return (None, pa.paContinue)
+
+            def filler():
+                # WASAPI loopback n'envoie AUCUN bloc quand rien ne joue : on injecte du silence
+                # pour que l'entrée reste « vivante » (sinon plus de signal, ni de niveau, ni de bascule propre).
+                blk = bytes(int(rate * 0.02) * ch * 2)
+                nxt = time.perf_counter()
+                while proc.poll() is None and not self.ev.is_set():
+                    nxt += 0.02
+                    d = nxt - time.perf_counter()
+                    if d > 0:
+                        time.sleep(d)
+                    else:
+                        nxt = time.perf_counter()
+                    if time.perf_counter() - last[0] > 0.06:
+                        try:
+                            with wl:
+                                proc.stdin.write(blk)
+                        except (OSError, ValueError):
+                            return
+            threading.Thread(target=filler, daemon=True).start()
+
+            stream = pa_inst.open(format=pa.paInt16, channels=ch, rate=rate, input=True,
+                                  input_device_index=info["index"],
+                                  frames_per_buffer=1024, stream_callback=cb)
+            return proc, pa_inst, stream
+        except Exception:
+            if proc and proc.poll() is None:
+                proc.terminate()
+            pa_inst.terminate()
+            raise
+
+    def capture_loop(self):
+        """Lit l'entrée audio (PCM) dans un tampon ; relance si elle disparaît."""
+        device = self.prof["source"]["device"]
+        while not self.ev.is_set():
+            stream = pa_inst = p = None
+            try:
+                if device.startswith("loopback:"):
+                    p, pa_inst, stream = self.open_loopback(device)
+                else:
+                    p = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error"] +
+                              input_args(device) +
+                              ["-ar", "44100", "-ac", "2", "-f", "s16le", "pipe:1"],
+                              bufsize=0, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+                self.cap_proc = p
+                threading.Thread(target=self.pump, args=(p, "Entrée : "), daemon=True).start()
+                with self.lock:
+                    self.live_buf.clear()
+                carry = b""
+                while True:
+                    data = p.stdout.read(CH)
+                    if not data:
+                        break
+                    data = carry + data
+                    n = len(data) // 4 * 4
+                    data, carry = data[:n], data[n:]
+                    if not data:
+                        continue
+                    if self.gain != 1.0:
+                        data = scale_pcm(data, self.gain)
+                    lv = peak_db(data)  # niveau d'entrée mesuré dès l'arrivée du son
+                    for ch in (0, 1):
+                        self.in_peak[ch] = max(self.in_peak[ch], lv[ch])
+                    with self.lock:
+                        self.live_buf += data
+                        trim(self.live_buf)
+            except ImportError:
+                self.log("Module PyAudioWPatch manquant : installe-le depuis l'onglet SOS.")
+            except Exception as e:
+                self.log(f"Capture impossible : {e}")
+            finally:
+                try:
+                    if stream:
+                        stream.stop_stream()
+                        stream.close()
+                    if pa_inst:
+                        pa_inst.terminate()
+                except Exception:
+                    pass
+                if p:
+                    stop_proc(p)
+            with self.lock:
+                del self.live_buf[len(self.live_buf) // 4 * 4:]
+            if not self.ev.is_set():
+                self.log("Entrée audio indisponible, nouvelle tentative dans 3 s...")
+                self.ev.wait(3)
+
+    # --- playlist de secours
+    def playlist_loop(self):
+        """Décode la playlist de secours plus vite que le temps réel (5 s d'avance)."""
+        fb = self.prof["fallback"]
+        while not self.ev.is_set():
+            full = list(fb["playlist"])
+            off = set(fb.get("off", []))
+            files = [x for x in full if x not in off]
+            if not (self.pl_active and files):
+                self.ev.wait(0.1)
+                continue
+            if self.next_file and self.next_file in full:  # morceau / émission choisi(e)
+                f, self.next_file = self.next_file, None
+                with self.lock:  # le saut demandé est pris en compte : on repart d'un tampon vide
+                    if self.pl_skip:
+                        self.pl_buf.clear()
+                        self.pl_marks.clear()
+                        self.pl_in = self.pl_out = 0
+                        self.pl_skip = False
+            else:
+                f = self.least_played(files, fb["shuffle"])  # les moins lus d'abord
+            title, dur = track_info(f)
+            self.count_play(f, title)
+            got, p, err = False, None, deque(maxlen=10)
+            try:
+                p = self.pl_proc = popen(
+                    ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+                     "-i", f, "-map", "0:a:0?", "-vn", "-ar", "44100", "-ac", "2",
+                     "-f", "s16le", "pipe:1"],
+                    bufsize=0, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                threading.Thread(target=self.drain, args=(p, err), daemon=True).start()
+                with self.lock:
+                    self.pl_marks.append((self.pl_in, title, full.index(f), f, dur))
+                while self.pl_active and not self.ev.is_set() and not self.pl_skip:
+                    if len(self.pl_buf) > 250 * CH:
+                        self.ev.wait(0.02)
+                        continue
+                    data = p.stdout.read(8 * CH)
+                    if not data:
+                        break
+                    got = True
+                    with self.lock:
+                        self.pl_buf += data
+                        self.pl_in += len(data)
+                stop_proc(p)
+            except OSError as e:
+                err.append(str(e))
+            with self.lock:
+                cut = len(self.pl_buf) % 4
+                if cut:
+                    del self.pl_buf[len(self.pl_buf) - cut:]
+                    self.pl_in -= cut
+                skipped, self.pl_skip = self.pl_skip, False
+                if skipped or not self.pl_active:
+                    self.pl_buf.clear()
+                    self.pl_marks.clear()
+                    self.pl_in = self.pl_out = 0
+                if not self.pl_active:
+                    self.track, self.pl_cur = "", None
+            if not got and not skipped:
+                if self.pl_active and not self.ev.is_set():
+                    self.log(f"Lecture impossible : {os.path.basename(f)} "
+                             + " ".join(list(err)[-2:]))
+                self.ev.wait(1)
+
+    # --- horloge de diffusion
+    def feeder_loop(self):
+        """Détecte le signal, choisit direct ou secours avec un fondu enchaîné,
+        applique cartouches / mute / retard, puis distribue un bloc de 20 ms aux sorties."""
+        fb = self.prof["fallback"]
+        try:
+            thr = float(fb["threshold"])
+            delay = float(fb["silence_s"]) * 1000
+            rec = float(fb["recover_s"]) * 1000
+        except ValueError:
+            thr, delay, rec = -50.0, 10000.0, 2000.0
+        use_pl = bool(fb["playlist"])  # le secours manuel marche même sans bascule automatique
+        self.rec_ms = rec
+        if not self.standalone:
+            self.log(f"Bascule automatique activée : seuil {thr:g} dB, délai {delay / 1000:g} s, "
+                     f"{len(fb['playlist'])} fichier(s)." if (use_pl and fb["enabled"]) else
+                     "Bascule automatique désactivée.")
+        idle = 0.0
+        zero = bytes(CH)
+        starved = live_ok = False
+        g, phase = 0.0, 0.0  # g : 0 = direct, 1 = playlist de secours
+        def fade_steps():
+            try:
+                fi = max(0.05, min(30.0, float(str(fb.get("fade_in", "0.5")).replace(",", "."))))
+                fo = max(0.05, min(30.0, float(str(fb.get("fade_out", "1.2")).replace(",", "."))))
+            except ValueError:
+                fi, fo = 0.5, 1.2
+            return 0.02 / fi, 0.02 / fo
+        step_in, step_out = fade_steps()  # fondu réglable (par défaut 0,5 s vers secours, 1,2 s retour)
+        nfade = 0
+        nxt = time.perf_counter()
+        while not self.ev.is_set():
+            nxt += 0.02
+            wait = nxt - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            elif wait < -1:
+                nxt = time.perf_counter()
+            if wait < -0.02:
+                self.late += 1
+                self.late_t = time.time()
+                if wait < -0.08:                  # un vrai trou (80 ms et plus), pas une simple gigue
+                    self.late_hist = [x for x in self.late_hist if self.late_t - x < 30] + [self.late_t]
+            t0 = time.perf_counter()
+            live, pl = zero, zero
+            with self.lock:
+                if not live_ok and len(self.live_buf) >= 4 * CH:
+                    live_ok = True  # réserve de 80 ms contre les irrégularités de capture
+                if live_ok:
+                    if len(self.live_buf) >= CH:
+                        live = bytes(self.live_buf[:CH])
+                        del self.live_buf[:CH]
+                    else:
+                        live_ok = False
+                if self.backup or g > 0:
+                    if len(self.pl_buf) >= CH * (10 if starved else 1):
+                        pl = bytes(self.pl_buf[:CH])
+                        del self.pl_buf[:CH]
+                        self.pl_out += CH
+                        starved = False
+                        while self.pl_marks and self.pl_marks[0][0] <= self.pl_out:
+                            m = self.pl_marks.popleft()
+                            self.track = m[1]
+                            self.pl_cur = {"i": m[2], "path": m[3], "start": m[0], "dur": m[4]}
+                    else:
+                        starved = True  # attend 200 ms d'avance avant de reprendre
+            if self.tone:
+                live, phase = tone_block(phase)
+            lv = peak_db(live)
+            if max(lv) > thr:
+                self.silent_ms = 0
+                self.loud_ms += 20
+            else:
+                self.silent_ms += 20
+                if self.silent_ms >= max(delay, 1000):
+                    self.loud_ms = 0
+            if use_pl:
+                if self.manual and not self.backup:
+                    self.backup = True
+                    self.log("Bascule manuelle sur la playlist de secours.")
+                elif fb["enabled"] and not self.manual and not self.backup and self.silent_ms >= delay:
+                    self.backup = True
+                    msg = (f"Aucun signal depuis {delay / 1000:g} s : "
+                           "bascule sur la playlist de secours.")
+                    self.log(msg)
+                    self.alert(msg, "fallback")
+                elif self.backup and not self.manual and self.loud_ms >= rec:
+                    self.backup = False
+                    self.log("Signal retrouvé : retour au direct (fondu).")
+                    self.alert("Signal retrouvé : retour au direct.", "fallback-back")
+                self.pl_active = (self.backup or self.manual or g > 0 or
+                                  (fb["enabled"] and self.silent_ms >= max(delay * 0.3, delay - 3000)))
+            nfade += 1
+            if nfade % 50 == 0:
+                step_in, step_out = fade_steps()
+            target = 1.0 if self.backup else 0.0
+            g0 = g
+            if g < target:
+                g = min(target, g + step_in)
+            elif g > target:
+                g = max(target, g - step_out)
+            self.mix_g = g
+            if g0 == 0.0 and g == 0.0:
+                prog = live
+            elif g0 == 1.0 and g == 1.0:
+                prog = pl
+            else:
+                prog = mix_blocks(live, pl, g0, g)
+            prog = self.apply_carts(prog, zero)
+            if self.mute:
+                prog = zero
+            dq = self.delay_q
+            dq.append(prog)
+            n = self.delay_blocks
+            while len(dq) > n + 1:
+                dq.popleft()
+            out = dq.popleft() if len(dq) > n else zero
+            lv = peak_db(out)
+            if max(lv) > -0.3:
+                self.clip_t = time.time()
+            for ch in (0, 1):
+                self.peak[ch] = max(self.peak[ch], lv[ch])
+            self.distribute(out)
+            self.proc_ms += ((time.perf_counter() - t0) * 1000 - self.proc_ms) * 0.05
+            if self.standalone:  # cartoucheur hors antenne : s'éteint après 2 min sans lecture
+                idle = 0.0 if self.voices else idle + 0.02
+                if idle > 120:
+                    self.stop()
+                    return
+
+    @staticmethod
+    def clip_mix(parts):
+        if np is not None:  # limiteur doux : plusieurs tuiles en même temps ne saturent plus
+            s = np.sum(parts, axis=0)
+            m = np.abs(s)
+            if float(m.max()) > 24000.0:
+                s = np.where(m > 24000.0, np.sign(s) * (24000.0 + 8767.0 * np.tanh((m - 24000.0) / 8767.0)), s)
+            return np.clip(s, -32768, 32767).astype("<i2").tobytes()
+        return array("h", (max(-32768, min(32767, int(sum(c)))) for c in zip(*parts))).tobytes()
+
+    def apply_carts(self, prog, zero):
+        """Mélange les cartouches en cours sur l'antenne (sauf sortie audio seule) et baisse le direct ;
+        tout part aussi vers la carte son du cartoucheur si elle est choisie."""
+        with self.lock:
+            voices = list(self.voices)
+        duck = 1.0
+        air, dev = [], []
+        master = self.cart_master()
+        for v in voices:
+            if v.get("paused") and v["g"] <= 0.0:
+                continue                         # en pause : la tête de lecture ne bouge plus
+            pcm, pos, chunk = v["pcm"], v["pos"], b""
+            lim = v.get("end") or len(pcm)
+            while len(chunk) < CH and pos < lim:
+                piece = pcm[pos:min(lim, pos + CH - len(chunk))]
+                chunk += piece
+                pos += len(piece)
+                if pos >= lim and v["loop"] and not v["stopping"]:
+                    pos = v.get("st0", 0)
+            ended = len(chunk) < CH
+            if ended:
+                chunk += bytes(CH - len(chunk))
+            v["pos"] = pos
+            g0 = v["g"]
+            fi, fo = v.get("fi", 0.0), v.get("fo", 0.0)
+            g1 = (max(0.0, g0 - 0.02 / max(v.get("sfade", fo), 0.03)) if v["stopping"]
+                  else max(0.0, g0 - 0.02 / 0.04) if v.get("paused")
+                  else min(1.0, g0 + 0.02 / (fi if fi > 0 else 0.01)))
+            if fo > 0 and not v["loop"]:  # fondu de sortie sur la fin du son
+                g1 = min(g1, max(0.0, (lim - pos) / 176400 / fo))
+            v["g"] = g1
+            k0, k1 = g0 * v["vol"] * master, g1 * v["vol"] * master
+            if np is not None:
+                a = np.frombuffer(chunk, dtype="<i2").astype(np.float32)
+                sc = a * (k0 + (k1 - k0) * np.arange(len(a), dtype=np.float32) / len(a))
+            else:
+                a = array("h")
+                a.frombytes(chunk)
+                d = (k1 - k0) / len(a)
+                sc = [x * (k0 + d * i) for i, x in enumerate(a)]
+            try:
+                pk = (float(np.abs(sc).max()) if np is not None else max((abs(x) for x in sc), default=0.0)) / 32768.0
+            except Exception:
+                pk = 0.0
+            v["pk"] = max(pk, v.get("pk", 0.0) * 0.8)
+            dev.append(sc)
+            if not v["pre"]:
+                air.append(sc)
+                if v["mode"] == "Remplace":
+                    t = 0.0
+                elif v["mode"] == "Mixé":
+                    t = 1.0
+                else:
+                    t = 1.0 - self.duck_amount()
+                duck = min(duck, 1.0 - (1.0 - t) * max(g0, g1) if t < 1 else 1.0)
+            if ended or (v["stopping"] and g1 == 0.0):
+                with self.lock:
+                    if v in self.voices:
+                        self.voices.remove(v)
+        if dev and self.cmon.stream:
+            self.cmon.push(self.clip_mix(dev))
+        g0 = self.duck_g
+        step = 0.02 / (0.15 if duck < g0 else 0.6)
+        g = max(duck, g0 - step) if duck < g0 else min(duck, g0 + step)
+        self.duck_g = g
+        if not air and g0 == 1.0 and g == 1.0:
+            return prog
+        if not air:
+            return gain_mix(prog, zero, g0, g)
+        return gain_mix(prog, self.clip_mix(air), g0, g)
+
+    def duck_amount(self):
+        try:
+            return max(0.0, min(1.0, float(self.prof["carts"].get("duck", 70)) / 100))
+        except (TypeError, ValueError):
+            return 0.7
+
+# ------------------------------------------------------------------ sorties
+class FxBus:
+    """Traitement du son calculé UNE fois pour tous les flux qui utilisent la même page (A-D) : un seul ffmpeg de traitement,
+    puis le son traité est distribué aux encodeurs. Avec trois flux sur la page A, trois fois moins de calcul. En cas
+    d'échecs répétés, les flux concernés reviennent à leur propre traitement (comme avant)."""
+
+    def __init__(self, eng, chain):
+        self.eng, self.chain = eng, chain
+        self.q = queue.Queue(maxsize=300)
+        self.stop_ev = threading.Event()
+        self.proc, self.fails = None, 0
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def push(self, blk):
+        try:
+            self.q.put_nowait(blk)
+        except queue.Full:
+            try:
+                self.q.get_nowait()
+                self.q.put_nowait(blk)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def subscribers(self):
+        return [o for o in list(self.eng.outputs) if o.bus_chain == self.chain]
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            err, t0 = deque(maxlen=6), time.time()
+            try:
+                p = self.proc = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "s16le", "-ar", str(SR),
+                                       "-ac", "2", "-i", "pipe:0", "-af", self.chain, "-ar", str(SR), "-ac", "2", "-f", "s16le",
+                                       "pipe:1"], bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError as ex:
+                err.append(str(ex))
+                p = None
+            if p is not None:
+                threading.Thread(target=Engine.drain, args=(p, err), daemon=True).start()
+                threading.Thread(target=self.feed, args=(p,), daemon=True).start()
+                carry = b""
+                while True:
+                    data = p.stdout.read(8192)
+                    if not data:
+                        break
+                    data = carry + data
+                    n = len(data) // 4 * 4
+                    data, carry = data[:n], data[n:]
+                    if data:
+                        for o in self.subscribers():
+                            o.push(data)
+                stop_proc(p)
+            if self.stop_ev.is_set():
+                break
+            self.fails = 0 if time.time() - t0 > 30 else self.fails + 1
+            self.eng.log("Traitement son partagé interrompu" + (f" ({' '.join(list(err)[-1:])})" if err else "") + " : relance.")
+            if self.fails >= 3:                     # on n'insiste pas : chaque flux reprend son propre traitement
+                self.eng.bus_bad.add(self.chain)
+                self.eng.log("Traitement son partagé abandonné : chaque flux applique son propre traitement.")
+                for o in self.subscribers():
+                    threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.5), o.start()), daemon=True).start()
+                break
+            self.stop_ev.wait(1)
+
+    def feed(self, p):
+        while not self.stop_ev.is_set() and p.poll() is None:
+            try:
+                blk = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                p.stdin.write(blk)
+            except (OSError, ValueError):
+                break
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.stop_ev.set()
+        p = self.proc
+        if p is not None:
+            threading.Thread(target=stop_proc, args=(p,), daemon=True).start()
+
+
+class Output:
+    """Une destination : chaque sortie a son propre encodeur et sa reconnexion."""
+
+    def __init__(self, cfg, eng):
+        self.cfg, self.eng = cfg, eng
+        self.q = queue.Queue(maxsize=300)
+        self.state, self.detail = "stopped", ""
+        self.stop_ev = threading.Event()
+        self.thread = None
+        self.procs = []
+        self.err = deque(maxlen=12)
+        self.t_live = 0.0
+        self.had_error = False
+        self.meta_note = ""
+        self.bus_chain = None              # traitement du son partagé : ce flux reçoit le son déjà traité par le bus
+
+    @property
+    def name(self):
+        return self.cfg.get("name") or self.cfg["type"]
+
+    def describe(self):
+        return ""
+
+    def status_text(self):
+        if self.state == "live":
+            return "● En ligne depuis " + fmt_dur(time.time() - self.t_live)
+        if self.state == "connecting":
+            return "◌ Connexion en cours…"
+        if self.state == "error":
+            return "✕ Problème : " + (self.detail or "?")[:80]
+        return "○ Arrêté"
+
+    # --- cycle de vie
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_ev = threading.Event()
+        self.state, self.detail = "connecting", ""
+        self.thread = threading.Thread(target=self.supervise, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        self.state, self.detail = "stopped", ""
+        threading.Thread(target=self.kill, daemon=True).start()
+
+    def kill(self):
+        """Ferme les encodeurs proprement (fin de flux), puis force si besoin."""
+        procs, self.procs = list(self.procs), []
+        for p in procs:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
+        t0 = time.time()
+        while time.time() - t0 < 1.5 and any(p.poll() is None for p in procs):
+            time.sleep(0.05)
+        for p in procs:
+            stop_proc(p)
+
+    def set_state(self, state, detail=""):
+        old = self.state
+        self.state, self.detail = state, detail
+        if state == "live":
+            self.t_live = time.time()
+        if old == state:
+            return
+        key = "out-" + self.cfg["id"]
+        if state == "error":
+            self.had_error = True
+            self.eng.log(f"[{self.name}] erreur : {detail}")
+            self.eng.alert(f"Sortie « {self.name} » en erreur : {detail}", key)
+        elif state == "live":
+            self.eng.log(f"[{self.name}] en direct")
+            if self.had_error:
+                self.had_error = False
+                self.eng.alert(f"Sortie « {self.name} » rétablie.", key + "-ok")
+            threading.Thread(target=self.send_meta, args=(self.eng.meta,), daemon=True).start()
+
+    def supervise(self):
+        stop = self.stop_ev
+        fails = 0
+        while not stop.is_set():
+            self.set_state("connecting")
+            self.err.clear()
+            t_start = time.time()
+            try:
+                self.run_once()
+            except Exception as e:
+                self.err.append(str(e))
+            self.kill()
+            if stop.is_set():
+                break
+            fails = 0 if self.t_live >= t_start else fails + 1
+            self.set_state("error", self.last_error() or "arrêt inattendu")
+            if not self.cfg.get("reconnect", True):
+                break
+            for _ in range(min(300, 50 + 50 * fails)):  # 5 s, puis +5 s par échec (30 s max)
+                if stop.is_set():
+                    break
+                time.sleep(0.1)
+
+    def last_error(self):
+        for line in reversed(self.err):
+            if line and not re.match(r"(size=|video:|audio:|\[out#|Exiting)", line):
+                return line[:120]
+        return ""
+
+    # --- audio
+    def push(self, blk):
+        if not self.thread or not self.thread.is_alive():
+            return
+        try:
+            self.q.put_nowait(blk)
+        except queue.Full:
+            try:
+                self.q.get_nowait()
+                self.q.put_nowait(blk)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def drain_q(self):
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+
+    def filters(self):
+        chain = fx_chain_for(self.cfg)
+        wanted = getattr(self.eng, "bus_wanted", None)
+        self.bus_chain = chain if (chain and wanted and wanted(chain)) else None
+        f = ",".join(x for x in (None if self.bus_chain else chain, PROCESSING.get(self.cfg.get("processing", "Aucun"), "")) if x)
+        return ["-af", f] if f else []
+
+    @staticmethod
+    def pcm_in():
+        return ["-hide_banner", "-nostdin", "-f", "s16le", "-ar", str(SR), "-ac", "2",
+                "-i", "pipe:0"]
+
+    def spawn(self, cmd, stdout=None, stdin=None, ffmpeg=True):
+        p = popen(cmd, bufsize=0, stdin=subprocess.PIPE if stdin is None else stdin,
+                  stdout=subprocess.DEVNULL if stdout is None else stdout,
+                  stderr=subprocess.PIPE)
+        self.procs.append(p)
+        threading.Thread(target=self.read_err, args=(p, ffmpeg), daemon=True).start()
+        if stdin is None:
+            threading.Thread(target=self.feed, args=(p,), daemon=True).start()
+        return p
+
+    def read_err(self, p, ffmpeg):
+        buf = b""
+        while True:
+            chunk = p.stderr.read(1024)
+            if not chunk:
+                break
+            parts = re.split(rb"[\r\n]+", buf + chunk)
+            buf = parts.pop()
+            for raw in parts:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                if ffmpeg and "time=" in line:
+                    if self.state == "connecting":
+                        self.set_state("live")
+                else:
+                    self.err.append(line)
+
+    def feed(self, p):
+        stop = self.stop_ev
+        while not stop.is_set() and p.poll() is None:
+            try:
+                blk = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                p.stdin.write(blk)
+            except (OSError, ValueError):
+                break
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+
+    def wait_all(self, live_after=None):
+        """Attend que la sortie s'arrête (processus terminé ou arrêt demandé)."""
+        t0 = time.time()
+        while not self.stop_ev.is_set():
+            if any(p.poll() is not None for p in self.procs):
+                break
+            if live_after and self.state == "connecting" and time.time() - t0 > live_after:
+                self.set_state("live")
+            self.tick()
+            time.sleep(0.2)
+
+    def tick(self):
+        pass
+
+    def run_once(self):
+        raise NotImplementedError
+
+    def send_meta(self, text):
+        pass
+
+
+class InternetOutput(Output):
+    def describe(self):
+        c = self.cfg
+        d = f"{c['protocol']} {c['host']}:{c['port']}"
+        return d + c["mount"] if c["protocol"] == "Icecast" else d
+
+    def run_once(self):
+        c = self.cfg
+        shout = c["protocol"] == "Shoutcast"
+        fmt = c["format"] if c["format"] in FORMATS else "MP3"
+        if shout and fmt not in SHOUT_FORMATS:
+            fmt = "MP3"
+        codec, muxer, ctype, rate = FORMATS[fmt]
+        out = ["-ar", str(rate), "-ac", str(c["channels"])] + codec
+        if fmt != "FLAC":
+            out += ["-b:a", f"{c['bitrate']}k"]
+        sock = None
+        try:
+            if shout:
+                sock = shoutcast_connect({**c, "format": fmt})
+                out += ["-f", muxer, "pipe:1"]
+            else:
+                url = "icecast://{}:{}@{}:{}/{}".format(
+                    quote(c["user"], safe=""), quote(c["password"], safe=""),
+                    c["host"], c["port"], c["mount"].lstrip("/"))
+                out += ["-content_type", ctype, "-ice_name", c["name"],
+                        "-ice_genre", c["genre"], "-ice_description", c["desc"],
+                        "-f", muxer, url]
+            self.drain_q()
+            p = self.spawn(["ffmpeg"] + self.pcm_in() + self.filters() + out,
+                           stdout=subprocess.PIPE if shout else None)
+            if shout:
+                threading.Thread(target=self.forward, args=(p, sock), daemon=True).start()
+            self.wait_all()
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def forward(self, p, sock):
+        try:
+            while True:
+                data = p.stdout.read(4096)
+                if not data:
+                    break
+                sock.sendall(data)
+        except OSError as e:
+            self.err.append(f"Connexion Shoutcast perdue : {e}")
+            if p.poll() is None:
+                p.terminate()
+
+    def send_meta(self, text):
+        c = self.cfg
+        if self.state != "live" or not text:
+            return
+        try:
+            if c["protocol"] == "Icecast":
+                url = (f"http://{c['host']}:{c['port']}/admin/metadata?" + urlencode(
+                    {"mount": "/" + c["mount"].lstrip("/"), "mode": "updinfo",
+                     "song": text, "charset": "UTF-8"}))
+                req = urllib.request.Request(url)
+                tok = base64.b64encode(f"{c['user']}:{c['password']}".encode()).decode()
+                req.add_header("Authorization", "Basic " + tok)
+            else:
+                url = (f"http://{c['host']}:{c['port']}/admin.cgi?" + urlencode(
+                    {"pass": c["password"], "mode": "updinfo", "song": text}))
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            urllib.request.urlopen(req, timeout=5).read()
+            self.meta_note = "Titre envoyé"
+        except Exception as e:
+            self.meta_note = f"Titre non envoyé : {e}"
+            self.eng.log(f"[{self.name}] {self.meta_note}")
+
+
+def split_hostport(s):
+    host, _, port = s.rpartition(":")
+    return host.strip("[]") or "127.0.0.1", int(port)
+
+
+class FMOutput(Output):
+    """Sortie FM : son (avec traitement) vers une carte son reliée à l'émetteur,
+    et texte RDS (PS / RT) envoyé à l'encodeur RDS."""
+
+    def describe(self):
+        return self.cfg.get("device") or "(carte son à choisir)"
+
+    def run_once(self):
+        if not have_module("sounddevice"):
+            raise RuntimeError("module sounddevice manquant (onglet SOS > Installer)")
+        import sounddevice as sd
+        label = self.cfg.get("device", "")
+        idx = dict(list_output_devices()).get(label)
+        if idx is None:
+            raise RuntimeError("carte son de sortie introuvable : choisis-la dans la sortie")
+        buf, lk = bytearray(), threading.Lock()
+        hi, lo = int(0.6 * SR) * 4, int(0.3 * SR) * 4
+
+        def add(data):
+            with lk:
+                buf.extend(data)
+                if len(buf) > hi:  # dérive d'horloge : on rattrape en douceur
+                    del buf[:(len(buf) - lo) // 4 * 4]
+
+        def cb(outdata, frames, t, status):
+            need = frames * 4
+            with lk:
+                chunk = bytes(buf[:need])
+                del buf[:need]
+            outdata[:need] = chunk + bytes(need - len(chunk))
+
+        self.drain_q()
+        use_ff = bool(self.filters())
+        if use_ff:
+            p = self.spawn(["ffmpeg"] + self.pcm_in() + self.filters() +
+                           ["-ar", str(SR), "-ac", "2", "-f", "s16le", "pipe:1"],
+                           stdout=subprocess.PIPE)
+
+            def reader():
+                while True:
+                    data = p.stdout.read(CH)
+                    if not data:
+                        break
+                    add(data)
+            threading.Thread(target=reader, daemon=True).start()
+        else:
+            def pump():
+                while not self.stop_ev.is_set():
+                    try:
+                        add(self.q.get(timeout=0.2))
+                    except queue.Empty:
+                        continue
+            threading.Thread(target=pump, daemon=True).start()
+        extra = None
+        if "WASAPI" in label:
+            extra = sd.WasapiSettings(auto_convert=True)
+        stream = sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
+                                    callback=cb, latency="high", extra_settings=extra)
+        try:
+            t0 = time.time()
+            while len(buf) < int(0.2 * SR) * 4 and time.time() - t0 < 2:
+                time.sleep(0.02)
+            stream.start()
+            self.set_state("live")
+            while not self.stop_ev.is_set():
+                if use_ff and self.procs and self.procs[0].poll() is not None:
+                    break
+                time.sleep(0.2)
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def send_meta(self, text):
+        c = self.cfg
+        target = (c.get("rds_target") or "").strip()
+        if not c.get("rds") or not target or self.state != "live":
+            return
+        tpl = (c.get("rds_template") or "PS {PS}\\nRT {RT}\\n")
+        tpl = tpl.replace("\\r", "\r").replace("\\n", "\n")
+        data = tpl.replace("{PS}", (c.get("ps") or "")[:8]).replace("{RT}", (text or "")[:64])
+        try:
+            mode = c.get("rds_mode", "")
+            if mode == "UDP":
+                host, port = split_hostport(target)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.sendto(data.encode("utf-8", "replace"), (host, port))
+            elif mode == "TCP":
+                host, port = split_hostport(target)
+                with socket.create_connection((host, port), timeout=3) as s:
+                    s.sendall(data.encode("utf-8", "replace"))
+            elif SYS != "Windows" and os.path.exists(target) and stat.S_ISFIFO(os.stat(target).st_mode):
+                fd = os.open(target, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    os.write(fd, data.encode("utf-8", "replace"))
+                finally:
+                    os.close(fd)
+            else:
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(data)
+            self.meta_note = "RDS envoyé"
+        except Exception as e:
+            self.meta_note = f"RDS non envoyé : {e}"
+            self.eng.log(f"[{self.name}] {self.meta_note}")
+
+
+class DABOutput(Output):
+    """Sortie DAB+ : vers ODR-AudioEnc (puis ODR-DabMux) ou AAC sur le réseau."""
+
+    def describe(self):
+        c = self.cfg
+        return c["dest"] if c.get("mode", "").startswith("ODR") else c.get("net_url", "")
+
+    def run_once(self):
+        c = self.cfg
+        br = str(c["bitrate"])
+        prof = c.get("profile", "HE-AAC (SBR)")
+        ff = ["ffmpeg"] + self.pcm_in() + self.filters() + ["-ar", "48000", "-ac", "2"]
+        self.drain_q()
+        if c.get("mode", "").startswith("ODR"):
+            exe = c.get("odr_path") or "odr-audioenc"
+            if not (shutil.which(exe) or os.path.isfile(exe)):
+                raise RuntimeError("odr-audioenc introuvable (indique son chemin complet)")
+            flag = {"AAC-LC": "--aaclc", "HE-AAC v2 (SBR+PS)": "--ps"}.get(prof, "--sbr")
+            enc = [exe, "-i", "-", "-f", "raw", "-r", "48000", "-c", "2", "-b", br, flag,
+                   "-o", c["dest"]] + shlex.split(c.get("extra", ""), posix=(SYS != "Windows"))
+            p1 = self.spawn(ff + ["-f", "s16le", "pipe:1"], stdout=subprocess.PIPE)
+            p2 = popen(enc, stdin=p1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            self.procs.append(p2)
+            threading.Thread(target=self.read_err, args=(p2, False), daemon=True).start()
+            p1.stdout.close()
+            self.wait_all(live_after=2)
+        else:
+            codec = {"AAC-LC": ["-c:a", "aac"],
+                     "HE-AAC (SBR)": ["-c:a", "libfdk_aac", "-profile:a", "aac_he"],
+                     "HE-AAC v2 (SBR+PS)": ["-c:a", "libfdk_aac", "-profile:a", "aac_he_v2"]
+                     }.get(prof, ["-c:a", "aac"])
+            self.spawn(ff + codec + ["-b:a", f"{br}k", "-f", c.get("net_format", "mpegts"),
+                                     c["net_url"]])
+            self.wait_all()
+
+    def send_meta(self, text):
+        f = (self.cfg.get("dls_file") or "").strip()
+        if not f:
+            return
+        try:
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write(text or "")
+            self.meta_note = "Texte DLS écrit"
+        except OSError as e:
+            self.meta_note = f"DLS non écrit : {e}"
+            self.eng.log(f"[{self.name}] {self.meta_note}")
+
+
+class RecordOutput(Output):
+    """Enregistrement local du programme, découpé en fichiers horaires."""
+    CODECS = {"MP3": (["-c:a", "libmp3lame"], ".mp3", True),
+              "FLAC": (["-c:a", "flac"], ".flac", False),
+              "Ogg Opus": (["-c:a", "libopus"], ".ogg", True),
+              "WAV": (["-c:a", "pcm_s16le"], ".wav", False)}
+    NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}h\d{2}\.\w+$")
+
+    def __init__(self, cfg, eng):
+        super().__init__(cfg, eng)
+        self.last_clean = 0.0
+
+    def describe(self):
+        return self.cfg.get("folder", "")
+
+    def cleanup(self):
+        self.last_clean = time.time()
+        try:
+            days = float(self.cfg.get("keep_days") or 0)
+        except ValueError:
+            days = 0
+        if days <= 0:
+            return
+        folder = self.cfg["folder"]
+        for n in os.listdir(folder) if os.path.isdir(folder) else []:
+            p = os.path.join(folder, n)
+            try:
+                if self.NAME_RE.match(n) and os.path.getmtime(p) < time.time() - days * 86400:
+                    os.remove(p)
+                    self.eng.log(f"[{self.name}] ancien fichier supprimé : {n}")
+            except OSError:
+                pass
+
+    def tick(self):
+        if time.time() - self.last_clean > 3600:
+            self.cleanup()
+
+    def run_once(self):
+        c = self.cfg
+        folder = c["folder"]
+        os.makedirs(folder, exist_ok=True)
+        codec, ext, has_br = self.CODECS.get(c.get("format", "MP3"), self.CODECS["MP3"])
+        try:
+            minutes = max(1, int(float(c.get("rotate") or 60)))
+        except ValueError:
+            minutes = 60
+        self.cleanup()
+        self.drain_q()
+        pige = c.get("pige") == "1"
+        raw_prefix = re.sub(r'[\\/:*?"<>|]', "_", c.get("prefix", "") or "")
+        br = ["-b:a", f"{c['bitrate']}k"] if has_br else []
+        if pige:  # pige : un fichier toutes les N minutes, calé sur l'horloge (60 min = à l'heure pile)
+            stamp = "%Y-%m-%d_%Hh" if minutes == 60 else "%Y-%m-%d_%Hh%M"
+            prefix = raw_prefix.replace("%", "%%")
+            if prefix and prefix[-1] not in "_- ":
+                prefix += "_"
+            pattern = os.path.join(folder, prefix + stamp + ext)
+            self.spawn(["ffmpeg"] + self.pcm_in() + self.filters() + codec + br +
+                       ["-f", "segment", "-segment_time", str(minutes * 60),
+                        "-segment_atclocktime", "1", "-reset_timestamps", "1",
+                        "-strftime", "1", pattern])
+        else:  # enregistrement simple : un seul fichier par démarrage (date facultative dans le nom)
+            stamp = REC_STAMPS.get(c.get("stamp"), "%Y-%m-%d_%Hh%M")
+            name = raw_prefix
+            if c.get("date", "1") != "0":
+                if name and name[-1] not in "_- ":
+                    name += "_"
+                name += time.strftime(stamp)
+            name = name.strip("_- ") or "Enregistrement"
+            path, n = os.path.join(folder, name + ext), 1
+            while os.path.exists(path):  # jamais d'écrasement : _2, _3...
+                n += 1
+                path = os.path.join(folder, f"{name}_{n}{ext}")
+            self.spawn(["ffmpeg"] + self.pcm_in() + self.filters() + codec + br + [path])
+        self.wait_all()
+
+
+REC_STAMPS = {"2026-10-23_16h30": "%Y-%m-%d_%Hh%M", "2026-10-23_16h (à l'heure)": "%Y-%m-%d_%Hh",
+              "23-10-2026 16h30": "%d-%m-%Y %Hh%M", "20261023-163000": "%Y%m%d-%H%M%S"}
+
+OUTPUT_CLASSES = {"internet": InternetOutput, "fm": FMOutput, "dab": DABOutput,
+                  "record": RecordOutput}
+
+
+def make_output(cfg, eng):
+    return OUTPUT_CLASSES[cfg["type"]](cfg, eng)
+
+# ------------------------------------------------- accès Internet (réseau)
+VIRTUAL = ("loopback", "vethernet", "vmware", "virtualbox", "vbox", "docker", "veth", "br-",
+           "bluetooth", "tailscale", "zerotier", "hyper-v", "wsl", "utun", "awdl", "llw",
+           "bridge", "vpn", "tun", "tap", "virbr")
+KIND_TXT = {"ethernet": "RJ45", "wifi": "Wi-Fi", "mobile": "4G/5G"}
+
+
+def guess_kind(name):
+    n = name.lower()
+    if any(k in n for k in ("wi-fi", "wifi", "wlan", "wireless", "sans fil")) or n.startswith("wl"):
+        return "wifi"
+    if (any(k in n for k in ("rndis", "usb", "mobile", "cellul", "wwan", "ppp", "4g", "5g",
+                             "lte", "huawei", "modem")) or n.startswith("ww")):
+        return "mobile"
+    return "ethernet"
+
+
+def list_links():
+    """Connexions réseau actives avec une adresse IPv4 : [{name, ip, up, kind}]."""
+    import psutil
+    stats, out = psutil.net_if_stats(), []
+    for name, addrs in psutil.net_if_addrs().items():
+        if any(v in name.lower() for v in VIRTUAL):
+            continue
+        a4 = next((a for a in addrs if a.family == socket.AF_INET and not a.address.startswith(("127.", "169.254."))), None)
+        ip = a4.address if a4 else None
+        if ip:
+            st = stats.get(name)
+            mac = next((a.address for a in addrs if getattr(a.family, "name", "") == "AF_LINK" or a.family == getattr(psutil, "AF_LINK", -1)), "")
+            out.append({"name": name, "ip": ip, "up": bool(st and st.isup), "kind": guess_kind(name),
+                        "mask": a4.netmask or "", "mac": mac, "speed": int(st.speed) if st else 0,
+                        "mtu": int(st.mtu) if st else 0, "v6": sum(1 for a in addrs if a.family == socket.AF_INET6)})
+    order = {"ethernet": 0, "wifi": 1, "mobile": 2}
+    return sorted(out, key=lambda l: order[l["kind"]])
+
+
+def default_route_ip():
+    """Adresse IP du lien que Windows/Linux utilise réellement pour sortir sur Internet."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def parse_targets(txt):
+    out = []
+    for part in re.split(r"[,; ]+", txt or ""):
+        if ":" in part:
+            h, _, p = part.rpartition(":")
+            if p.isdigit():
+                out.append((h, int(p)))
+    return out or [("1.1.1.1", 443), ("8.8.8.8", 443)]
+
+
+def probe_link(name, ip, targets, n=5):
+    """Mesure latence / gigue / perte en ouvrant des connexions TCP depuis ce lien."""
+    lats, fails = [], 0
+    for k in range(n):
+        host, port = targets[k % len(targets)]
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        try:
+            if SYS == "Linux":
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, 25, name.encode() + b"\0")  # SO_BINDTODEVICE
+                except OSError:
+                    pass
+            s.bind((ip, 0))
+            t0 = time.perf_counter()
+            s.connect((host, port))
+            lats.append((time.perf_counter() - t0) * 1000)
+        except OSError:
+            fails += 1
+        finally:
+            s.close()
+        time.sleep(0.15)
+    lat = sum(lats) / len(lats) if lats else None
+    jit = (sum(abs(a - b) for a, b in zip(lats, lats[1:])) / (len(lats) - 1)) if len(lats) > 1 else 0.0
+    return {"lat": lat, "jit": jit, "loss": 100 * fails / n, "t": time.time()}
+
+
+def quality(st):
+    """(libellé, couleur, utilisable) d'après latence, gigue et perte."""
+    if not st or st.get("lat") is None:
+        return "Coupée", "#c0392b", False
+    lat, jit, loss = st["lat"], st["jit"], st["loss"]
+    if loss == 0 and lat < 80 and jit < 25:
+        return "Excellente", "#1e8e3e", True
+    if loss <= 10 and lat < 200 and jit < 80:
+        return "Bonne", "#27ae60", True
+    if loss <= 30 and lat < 500:
+        return "Moyenne", "#e67e22", True
+    return "Mauvaise", "#c0392b", False
+
+
+def speed_test(ip):
+    """Débit descendant / montant (Mbit/s) via Cloudflare, depuis ce lien. Retourne (down, up)."""
+    import http.client
+    down = up = None
+    try:
+        c = http.client.HTTPSConnection("speed.cloudflare.com", timeout=20, source_address=(ip, 0))
+        t0 = time.perf_counter()
+        c.request("GET", "/__down?bytes=4000000")
+        n = len(c.getresponse().read())
+        down = n * 8 / 1e6 / (time.perf_counter() - t0)
+        c.close()
+    except Exception:
+        pass
+    try:
+        c = http.client.HTTPSConnection("speed.cloudflare.com", timeout=20, source_address=(ip, 0))
+        body = bytes(1500000)
+        t0 = time.perf_counter()
+        c.request("POST", "/__up", body=body, headers={"Content-Type": "application/octet-stream"})
+        c.getresponse().read()
+        up = len(body) * 8 / 1e6 / (time.perf_counter() - t0)
+        c.close()
+    except Exception:
+        pass
+    return down, up
+
+
+def prefer_link(name):
+    """Fait de ce lien la sortie Internet par défaut du système. Retourne (ok, message)."""
+    try:
+        if SYS == "Windows":
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                return False, "droits administrateur requis (lance l'application en administrateur)"
+            links = [l["name"] for l in list_links()]
+            for n in links:
+                r = subprocess.run(["netsh", "interface", "ipv4", "set", "interface", n,
+                                    "metric=" + ("5" if n == name else "0")],
+                                   capture_output=True, text=True, creationflags=0x08000000)
+                if r.returncode != 0 and n == name:
+                    return False, (r.stdout + r.stderr).strip()[:200] or "netsh a échoué"
+            return True, ""
+        if SYS == "Linux":
+            for n in [l["name"] for l in list_links() if l["name"] != name]:
+                subprocess.run(["ip", "route", "del", "default", "dev", n, "metric", "5"],
+                               capture_output=True)
+            out = run(["ip", "-4", "route", "show", "default", "dev", name])
+            m = re.search(r"default via (\S+)", out)
+            if not m:
+                return False, "passerelle introuvable pour ce lien"
+            r = subprocess.run(["ip", "route", "replace", "default", "via", m.group(1), "dev", name,
+                                "metric", "5"], capture_output=True, text=True)
+            return (r.returncode == 0), (r.stderr.strip()[:200] or "droits root requis")
+    except Exception as e:
+        return False, str(e)
+    return False, "système non pris en charge : change de connexion à la main"
+
+
+
+
+def wifi_info(name):
+    """Nom du réseau Wi-Fi (SSID) et force du signal, quand le système les donne."""
+    try:
+        if SYS == "Windows":
+            out = run(["netsh", "wlan", "show", "interfaces"])
+            blocks = re.split(r"\n\s*\n", out)
+            for b in blocks:
+                if name.lower() in b.lower() or len(blocks) == 1:
+                    ssid = re.search(r"^\s*SSID\s*:\s*(.+)$", b, re.M)
+                    sig = re.search(r"(?:Signal)\s*:\s*(\d+)\s*%", b)
+                    band = re.search(r"(?:Bande|Band)\s*:\s*(.+)$", b, re.M)
+                    if ssid:
+                        return {"ssid": ssid.group(1).strip(), "signal": sig.group(1) + " %" if sig else "",
+                                "band": band.group(1).strip() if band else ""}
+        elif SYS == "Darwin":
+            out = run(["/usr/sbin/networksetup", "-getairportnetwork", name])
+            m = re.search(r":\s*(.+)$", out.strip())
+            if m and "not" not in out.lower():
+                return {"ssid": m.group(1).strip(), "signal": "", "band": ""}
+        else:
+            out = run(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ", "dev", "wifi"])
+            for line in out.splitlines():
+                p = line.split(":")
+                if p and p[0] == "yes":
+                    return {"ssid": p[1] if len(p) > 1 else "", "signal": (p[2] + " %") if len(p) > 2 else "",
+                            "band": p[3] if len(p) > 3 else ""}
+    except Exception:
+        pass
+    return {}
+
+
+def public_info(ip):
+    """Adresse publique, opérateur, ville et pays vus depuis ce lien (service ipinfo.io)."""
+    import http.client
+    try:
+        c = http.client.HTTPSConnection("ipinfo.io", timeout=6, source_address=(ip, 0))
+        c.request("GET", "/json", headers={"User-Agent": "studio-radio"})
+        d = json.loads(c.getresponse().read().decode("utf-8", "replace"))
+        c.close()
+        return {"pub": d.get("ip", ""), "org": re.sub(r"^AS\d+\s+", "", d.get("org", "")), "city": d.get("city", ""),
+                "country": d.get("country", "")}
+    except Exception:
+        return {}
+
+# ============================================================ INTERFACE Qt (PySide6)
+# ------------------------------------------------------------------ moteur audio dans un processus séparé
+# Le moteur (capture, mixage, cartouches, encodeurs) tourne dans son propre processus Python : il a son propre cœur de
+# processeur et son propre verrou d'interpréteur (GIL). L'interface ne peut plus jamais faire décrocher l'antenne, et
+# l'antenne ne fait plus ramer l'interface. Le processus est préparé à l'avance (démarrage instantané) ; s'il ne peut pas
+# être lancé, le moteur tourne comme avant dans l'application (repli automatique, rien ne change pour l'utilisateur).
+WORKER_ARG = "--bev-engine"
+SNAP_S = 0.025                         # 40 états par seconde envoyés à l'interface
+
+
+def _merge(dst, kv):
+    for k, v in kv.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            dst[k].update(v)
+        else:
+            dst[k] = v
+
+
+class EngineWorker:
+    """Côté processus moteur : reçoit les commandes de l'interface, renvoie l'état 40 fois par seconde."""
+
+    def __init__(self, conn):
+        self.conn, self.eng, self.out_q = conn, None, queue.Queue()
+        self.cfg_sig, self.done = None, threading.Event()
+        self.ps = None
+        try:
+            import psutil
+            self.ps = psutil.Process()
+        except Exception:
+            pass
+
+    def log(self, msg):
+        self.out_q.put(("log", msg))
+
+    def alert(self, text, key=None):
+        self.out_q.put(("alert", text, key))
+
+    def snap(self):
+        e = self.eng
+        pin, pout = list(e.in_peak), list(e.peak)
+        e.in_peak[:] = [-90.0, -90.0]
+        e.peak[:] = [-90.0, -90.0]
+        st, loading = e.cart_status()
+        outs = list(e.outputs)
+        sig = tuple((o.cfg.get("id"), id(o.cfg)) for o in outs)
+        if sig != self.cfg_sig:                    # configuration des sorties : envoyée seulement quand elle change
+            self.cfg_sig = sig
+            self.out_q.put(("outcfg", [json.loads(json.dumps(o.cfg)) for o in outs]))
+        return {"t": time.time(), "running": e.running, "started": e.started, "backup": e.backup, "manual": e.manual,
+                "mute": e.mute, "tone": e.tone, "silent_ms": e.silent_ms, "loud_ms": e.loud_ms, "rec_ms": e.rec_ms,
+                "track": e.track, "meta": e.meta, "meta_manual": e.meta_manual, "pl_cur": dict(e.pl_cur) if e.pl_cur else None,
+                "pl_out": e.pl_out, "in_peak": pin, "peak": pout, "clip_t": e.clip_t, "proc_ms": e.proc_ms, "late": e.late,
+                "slow": e.slow_now(), "mix_g": e.mix_g, "carts": st, "loading": set(loading),
+                "voices": [(v["id"], bool(v["stopping"])) for v in list(e.voices)],
+                "outs": [(o.cfg.get("id"), o.state, o.detail, o.t_live) for o in outs], "cmon": e.cmon.label}
+
+    def sender(self):
+        """Seul fil qui écrit vers l'interface (une connexion ne supporte pas deux écritures simultanées)."""
+        nxt = time.perf_counter()
+        while not self.done.is_set():
+            nxt += SNAP_S
+            d = nxt - time.perf_counter()
+            if d > 0:
+                time.sleep(d)
+            else:
+                nxt = time.perf_counter()
+            try:
+                if self.eng is not None:
+                    self.out_q.put(("snap", self.snap()))
+                while True:
+                    try:
+                        m = self.out_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.conn.send(m)
+                if self.eng is not None and not self.eng.running:
+                    self.done.set()
+            except (EOFError, OSError, BrokenPipeError):
+                self.done.set()
+            except Exception as ex:                 # une erreur d'état ne doit jamais couper l'antenne
+                try:
+                    self.conn.send(("log", f"Moteur : état non transmis ({ex})"))
+                except Exception:
+                    self.done.set()
+
+    def handle(self, m):
+        k = m[0]
+        e = self.eng
+        if k == "start":
+            _, prof, standalone, alerts, fx = m
+            FX.update(fx)
+            self.eng = Engine(prof, self.log, self.alert if alerts else None, standalone)
+            self.eng.start()
+        elif e is None:
+            return
+        elif k == "fx":
+            FX.update(m[1])
+        elif k == "call":
+            getattr(e, m[1])(*m[2], **m[3])
+        elif k == "set":
+            setattr(e, m[1], m[2])
+        elif k == "prof":
+            _merge(e.prof.setdefault(m[1], {}), m[2])
+        elif k == "out":
+            o = e.output(m[1])
+            if o:
+                o.start() if m[2] == "start" else o.stop()
+        elif k == "cmon":
+            e.cmon.set_device(m[1])
+        elif k == "stop":
+            e.stop()
+
+    def run(self):
+        threading.Thread(target=self.sender, daemon=True).start()
+        self.conn.send(("ready", os.getpid()))
+        while not self.done.is_set():
+            try:
+                if not self.conn.poll(0.2):
+                    continue
+                m = self.conn.recv()
+            except (EOFError, OSError):
+                break                               # l'interface a disparu : on arrête proprement l'antenne
+            try:
+                self.handle(m)
+            except Exception as ex:
+                self.log(f"Moteur : commande « {m[0]} » impossible ({ex})")
+            if m[0] == "stop":
+                break
+        if self.eng is not None and self.eng.running:
+            try:
+                self.eng.stop()
+            except Exception:
+                pass
+        if self.eng is not None:
+            time.sleep(1.8)                         # les encodeurs se ferment proprement (fin de fichier, fin de flux)
+        time.sleep(SNAP_S * 3)                      # dernier état (arrêt) transmis
+        self.done.set()
+
+
+def _engine_worker_main():
+    try:
+        sys.setswitchinterval(0.002)
+    except Exception:
+        pass
+    if SYS == "Windows":                            # priorité « supérieure à la normale » : l'antenne passe avant le reste
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
+            ctypes.windll.winmm.timeBeginPeriod(1)  # blocs de 20 ms réguliers (pas de 15,6 ms par défaut sous Windows)
+        except Exception:
+            pass
+    try:
+        from multiprocessing.connection import Client
+        i = sys.argv.index(WORKER_ARG)
+        conn = Client(sys.argv[i + 1], authkey=bytes.fromhex(sys.argv[i + 2]))
+    except Exception:
+        os._exit(3)
+    try:
+        EngineWorker(conn).run()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+if WORKER_ARG in sys.argv and __name__ in ("__main__", "__mp_main__"):
+    _engine_worker_main()
+
+
+def worker_cmd():
+    """Commande qui relance cette même application en mode « moteur seul » (script, exécutable PyInstaller ou Nuitka)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    if "__compiled__" in globals():
+        return [os.path.abspath(sys.argv[0])]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+class WorkerSlot:
+    """Un processus moteur lancé à l'avance, connecté et en attente : « Démarrer » est instantané."""
+
+    def __init__(self):
+        self.proc = self.conn = None
+        self.pid, self.error = None, ""
+        self.ready = threading.Event()
+        threading.Thread(target=self._spawn, daemon=True).start()
+
+    def _spawn(self):
+        lst = None
+        try:
+            from multiprocessing.connection import Listener
+            key = os.urandom(16)
+            lst = Listener(authkey=key)
+            env = dict(os.environ)
+            env.pop("QT_QPA_PLATFORM", None)
+            try:
+                log = open(os.path.join(os.path.expanduser("~"), ".bev_moteur.log"), "ab")
+            except OSError:
+                log = subprocess.DEVNULL
+            self.proc = popen(worker_cmd() + [WORKER_ARG, lst.address, key.hex()], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=log, env=env)
+            box = {}
+
+            def acc():
+                try:
+                    box["c"] = lst.accept()
+                except Exception as ex:
+                    box["e"] = ex
+            th = threading.Thread(target=acc, daemon=True)
+            th.start()
+            th.join(25)
+            c = box.get("c")
+            if c is None:
+                raise RuntimeError(str(box.get("e") or "le processus moteur ne répond pas"))
+            if not c.poll(10):
+                raise RuntimeError("le processus moteur ne s'est pas présenté")
+            m = c.recv()
+            if not (isinstance(m, tuple) and m and m[0] == "ready"):
+                raise RuntimeError("réponse inattendue du processus moteur")
+            self.conn, self.pid = c, m[1]
+        except Exception as ex:
+            self.error = str(ex) or ex.__class__.__name__
+            if self.proc is not None and self.proc.poll() is None:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        finally:
+            try:
+                if lst is not None:
+                    lst.close()
+            except Exception:
+                pass
+            self.ready.set()
+
+    def alive(self):
+        return self.conn is not None and self.proc is not None and self.proc.poll() is None
+
+    def close(self):
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+class _OutProxy:
+    """Une sortie vue depuis l'interface (l'encodeur réel tourne dans le processus moteur)."""
+
+    def __init__(self, eng, cfg):
+        self.eng, self.cfg = eng, cfg
+        self.state, self.detail, self.t_live = "stopped", "", 0.0
+
+    @property
+    def name(self):
+        return self.cfg.get("name") or self.cfg.get("type", "")
+
+    def status_text(self):
+        if self.state == "live":
+            return "● En ligne depuis " + fmt_dur(time.time() - self.t_live)
+        if self.state == "connecting":
+            return "◌ Connexion en cours…"
+        if self.state == "error":
+            return "✕ Problème : " + (self.detail or "?")[:80]
+        return "○ Arrêté"
+
+    def start(self):
+        if self.state in ("stopped", "error"):
+            self.state, self.detail = "connecting", ""
+            self.eng._hold_out[self.cfg.get("id")] = time.time()
+        self.eng._send(("out", self.cfg.get("id"), "start"))
+
+    def stop(self):
+        self.state, self.detail = "stopped", ""
+        self.eng._hold_out[self.cfg.get("id")] = time.time()
+        self.eng._send(("out", self.cfg.get("id"), "stop"))
+
+
+class _CmonProxy:
+    def __init__(self, eng):
+        self.eng, self.label = eng, ""
+
+    def set_device(self, label):
+        self.label = label
+        self.eng._send(("cmon", label))
+
+
+class EngineProxy:
+    """Le moteur vu depuis l'interface : mêmes attributs et mêmes commandes qu'Engine, mais le travail se fait dans le
+    processus moteur. Les valeurs changées ici (coupure, tonalité…) sont prises en compte tout de suite à l'écran."""
+    SETTABLE = ("tone", "mute", "meta_manual", "manual")
+    HOLD = 0.6
+
+    def __init__(self, slot, prof, log, alert=None, standalone=False, on_dead=None):
+        d = self.__dict__
+        d["_slot"], d["_conn"], d["log"], d["alert"] = slot, slot.conn, log, alert
+        d["prof"], d["standalone"], d["_on_dead"] = prof, standalone, on_dead
+        d["_lk"], d["_wlk"] = threading.Lock(), threading.Lock()
+        d["_hold"], d["_hold_out"], d["_pred_load"] = {}, {}, {}
+        d["_stopping"], d["_fx"] = False, None
+        d["cmon"] = _CmonProxy(self)
+        d["outputs"] = [_OutProxy(self, c) for c in prof.get("outputs", [])]
+        d["_s"] = {"t": time.time(), "running": True, "started": time.time(), "backup": False, "manual": False, "mute": False,
+                   "tone": False, "silent_ms": 0, "loud_ms": 0, "rec_ms": 2000.0, "track": "", "meta": "",
+                   "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
+                   "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": []}
+        d["in_peak"], d["peak"] = [-90.0, -90.0], [-90.0, -90.0]
+        d["pid"] = slot.pid
+
+    # --- état
+    def __getattr__(self, k):
+        s = self.__dict__.get("_s")
+        if s is not None and k in s:
+            h = self.__dict__["_hold"].get(k)
+            if h and time.time() - h[1] < self.HOLD:
+                return h[0]
+            return s[k]
+        raise AttributeError(k)
+
+    def __setattr__(self, k, v):
+        if k in self.SETTABLE:
+            self._hold[k] = (v, time.time())
+            self._s[k] = v
+            self._send(("set", k, v))
+        elif k == "outputs":
+            keep = {id(o) for o in v}
+            for o in list(self.outputs):
+                if id(o) not in keep:
+                    self.remove_output(o.cfg.get("id"))
+        else:
+            self.__dict__[k] = v
+
+    def _send(self, m):
+        if FX != self._fx:                         # traitement du son modifié dans l'interface : le moteur suit
+            self.__dict__["_fx"] = json.loads(json.dumps(FX))
+            self._raw_send(("fx", self._fx))
+        self._raw_send(m)
+
+    def _raw_send(self, m):
+        try:
+            with self._wlk:
+                self._conn.send(m)
+        except Exception:
+            pass
+
+    def _reader(self):
+        conn = self._conn
+        while True:
+            try:
+                m = conn.recv()
+            except Exception:
+                break
+            try:
+                k = m[0]
+                if k == "snap":
+                    self._apply(m[1])
+                elif k == "log":
+                    self.log(m[1])
+                elif k == "alert":
+                    if self.alert:
+                        self.alert(m[1], m[2])
+                elif k == "outcfg":
+                    self._outcfg(m[1])
+            except Exception:
+                pass
+        s = self._s
+        was = s.get("running")
+        s["running"] = False
+        self._slot.close()
+        if was and not self._stopping and self._on_dead:
+            self._on_dead(self)
+
+    def _outcfg(self, cfgs):
+        with self._lk:
+            cur = {o.cfg.get("id"): o for o in self.outputs}
+            new = []
+            for c in cfgs:
+                o = cur.get(c.get("id"))
+                if o is None:
+                    o = _OutProxy(self, c)
+                else:
+                    o.cfg = c
+                new.append(o)
+            self.__dict__["outputs"] = new
+
+    def _apply(self, s):
+        now = time.time()
+        for i in (0, 1):
+            self.in_peak[i] = max(self.in_peak[i], s["in_peak"][i])
+            self.peak[i] = max(self.peak[i], s["peak"][i])
+        st = dict(self._s)
+        st.update(s)
+        for k, (v, t0) in list(self._hold.items()):
+            if now - t0 < self.HOLD and s.get(k) != v:
+                st[k] = v
+            elif now - t0 >= self.HOLD:
+                self._hold.pop(k, None)
+        for cid, t0 in list(self._pred_load.items()):
+            if cid in s["carts"] or now - t0 > 1.5:
+                self._pred_load.pop(cid, None)
+        self.__dict__["_s"] = st
+        self.cmon.label = s.get("cmon", self.cmon.label)
+        by = {o.cfg.get("id"): o for o in self.outputs}
+        for oid, state, detail, t_live in s["outs"]:
+            o = by.get(oid)
+            if o is None:
+                continue
+            h = self._hold_out.get(oid)
+            if h and now - h < self.HOLD:
+                continue
+            self._hold_out.pop(oid, None)
+            o.state, o.detail, o.t_live = state, detail, t_live
+
+    def start(self):
+        self.__dict__["_fx"] = json.loads(json.dumps(FX))
+        for o in self.outputs:
+            if o.cfg.get("enabled", True):
+                o.state = "connecting"
+        self._raw_send(("start", self.prof, self.standalone, self.alert is not None, self._fx))
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def stop(self):
+        self.__dict__["_stopping"] = True
+        self._s["running"] = False
+        for o in self.outputs:
+            o.state, o.detail = "stopped", ""
+        self._raw_send(("stop",))
+
+        def bye(slot=self._slot):
+            time.sleep(4)                          # le moteur ferme ses encodeurs proprement, puis s'en va
+            slot.close()
+        threading.Thread(target=bye, daemon=True).start()
+
+    def alive(self):
+        return self._slot.alive()
+
+    # --- commandes
+    def _call(self, name, *a, **kw):
+        self._send(("call", name, a, kw))
+
+    def output(self, oid):
+        return next((o for o in self.outputs if o.cfg.get("id") == oid), None)
+
+    def swap_output(self, cfg):
+        with self._lk:
+            old = self.output(cfg.get("id"))
+            new = _OutProxy(self, cfg)
+            if self.running and cfg.get("enabled", True):
+                new.state = "connecting"
+                self._hold_out[cfg.get("id")] = time.time()
+            self.__dict__["outputs"] = [o for o in self.outputs if o is not old] + [new]
+        self._call("swap_output", cfg)
+
+    def remove_output(self, oid):
+        with self._lk:
+            self.__dict__["outputs"] = [o for o in self.outputs if o.cfg.get("id") != oid]
+        self._call("remove_output", oid)
+
+    def prof_update(self, section, **kw):
+        _merge(self.prof.setdefault(section, {}), kw)
+        self._send(("prof", section, kw))
+
+    def slow_now(self):
+        return bool(self._s.get("slow"))
+
+    def cart_status(self):
+        s = self._s
+        dt = max(0.0, time.time() - s["t"])
+        out = {}
+        for cid, v in s["carts"].items():
+            if not v[6]:                                         # en lecture (ou en fondu) : la position avance d'elle-même
+                pos = v[0] + dt
+                if not v[2]:
+                    pos = min(pos, v[1])
+                elif v[1] > 0:
+                    pos = pos % v[1]
+                v = (pos,) + tuple(v[1:])
+            out[cid] = v
+        return out, set(s["loading"]) | set(self._pred_load)
+
+    @property
+    def voices(self):
+        return [{"id": i, "stopping": stp} for i, stp in self._s["voices"]]
+
+    def cart_playing(self, cid):
+        return any(i == cid and not stp for i, stp in self._s["voices"])
+
+    def play_cart(self, cid, cart, pre=False, at=None):
+        self._pred_load[cid] = time.time()
+        self._call("play_cart", cid, cart, pre, at)
+
+    def stop_cart(self, cid=None, fade=None):
+        self._call("stop_cart", cid, fade)
+
+    def pause_cart(self, cid=None, on=None):
+        res = None
+        carts = dict(self._s["carts"])
+        for k, v in carts.items():
+            if (cid is None or k == cid) and not v[4]:
+                nv = (not v[6]) if on is None else bool(on)
+                if res is None:
+                    res = nv
+                if cid is None and on is None:
+                    nv = res
+                carts[k] = tuple(v[:6]) + (nv,) + tuple(v[7:])
+        self._s["carts"] = carts
+        self._call("pause_cart", cid, on)
+        return res
+
+    def seek_cart(self, cid, sec):
+        v = self._s["carts"].get(cid)
+        if v is None or v[4]:
+            return False
+        carts = dict(self._s["carts"])
+        carts[cid] = (max(0.0, sec - (v[7] if len(v) > 7 else 0.0)),) + tuple(v[1:])
+        self._s["carts"] = carts
+        self._s["t"] = time.time()
+        self._call("seek_cart", cid, sec)
+        return True
+
+    def set_cart_live(self, cid, **kw):
+        self._call("set_cart_live", cid, **kw)
+
+    def set_manual(self, on):
+        self._hold["manual"] = (bool(on), time.time())
+        self._call("set_manual", on)
+
+    def set_gain(self, db):
+        self._call("set_gain", db)
+
+    def set_delay(self, sec):
+        self._call("set_delay", sec)
+
+    def dump_delay(self):
+        self._call("dump_delay")
+
+    def play_now(self, path):
+        self._hold["manual"] = (True, time.time())
+        self._call("play_now", path)
+
+
+from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal, QElapsedTimer)
+from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence,
+                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
+from PySide6.QtWidgets import QWidgetAction
+from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+                               QLayout, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                               QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QStyledItemDelegate, QWidgetItem as _WItem,
+                               QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+
+
+def _early_settings():
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            return json.load(f).get("settings", {}) or {}
+    except Exception:
+        return {}
+
+
+SET = _early_settings()
+ACCENTS = {"Phare": ("#ffb03b", "#ffd27a"), "Orange": ("#ff7a45", "#ffb347"), "Rose": ("#ff4f7b", "#ff9db5"), "Bleu": ("#3d8bff", "#86b8ff"),
+           "Vert": ("#22c58b", "#7fe6bd"), "Violet": ("#9b6bff", "#c5a8ff"), "Hermine": ("#e9edf5", "#ffffff")}
+MINI = bool(SET.get("mini"))        # mode minimaliste : austère, sans animation, centré sur la diffusion
+NEWLOOK = SET.get("look_v") == 2          # tant que l'utilisateur n'a rien choisi, l'ambiance « Phare » (celle du logo) s'applique partout
+MOOD = "sobre" if MINI else (SET.get("mood", "phare") if NEWLOOK else "phare")
+if MOOD not in ("phare", "psyche", "sobre", "ocean"):
+    MOOD = "phare"
+OCEAN, PSYCHE, PHARE = MOOD == "ocean", MOOD == "psyche", MOOD == "phare"
+NAVTOP = SET.get("nav") == "top" or MINI
+ANIM = not (SET.get("perf") or SET.get("reduce_anim") or MINI)
+ACC, ACC2 = ACCENTS.get(SET.get("accent") if NEWLOOK else "Phare", ACCENTS["Phare"])
+if MINI:
+    ACC = ACC2 = "#d4d7de"
+if OCEAN:
+    ACC, ACC2 = "#2fd6c0", "#7cc7ff"
+PSY = ("#ff5fa2", "#a76bff", "#4cc9f0", "#35d49a", "#ffb347")
+
+
+def _is_light():
+    th = SET.get("theme", "dark")
+    if th == "light":
+        return True
+    if th != "auto":
+        return False
+    try:
+        if SYS == "Windows":
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            return bool(winreg.QueryValueEx(k, "AppsUseLightTheme")[0])
+        if SYS == "Darwin":
+            return "dark" not in run(["defaults", "read", "-g", "AppleInterfaceStyle"]).lower()
+    except Exception:
+        pass
+    return False
+
+
+LIGHT = _is_light() and not OCEAN and not MINI
+
+
+def mixc(a, b, t):
+    a, b = QColor(a), QColor(b)
+    return QColor(int(a.red() * (1 - t) + b.red() * t), int(a.green() * (1 - t) + b.green() * t), int(a.blue() * (1 - t) + b.blue() * t))
+
+
+if LIGHT:
+    PAGE, RAIL, PANEL, FIELD, LINE = "#f4f5f8", "#ffffff", "#ffffff", "#eceef3", "#dfe3ec"
+    TXT, MUT = "#171a22", "#6b7488"
+elif MINI:
+    PAGE, RAIL, PANEL, FIELD, LINE = "#0f0f10", "#0f0f10", "#171718", "#202022", "#2d2d30"
+    TXT, MUT = "#e6e6e8", "#8d8d93"
+elif PHARE:
+    PAGE, RAIL, PANEL, FIELD, LINE = "#0a1a30", "#081426", "#102442", "#173055", "#243f66"
+    TXT, MUT = "#f3f6fb", "#8ea4c2"
+elif OCEAN:
+    PAGE, RAIL, PANEL, FIELD, LINE = "#0a1b2c", "#071522", "#0f2438", "#143049", "#1b3a56"
+    TXT, MUT = "#e6f1fb", "#7f9bb5"
+else:
+    PAGE, RAIL, PANEL, FIELD, LINE = "#0e1119", "#0b0e15", "#151a25", "#1b2130", "#262c3a"
+    TXT, MUT = "#eef1f7", "#8a93a8"
+OKC, BADC = ("#13a56f", "#d6455d") if LIGHT else ("#35d49a", "#ff6b6b")
+ACCT = mixc(ACC2, "#000000", .42).name() if LIGHT else ACC2
+ONACC = "#0b1f3a" if (PHARE and ACC == "#ffb03b") else ("#1d0d03" if QColor(ACC).lightnessF() > .62 else "#ffffff")
+FONT_FAMILY = "Inter"
+
+
+def qss():
+    return f"""
+* {{ font-family: '{FONT_FAMILY}', 'Segoe UI', 'Inter', 'Helvetica Neue', sans-serif; font-size: 13px; }}
+QWidget {{ color: {TXT}; }}
+QMainWindow, QDialog, #page {{ background: {PAGE}; }}
+QLabel {{ background: transparent; }}
+QLabel#mut {{ color: {MUT}; }}
+QLabel#title {{ font-size: 21px; font-weight: 700; }}
+QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 10px;
+    padding: 6px 10px; selection-background-color: {ACC}; selection-color: {ONACC}; }}
+QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border-color: {ACC}; }}
+QComboBox {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 10px; padding: 6px 10px; min-height: 20px; }}
+QComboBox::drop-down {{ border: none; width: 24px; }}
+QComboBox QAbstractItemView {{ background: {FIELD}; border: 1px solid {LINE}; selection-background-color: {ACC}; selection-color: {ONACC}; outline: 0; }}
+QPushButton {{ background: {FIELD}; border: none; border-radius: 11px; padding: 7px 14px; font-weight: 600; }}
+QPushButton:hover {{ background: {mixc(FIELD, TXT, .10).name()}; }}
+QPushButton:pressed {{ background: {mixc(FIELD, TXT, .18).name()}; }}
+QPushButton:disabled {{ color: {mixc(MUT, PANEL, .35).name()}; background: {mixc(FIELD, PANEL, .45).name()}; }}
+QPushButton[kind="primary"]:disabled {{ background: {mixc(FIELD, PANEL, .2).name()}; color: {mixc(MUT, PANEL, .3).name()}; }}
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{ color: {mixc(MUT, PANEL, .3).name()};
+    background: {mixc(FIELD, PANEL, .5).name()}; border-color: {mixc(LINE, PANEL, .4).name()}; }}
+QSlider::sub-page:horizontal:disabled {{ background: {mixc(MUT, PANEL, .4).name()}; }}
+QSlider::handle:horizontal:disabled {{ background: {mixc(MUT, PANEL, .2).name()}; }}
+QPushButton[kind="primary"] {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {ACC},stop:1 {'#ff5fa2' if PSYCHE else ACC2}); color: {ONACC}; }}
+QPushButton[kind="primary"]:hover {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {mixc(ACC, '#ffffff', .12).name()},stop:1 {mixc('#ff5fa2' if PSYCHE else ACC2, '#ffffff', .12).name()}); }}
+QPushButton[kind="danger"] {{ background: #e5485a; color: white; }}
+QPushButton[kind="danger"]:hover {{ background: #f05a6c; }}
+QPushButton[kind="danger"]:disabled {{ background: {mixc(FIELD, PANEL, .45).name()}; color: {mixc(MUT, PANEL, .35).name()}; }}
+QPushButton[kind="stop"] {{ background: #2a3040; color: white; }}
+QSlider::groove:horizontal {{ height: 6px; background: {FIELD}; border-radius: 3px; }}
+QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {ACC},stop:1 {'#ff5fa2' if PSYCHE else ACC2}); border-radius: 3px; }}
+QSlider::handle:horizontal {{ background: white; border: 1px solid {LINE}; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }}
+QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: {mixc(FIELD, TXT, .18).name()}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ background: {mixc(FIELD, TXT, .18).name()}; border-radius: 4px; min-width: 30px; }}
+QTableWidget, QListWidget {{ background: transparent; border: none; outline: 0; gridline-color: transparent; }}
+QTableWidget::item {{ padding: 6px 6px 6px 10px; border: none; }}
+QTableWidget::item:selected, QListWidget::item:selected {{ background: transparent; border: none; color: {TXT}; }}
+QTableWidget::item:focus, QListWidget::item:focus {{ border: none; outline: 0; }}
+QListWidget::item {{ padding: 8px 12px; border-radius: 10px; margin: 2px 4px; }}
+QListWidget::item:hover {{ background: transparent; }}
+QHeaderView {{ background: transparent; border: none; }}
+QTableCornerButton::section {{ background: transparent; border: none; }}
+QHeaderView::section {{ background: transparent; color: {MUT}; border: none; padding: 8px 6px; font-weight: 700; font-size: 11px; }}
+QMenu {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 10px; padding: 6px; }}
+QMenu::item {{ padding: 7px 18px; border-radius: 7px; }}
+QMenu::item:selected {{ background: {ACC}; color: {ONACC}; }}
+QToolTip {{ background: {FIELD}; color: {TXT}; border: 1px solid {LINE}; padding: 5px 8px; }}
+QCheckBox {{ spacing: 8px; }}
+"""
+
+# ------------------------------------------------------------------ widgets Qt maison
+def qc(c, a=255):
+    c = QColor(c)
+    c.setAlpha(a)
+    return c
+
+
+def set_ss(w, sheet):
+    """Applique une feuille de style seulement si elle change (les mises à jour périodiques renvoient souvent la même :
+    l'appliquer quand même relance le calcul du style du widget)."""
+    if w.property("_ss") != sheet:
+        w.setProperty("_ss", sheet)
+        w.setStyleSheet(sheet)
+
+
+def btn(text, kind="", fn=None, tip=""):
+    b = QPushButton(text)
+    if kind:
+        b.setProperty("kind", kind)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    if fn:
+        b.clicked.connect(lambda *_: fn())
+    if tip:
+        b.setToolTip(tip)
+    b.setMinimumWidth(b.fontMetrics().horizontalAdvance(text) + 42)
+    return b
+
+
+def lab(text="", name="", wrap=False):
+    w = QLabel(text)
+    if name:
+        w.setObjectName(name)
+    w.setWordWrap(wrap)
+    return w
+
+
+class Card(QFrame):
+    """Panneau arrondi avec ombre légère, peint à la main (rapide à redimensionner)."""
+
+    def __init__(self, title="", sub="", parent=None, accent=None):
+        super().__init__(parent)
+        self.accent = accent
+        self.lay = QVBoxLayout(self)
+        self.lay.setContentsMargins(18, 14, 18, 16)
+        self.lay.setSpacing(10)
+        if title:
+            h = QHBoxLayout()
+            self.head = QLabel(title)
+            self.head.setStyleSheet("font-size:15px;font-weight:700;")
+            h.addWidget(self.head)
+            h.addStretch(1)
+            self.hl = h
+            self.lay.addLayout(h)
+            if sub:
+                s = lab(sub, "mut", True)
+                s.setStyleSheet(f"color:{MUT};font-size:12px;")
+                self.sub = s
+                self.lay.addWidget(s)
+                self.lay.addSpacing(2)
+
+    def set_compact(self, on):
+        """Fenêtre basse : marges plus serrées et sous-titre masqué, pour que tout tienne sans défiler."""
+        if getattr(self, "_compact", None) == on:
+            return
+        self._compact = on
+        m = self.lay.contentsMargins()
+        if not hasattr(self, "_m0"):
+            self._m0 = (m.left(), m.top(), m.right(), m.bottom(), self.lay.spacing())
+        l, t, r, b, sp = self._m0
+        if on:
+            self.lay.setContentsMargins(l, max(6, t - 6), r, max(6, b - 6))
+            self.lay.setSpacing(max(5, sp - 4))
+        else:
+            self.lay.setContentsMargins(l, t, r, b)
+            self.lay.setSpacing(sp)
+        if getattr(self, "sub", None) is not None:
+            self.sub.setVisible(not on)
+
+    _NINE = {}
+    C = 20                     # taille des coins (px logiques) de l'image modèle
+
+    @classmethod
+    def nine(cls, dpr):
+        """Modèle du fond (ombre + panneau arrondi + liseré) dessiné UNE fois : chaque carte en recopie les coins et étire
+        les bords. Le dessin ne dépend plus de la taille : redimensionner la fenêtre ne coûte presque rien."""
+        pm = cls._NINE.get(dpr)
+        if pm is None:
+            C = cls.C
+            S = 2 * C + 4
+            pm = QPixmap(int(round(S * dpr)), int(round(S * dpr)))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            cls._bg_shape(q, QRectF(0, 0, S, S))
+            q.end()
+            cls._NINE[dpr] = pm
+        return pm
+
+    @staticmethod
+    def _bg_shape(p, rect):
+        r = QRectF(rect).adjusted(1, 1, -1, -2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc("#000000", 14 if not LIGHT else 8))
+        p.drawRoundedRect(r.translated(0, 1.5), 16, 16)
+        p.setBrush(QColor(PANEL))
+        p.setPen(QPen(QColor(LINE), 1))
+        p.drawRoundedRect(r, 16, 16)
+
+    def paint_bg(self, p, er):
+        dpr = self.devicePixelRatioF()
+        pm = self.nine(dpr)
+        C = self.C
+        S = 2 * C + 4
+        W, H = self.width(), self.height()
+        if W < S or H < S:                       # très petite carte : dessin direct
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self._bg_shape(p, QRectF(self.rect()))
+            return
+        d = dpr
+        xs = ((0, C, 0, C), (C, W - C, C, C + 4), (W - C, W, C + 4, S))        # (x0, x1 cible, sx0, sx1 source)
+        ys = ((0, C, 0, C), (C, H - C, C, C + 4), (H - C, H, C + 4, S))
+        for tx0, tx1, sx0, sx1 in xs:
+            for ty0, ty1, sy0, sy1 in ys:
+                t = QRectF(tx0, ty0, tx1 - tx0, ty1 - ty0)
+                if not er.intersects(t.toAlignedRect()):
+                    continue
+                p.drawPixmap(t, pm, QRectF(sx0 * d, sy0 * d, (sx1 - sx0) * d, (sy1 - sy0) * d))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        self.paint_bg(p, e.rect())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -2)
+        if self.accent:
+            g = QLinearGradient(r.left(), 0, r.right(), 0)
+            g.setColorAt(0, QColor(ACC))
+            g.setColorAt(1, QColor("#ff5fa2" if PSYCHE else ACC2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(QRectF(r.left() + 16, r.top(), r.width() - 32, 3), 1.5, 1.5)
+
+
+class Switch(QCheckBox):
+    """Interrupteur façon iOS."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._t = 1.0 if self.isChecked() else 0.0
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(120)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "_t", float(v)), self.update()))
+        self.toggled.connect(self._go)
+
+    def _go(self, on):
+        self.an.stop()
+        self.an.setStartValue(self._t)
+        self.an.setEndValue(1.0 if on else 0.0)
+        self.an.start()
+
+    def setChecked(self, on):
+        super().setChecked(on)
+        self.an.stop()                       # changement par le programme : position finale tout de suite (pas d'animation)
+        self._t = 1.0 if on else 0.0
+        self.update()
+
+    def sizeHint(self):
+        return QSize(44 + (8 + self.fontMetrics().horizontalAdvance(self.text()) if self.text() else 0), 26)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(.4)
+        t = self._t
+        tr = QRectF(0, 3, 42, 20)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mixc(FIELD if not LIGHT else "#c9ced9", ACC, t))
+        p.drawRoundedRect(tr, 10, 10)
+        p.setBrush(QColor("white"))
+        p.drawEllipse(QRectF(2 + 20 * t, 5, 16, 16))
+        if self.text():
+            p.setPen(QColor(TXT))
+            p.drawText(QRectF(52, 0, self.width() - 52, self.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+
+
+class Chip(QWidget):
+    """Pastille d'état (ex. HORS ANTENNE / À L'ANTENNE)."""
+    clicked = Signal()
+
+    def __init__(self, text="", color=MUT, parent=None):
+        super().__init__(parent)
+        self.text, self.col, self.pulse = text, color, 0.0
+        self.setFixedHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set(self, text, color, pulse=False):
+        if (text, color) != (self.text, self.col):
+            self.text, self.col = text, color
+            self.updateGeometry()
+        self.pulse = 1.0 if pulse else 0.0
+        self.update()
+
+    def sizeHint(self):
+        return QSize(self.fontMetrics().horizontalAdvance(self.text) + 44, 30)
+
+    def mouseReleaseEvent(self, e):
+        self.clicked.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc(self.col, 36))
+        p.drawRoundedRect(r, 15, 15)
+        p.setBrush(QColor(self.col))
+        p.drawEllipse(QRectF(12, 11, 8, 8))
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPointSizeF(9)
+        p.setFont(f)
+        p.setPen(QColor(self.col))
+        p.drawText(r.adjusted(26, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text)
+
+
+class Meter(QWidget):
+    """Vumètre stéréo horizontal (dBFS)."""
+
+    def __init__(self, parent=None, lo=-60.0):
+        super().__init__(parent)
+        self.v, self.hold, self.lo = [-90.0, -90.0], [-90.0, -90.0], lo
+        self.clip = False
+        self.setMinimumHeight(30)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(32)
+
+    def set(self, v, clip=False):
+        nv = [max(self.lo, x) for x in v]
+        for i in (0, 1):
+            self.hold[i] = max(nv[i], self.hold[i] - 1.2)
+        if nv != self.v or clip != self.clip:
+            self.v, self.clip = nv, clip
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bh = (h - 6) / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in (0, 1):
+            y = i * (bh + 2)
+            p.setBrush(QColor(FIELD))
+            p.drawRoundedRect(QRectF(0, y, w, bh), bh / 2, bh / 2)
+            fr = max(0.0, min(1.0, (self.v[i] - self.lo) / -self.lo))
+            if fr > 0:
+                g = QLinearGradient(0, 0, w, 0)
+                g.setColorAt(0, QColor(OKC))
+                g.setColorAt(.75, QColor("#ffc23d"))
+                g.setColorAt(1, QColor("#ff4f5e"))
+                p.setBrush(QBrush(g))
+                p.setClipRect(QRectF(0, y, w * fr, bh))
+                p.drawRoundedRect(QRectF(0, y, w, bh), bh / 2, bh / 2)
+                p.setClipping(False)
+            hf = max(0.0, min(1.0, (self.hold[i] - self.lo) / -self.lo))
+            if hf > .02:
+                p.setBrush(QColor(TXT))
+                p.drawRect(QRectF(w * hf - 2, y, 2, bh))
+        if self.clip:
+            p.setBrush(QColor("#ff4f5e"))
+            p.drawEllipse(QRectF(w - 10, h / 2 - 4, 8, 8))
+
+
+class Flow(QLayout):
+    """Mise en page « flux » pour les tuiles."""
+
+    def __init__(self, parent=None, gap=12):
+        super().__init__(parent)
+        self.items, self.gap, self.tw, self.ratio, self.th_min = [], gap, 150, .64, 78
+
+    def addItem(self, it):
+        self.items.append(it)
+
+    def count(self):
+        return len(self.items)
+
+    def itemAt(self, i):
+        return self.items[i] if 0 <= i < len(self.items) else None
+
+    def takeAt(self, i):
+        return self.items.pop(i) if 0 <= i < len(self.items) else None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._lay(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, r):
+        super().setGeometry(r)
+        self._lay(r, False)
+
+    def sizeHint(self):
+        return QSize(self.tw, 90)
+
+    def minimumSize(self):
+        return QSize(self.tw, 90)
+
+    def _lay(self, r, test):
+        g = self.gap
+        W = max(1, r.width() - g)
+        cols = max(1, int(W // (self.tw + g)))
+        tw = (W - g * (cols - 1)) // cols
+        th = max(self.th_min, int(tw * self.ratio))
+        for k, it in enumerate(self.items):
+            if not test:
+                it.setGeometry(QRect(r.x() + g + (k % cols) * (tw + g), r.y() + g + (k // cols) * (th + g), tw, th))
+        rows = (len(self.items) + cols - 1) // cols
+        return g + rows * (th + g)
+
+
+class WaveLoader(QObject):
+    """Calcule la forme d'onde d'un fichier avec ffmpeg (thread), mise en cache en mémoire."""
+    done = Signal(str, list, float)
+
+    def __init__(self):
+        super().__init__()
+        self.cache, self.busy = {}, set()
+
+    def want(self, path):
+        if path in self.cache:
+            return self.cache[path]
+        if path not in self.busy:
+            self.busy.add(path)
+            threading.Thread(target=self._run, args=(path,), daemon=True).start()
+        return None
+
+    def _run(self, path):
+        bins, dur = [], 0.0
+        try:
+            if shutil.which("ffmpeg"):
+                import array
+                r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", path, "-ac", "1", "-ar", "4000",
+                                    "-f", "s16le", "pipe:1"], capture_output=True, timeout=60,
+                                   creationflags=0x08000000 if SYS == "Windows" else 0)
+                n = len(r.stdout) // 2
+                if n:
+                    a = array.array("h")
+                    a.frombytes(r.stdout[:n * 2])
+                    dur = n / 4000.0
+                    k = 360                    # fine résolution : l'inspecteur du cartoucheur l'affiche en grand
+                    step = max(1, n // k)
+                    bins = [max((abs(x) for x in a[i * step:(i + 1) * step]), default=0) / 32768.0 for i in range(k)]
+                    pk = max(bins) or 1.0
+                    bins = [b / pk for b in bins]
+        except Exception:
+            pass
+        if not bins:
+            rnd = random.Random(path)
+            bins = [.25 + .75 * abs(math.sin(i / 25.0 + rnd.random())) for i in range(360)]
+        self.cache[path] = (bins, dur)
+        self.busy.discard(path)
+        self.done.emit(path, bins, dur)
+
+
+class Tile(QWidget):
+    """Tuile du cartoucheur : l'état de lecture vient du moteur (cart_status)."""
+    clicked = Signal(object)
+    edit = Signal(object)
+
+    def __init__(self, d, cid, parent=None):
+        super().__init__(parent)
+        self.d, self.cid = d, cid
+        self.st = None
+        self.bins, self.dur = [], 0.0
+        self.hov, self.lift = False, 0.0
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumSize(110, 74)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(140)
+        self.anim.valueChanged.connect(lambda v: (setattr(self, "lift", float(v)), self.update()))
+
+    def color(self):
+        return QColor(CART_COLORS.get(self.d.get("color"), CART_COLORS["Bleu"]))
+
+    def set_state(self, st):
+        if st != self.st:
+            self.st = st
+            self.update()
+
+    def _hover(self, on):
+        self.anim.stop()
+        self.anim.setStartValue(self.lift)
+        self.anim.setEndValue(1.0 if on else 0.0)
+        self.anim.start()
+
+    def enterEvent(self, e):
+        self._hover(True)
+
+    def leaveEvent(self, e):
+        self._hover(False)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit(self)
+        elif e.button() == Qt.MouseButton.RightButton:
+            self.edit.emit(self)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        w, h = self.width(), self.height()
+        f = max(.85, min(1.5, w / 150.0))
+        st = self.st
+        playing = st is not None
+        fading = playing and st[4]
+        pre = playing and st[3]
+        loop = playing and st[2]
+        pos, tot = (st[0], st[1]) if playing else (0, 0)
+        col = self.color()
+        if not self.d.get("file"):
+            col = QColor(FIELD)
+        elif playing:
+            col = col.darker(125)
+        elif self.lift:
+            col = col.lighter(100 + int(8 * self.lift))
+        r = QRectF(2, 2 - 2 * self.lift, w - 4, h - 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(5):
+            p.setBrush(QColor(0, 0, 0, 14))
+            p.drawRoundedRect(r.adjusted(-i, 2 + i, i, 3 + i), 14 * f, 14 * f)
+        g = QLinearGradient(0, r.top(), 0, r.bottom())
+        g.setColorAt(0, col.lighter(112))
+        g.setColorAt(1, col)
+        p.setBrush(QBrush(g))
+        p.setPen(QPen(QColor(255, 255, 255, 150), 2) if playing else Qt.PenStyle.NoPen)
+        p.drawRoundedRect(r, 14 * f, 14 * f)
+        name = self.d.get("name") or os.path.basename(self.d.get("file") or "") or "+ Ajouter un son"
+        p.setPen(QColor("white") if self.d.get("file") else QColor(MUT))
+        font = QFont(self.font())
+        font.setBold(True)
+        fm = None
+        for sz in (11, 10, 9):
+            font.setPointSizeF(sz * f * .85)
+            fm = QFontMetrics(font)
+            if max((fm.horizontalAdvance(t) for t in name.split()), default=0) <= w - 70 * f:
+                break
+        p.setFont(font)
+        avail = w - 62 * f
+        words = []
+        for wd in name.split():
+            if fm.horizontalAdvance(wd) <= avail:
+                words.append(wd)
+                continue
+            cur = ""
+            for ch in wd:
+                if cur and fm.horizontalAdvance(cur + ch + "-") > avail:
+                    words.append(cur + "-")
+                    cur = ""
+                cur += ch
+            words.append(cur)
+        p.drawText(QRectF(12, 9 - 2 * self.lift, avail, 44 * f), Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop, " ".join(words))
+        key = self.d.get("key", "")
+        if key:
+            kf = QFont(font)
+            kf.setPointSizeF(8 * f * .9)
+            p.setFont(kf)
+            kw = QFontMetrics(kf).horizontalAdvance(key) + 12
+            p.setBrush(QColor(0, 0, 0, 70))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QRectF(w - 10 - kw, 8, kw, 17 * f), 7, 7)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(w - 10 - kw, 8, kw, 17 * f), Qt.AlignmentFlag.AlignCenter, key)
+        prog = min(1.0, pos / tot) if playing and tot > 0 else 0.0
+        if self.bins and not (playing and h < 125):
+            n = len(self.bins)
+            bw = (w - 24) / n
+            mid, amp = h * .62, 8 * f
+            for i, v in enumerate(self.bins):
+                a = max(1.5, v * amp)
+                on = playing and i / n <= prog
+                p.setPen(QPen(QColor(255, 255, 255, 255 if on else 100), max(1.2, bw * .62), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                x = 12 + i * bw + bw / 2
+                p.drawLine(QPoint(int(x), int(mid - a)), QPoint(int(x), int(mid + a)))
+        if playing:
+            bh = max(5, int(7 * f))
+            by1 = h - 12
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 90))
+            p.drawRoundedRect(QRectF(12, by1 - bh, w - 24, bh), bh / 2, bh / 2)
+            p.setBrush(QColor("#f4d03f") if fading else QColor("white"))
+            if prog > 0:
+                p.drawRoundedRect(QRectF(12, by1 - bh, (w - 24) * prog, bh), bh / 2, bh / 2)
+            tf = QFont(font)
+            tf.setPointSizeF(14 * f * .8)
+            p.setFont(tf)
+            p.setPen(QColor("white"))
+            txt = ("∞ " + fmt_ms(pos)) if loop else "-" + fmt_ms(max(0, tot - pos))
+            p.drawText(QRectF(12, by1 - bh - 28 * f, w * .5, 26 * f), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
+            bd = "FONDU" if fading else ("ÉCOUTE" if pre else "DIRECT")
+            bc = {"DIRECT": "#ff3b4e", "ÉCOUTE": "#2f9e8f", "FONDU": "#e0a800"}[bd]
+            bf = QFont(font)
+            bf.setPointSizeF(7.5 * f * .9)
+            bwid = QFontMetrics(bf).horizontalAdvance(bd) + 26
+            br = QRectF(w - 12 - bwid, by1 - bh - 24 * f, bwid, 18 * f)
+            p.setBrush(QColor(bc))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(br, 9, 9)
+            if bd != "FONDU":
+                p.setBrush(QColor("white"))
+                p.drawEllipse(QRectF(br.left() + 8, br.center().y() - 3, 6, 6))
+            p.setFont(bf)
+            p.setPen(QColor("white"))
+            p.drawText(br.adjusted(16, 0, 0, 0), Qt.AlignmentFlag.AlignCenter, bd)
+        elif self.dur:
+            tf = QFont(font)
+            tf.setPointSizeF(10 * f * .85)
+            tf.setBold(False)
+            p.setFont(tf)
+            p.setPen(QColor(255, 255, 255, 220))
+            p.drawText(QRectF(12, h - 30 * f, w * .6, 22 * f), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, fmt_ms(self.dur))
+
+
+class Bridge(QObject):
+    """Pont thread -> interface : les threads du moteur appellent log(), le signal repasse dans le thread Qt."""
+    logged = Signal(str)
+    call = Signal(object)
+
+
+# ------------------------------------------------------------------ lignes de tableau : surbrillance douce, case « Actif »
+from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
+
+CHECK_ROLE = Qt.ItemDataRole.UserRole + 1
+TINT_ROLE = Qt.ItemDataRole.UserRole + 2         # couleur de ligne mise en avant (ex. lien réseau actif)
+
+
+def paint_check(p, cx, cy, on, hover=False, size=18):
+    r = QRectF(cx - size / 2, cy - size / 2, size, size)
+    p.setPen(Qt.PenStyle.NoPen)
+    if on:
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        g.setColorAt(0, QColor(ACC))
+        g.setColorAt(1, QColor("#ff5fa2" if PSYCHE else ACC2))
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(r, 6, 6)
+        p.setPen(QPen(QColor(ONACC), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline([QPointF(cx - 4.2, cy + .2), QPointF(cx - 1.2, cy + 3.2), QPointF(cx + 4.4, cy - 3.4)])
+    else:
+        p.setBrush(QColor(FIELD))
+        p.setPen(QPen(mixc(LINE, TXT, .35 if hover else .18), 1.4))
+        p.drawRoundedRect(r.adjusted(.7, .7, -.7, -.7), 6, 6)
+
+
+class RowDelegate(QStyledItemDelegate):
+    """Sélection et survol peints sur toute la ligne (pastille arrondie + filet d'accent), sans cadre de focus."""
+
+    def __init__(self, view, check_col=None):
+        super().__init__(view)
+        self.view, self.check_col = view, check_col
+        self.hrow = -1
+        view.setMouseTracking(True)
+        view.viewport().installEventFilter(self)
+        pal = view.palette()                       # la vue peint aussi un fond de ligne : on le neutralise
+        for grp in (pal.ColorGroup.Active, pal.ColorGroup.Inactive):
+            pal.setColor(grp, pal.ColorRole.Highlight, QColor(0, 0, 0, 0))
+            pal.setColor(grp, pal.ColorRole.HighlightedText, QColor(TXT))
+        view.setPalette(pal)
+        if isinstance(view, QTableWidget):
+            view.verticalHeader().setDefaultSectionSize(40)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == ev.Type.MouseMove:
+            r = self.view.indexAt(ev.position().toPoint()).row()
+            if r != self.hrow:
+                self.hrow = r
+                obj.update()
+        elif t == ev.Type.Leave:
+            if self.hrow != -1:
+                self.hrow = -1
+                obj.update()
+        return False
+
+    check_from_selection = False
+
+    def paint(self, p, opt, idx):
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        hov = idx.row() == self.hrow
+        tint = idx.data(TINT_ROLE)
+        if sel or hov or tint:
+            vp = self.view.viewport()
+            r = QRectF(opt.rect)
+            full = QRectF(3, r.top() + 2, vp.width() - 6, r.height() - 4)
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setClipRect(opt.rect)
+            p.setPen(Qt.PenStyle.NoPen)
+            base = tint or ACC
+            if sel or tint:
+                g = QLinearGradient(full.left(), 0, full.right(), 0)
+                g.setColorAt(0, mixc(PANEL, base, (.22 if sel else .17) if not LIGHT else .14))
+                g.setColorAt(1, mixc(PANEL, base if tint else ("#ff5fa2" if PSYCHE else ACC2), .07 + (.04 if hov else 0)))
+                p.setBrush(QBrush(g))
+            else:
+                p.setBrush(mixc(PANEL, TXT, .05))
+            p.drawRoundedRect(full, 12, 12)
+            if sel or tint:
+                p.setBrush(QColor(ACC if sel else base))
+                p.drawRoundedRect(QRectF(full.left() + 3, full.top() + 9, 3, full.height() - 18), 1.5, 1.5)
+            p.restore()
+        o = QStyleOptionViewItem(opt)
+        o.state &= ~(QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_HasFocus | QStyle.StateFlag.State_MouseOver)
+        o.backgroundBrush = QBrush(Qt.BrushStyle.NoBrush)
+        if self.check_col is not None and idx.column() == self.check_col:
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            c = QRectF(opt.rect).center()
+            paint_check(p, c.x(), c.y(), sel if self.check_from_selection else bool(idx.data(CHECK_ROLE)), hov)
+            p.restore()
+            return
+        super().paint(p, o, idx)
+
+
+def style_table(view, check_col=None):
+    if getattr(view, "_row_dlg", None) is None:
+        view._row_dlg = RowDelegate(view, check_col)
+        view.setItemDelegate(view._row_dlg)
+    elif check_col is not None:
+        view._row_dlg.check_col = check_col
+    return view._row_dlg
+
+
+# ------------------------------------------------------------------ choix de l'entrée audio
+def dev_kind(label):
+    l = (label or "").lower()
+    if "loopback" in l or "ordinateur" in l or "stereo mix" in l or "mixage" in l or "what u hear" in l or "monitor of" in l:
+        return "pc"
+    if any(k in l for k in ("line", "ligne", "aux")):
+        return "line"
+    if any(k in l for k in ("usb", "interface", "scarlett", "focusrite", "mixer", "table", "behringer", "yamaha", "rode", "zoom")):
+        return "usb"
+    return "mic"
+
+
+def dev_short(label):
+    """Nom affiché sans répéter le type (« Son de l'ordinateur : Haut-parleurs » → « Haut-parleurs »)."""
+    l = label or ""
+    for pre in ("Son de l'ordinateur : ", "Son de l'ordinateur ", "Monitor of ", "Moniteur de "):
+        if l.startswith(pre):
+            l = l[len(pre):].strip()
+            break
+    l = l.strip("() ")
+    return (l[:1].upper() + l[1:]) if l else label
+
+
+DEV_KIND_LABEL = {"pc": "Son de l'ordinateur", "line": "Entrée ligne", "usb": "Interface ou table de mixage", "mic": "Micro / entrée audio"}
+
+
+def draw_dev_icon(p, kind, cx, cy, col, s=1.0):
+    p.save()
+    p.translate(cx, cy)
+    p.scale(s, s)
+    p.setPen(ppen(col, 1.8))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if kind == "pc":
+        p.drawRoundedRect(QRectF(-9, -7, 18, 12), 2.5, 2.5)
+        p.drawLine(QPointF(-4, 9), QPointF(4, 9))
+        p.drawLine(QPointF(0, 5), QPointF(0, 9))
+    elif kind == "line":
+        p.drawRoundedRect(QRectF(-3, -9, 6, 8), 2, 2)
+        p.drawLine(QPointF(0, -1), QPointF(0, 4))
+        path = QPainterPath(QPointF(0, 4))
+        path.cubicTo(QPointF(0, 10), QPointF(8, 10), QPointF(8, 4))
+        p.drawPath(path)
+    elif kind == "usb":
+        for dx, ky in ((-6, -2), (0, 3), (6, -4)):
+            p.drawLine(QPointF(dx, -8), QPointF(dx, 8))
+            p.setBrush(QColor(col))
+            p.drawEllipse(QPointF(dx, ky), 2.2, 2.2)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+    else:
+        p.drawRoundedRect(QRectF(-3.5, -9, 7, 11), 3.5, 3.5)
+        p.drawArc(QRectF(-7, -5, 14, 12), 180 * 16, 180 * 16)
+        p.drawLine(QPointF(0, 7), QPointF(0, 9.5))
+    p.restore()
+
+
+def dev_icon_pm(kind, col, size=20):
+    dpr = QApplication.primaryScreen().devicePixelRatio() if QApplication.primaryScreen() else 1.0
+    pm = QPixmap(int(size * dpr), int(size * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    draw_dev_icon(p, kind, size / 2, size / 2, col, size / 22)
+    p.end()
+    return QIcon(pm)
+
+
+class DevicePicker(QWidget):
+    """Sélecteur d'entrée façon macOS : icône, nom, type d'entrée, chevron. Le menu liste les entrées détectées."""
+    picked = Signal(str)
+    refresh = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.devs, self.cur, self.hov, self.lift = [], "", False, 0.0
+        self.extra = []                     # [(libellé, fonction)] : entrées spéciales (ex. activer la capture du son de l'ordinateur)
+        self.setFixedHeight(54)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(140)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "lift", float(v)), self.update()))
+
+    def set_devices(self, labels):
+        self.devs = list(labels)
+        self.update()
+
+    def set_current(self, label):
+        self.cur = label or ""
+        self.update()
+
+    def _anim(self, on):
+        self.an.stop()
+        self.an.setStartValue(self.lift)
+        self.an.setEndValue(1.0 if on else 0.0)
+        self.an.start()
+
+    def enterEvent(self, e):
+        self._anim(True)
+
+    def leaveEvent(self, e):
+        self._anim(False)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Down):
+            return self.popup()
+        super().keyPressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.popup()
+
+    def popup(self):
+        m = QMenu(self)
+        m.setMinimumWidth(self.width())
+        ins = [l for l in self.devs if dev_kind(l) != "pc"]
+        pcs = [l for l in self.devs if dev_kind(l) == "pc"]
+        for title, group in (("ENTRÉES AUDIO", ins), ("SON DE L'ORDINATEUR", pcs)):
+            if not group and not (title.startswith("SON") and self.extra):
+                continue
+            hd = m.addAction(title)
+            hd.setEnabled(False)
+            for l in group:
+                a = m.addAction(dev_icon_pm(dev_kind(l), ACCT if l == self.cur else MUT), "  " + dev_short(l))
+                a.setCheckable(True)
+                a.setChecked(l == self.cur)
+                a.setToolTip(l)
+                a.triggered.connect(lambda _=False, l=l: self._pick(l))
+            if title.startswith("SON"):
+                for lb, fn in self.extra:
+                    m.addAction(dev_icon_pm("pc", ACCT), "  " + lb, fn)
+        if not self.devs:
+            na = m.addAction("Aucune entrée détectée")
+            na.setEnabled(False)
+        m.addSeparator()
+        m.addAction("Saisir le nom d'une entrée…", self._manual)
+        m.addAction("Actualiser la liste", self.refresh.emit)
+        m.exec(self.mapToGlobal(QPoint(0, self.height() + 4)))
+
+    def _manual(self):
+        t, ok = QInputDialog.getText(self, "Entrée audio", "Nom exact de l'entrée (tel que le système l'affiche) :", text=self.cur)
+        if ok and t.strip():
+            self._pick(t.strip())
+
+    def _pick(self, l):
+        self.cur = l
+        self.update()
+        self.picked.emit(l)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        if not self.isEnabled():
+            p.setOpacity(.45)
+        W, H = self.width(), self.height()
+        r = QRectF(1, 1, W - 2, H - 2)
+        p.setPen(QPen(mixc(LINE, ACC, .5 * self.lift) if not self.hasFocus() else QColor(ACC), 1))
+        p.setBrush(mixc(FIELD, TXT, .035 * self.lift))
+        p.drawRoundedRect(r, 14, 14)
+        kind = dev_kind(self.cur)
+        ic = QRectF(9, 9, H - 18, H - 18)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mixc(FIELD, ACC, .20))
+        p.drawRoundedRect(ic, 10, 10)
+        draw_dev_icon(p, kind, ic.center().x(), ic.center().y(), ACCT, 1.0)
+        x0 = ic.right() + 12
+        f = QFont(self.font())
+        f.setPointSizeF(10.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(TXT if self.cur else MUT))
+        fm = QFontMetrics(f)
+        name = fm.elidedText(dev_short(self.cur) if self.cur else "Choisir une entrée audio", Qt.TextElideMode.ElideRight, int(W - x0 - 40))
+        p.drawText(QRectF(x0, 8, W - x0 - 40, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+        f2 = QFont(self.font())
+        f2.setPointSizeF(8.8)
+        p.setFont(f2)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(x0, 27, W - x0 - 40, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   DEV_KIND_LABEL[kind] if self.cur else "Micro, table de mixage ou son de l'ordinateur")
+        cx, cy = W - 22, H / 2
+        p.setPen(ppen(mixc(MUT, TXT, .4 * self.lift), 1.8))
+        p.drawPolyline([QPointF(cx - 4, cy - 3), QPointF(cx, cy - 7), QPointF(cx + 4, cy - 3)])
+        p.drawPolyline([QPointF(cx - 4, cy + 3), QPointF(cx, cy + 7), QPointF(cx + 4, cy + 3)])
+
+
+class IconButton(QWidget):
+    """Petit bouton rond à icône dessinée (actualiser…)."""
+    clicked = Signal()
+
+    def __init__(self, kind="refresh", tip="", size=36, parent=None):
+        super().__init__(parent)
+        self.kind, self.lift, self.spin = kind, 0.0, 0.0
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tip:
+            self.setToolTip(tip)
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(140)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "lift", float(v)), self.update()))
+        self.sp = QVariantAnimation(self)
+        self.sp.setDuration(520)
+        self.sp.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.sp.setStartValue(0.0)
+        self.sp.setEndValue(360.0)
+        self.sp.valueChanged.connect(lambda v: (setattr(self, "spin", float(v)), self.update()))
+
+    def enterEvent(self, e):
+        self.an.stop()
+        self.an.setStartValue(self.lift)
+        self.an.setEndValue(1.0)
+        self.an.start()
+
+    def leaveEvent(self, e):
+        self.an.stop()
+        self.an.setStartValue(self.lift)
+        self.an.setEndValue(0.0)
+        self.an.start()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()) and self.isEnabled():
+            self.sp.stop()
+            self.sp.start()
+            self.clicked.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(.35)
+        W = self.width()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mixc(FIELD, TXT, .08 * self.lift))
+        p.drawEllipse(QRectF(1, 1, W - 2, W - 2))
+        p.translate(W / 2, W / 2)
+        p.rotate(self.spin)
+        col = mixc(MUT, TXT, .5 + .5 * self.lift)
+        p.setPen(ppen(col, 1.9))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(-7, -7, 14, 14), 60 * 16, 290 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        tri = QPainterPath(QPointF(3.2, -9.6))
+        tri.lineTo(QPointF(8.6, -6.2))
+        tri.lineTo(QPointF(2.6, -3.4))
+        tri.closeSubpath()
+        p.drawPath(tri)
+
+
+class Slider(QSlider):
+    """Curseur dessiné à la main : jamais rogné (hauteur fixe), poignée qui grossit au survol / à la prise,
+    clic n'importe où = la poignée y va, glissement continu ; repeint seulement sa propre zone."""
+
+    def __init__(self, orient=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orient, parent)
+        self.setFixedHeight(28)
+        self.setMinimumWidth(80)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.lift, self.drag = 0.0, False
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(140)
+        self.an.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "lift", float(v)), self.update()))
+
+    def _to(self, on):
+        self.an.stop()
+        self.an.setStartValue(self.lift)
+        self.an.setEndValue(1.0 if on else 0.0)
+        self.an.start()
+
+    def enterEvent(self, e):
+        self._to(True)
+
+    def leaveEvent(self, e):
+        if not self.drag:
+            self._to(False)
+
+    def _geo(self):
+        m = 11
+        return m, self.width() - m
+
+    def _val_at(self, x):
+        a, b = self._geo()
+        f = _cl((x - a) / max(1, b - a))
+        if self.invertedAppearance():
+            f = 1 - f
+        return round(self.minimum() + f * (self.maximum() - self.minimum()))
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton or not self.isEnabled():
+            return
+        self.drag = True
+        self.setSliderDown(True)
+        self.setValue(self._val_at(e.position().x()))
+        self._to(True)
+
+    def mouseMoveEvent(self, e):
+        if self.drag:
+            self.setValue(self._val_at(e.position().x()))
+
+    def mouseReleaseEvent(self, e):
+        if self.drag:
+            self.drag = False
+            self.setSliderDown(False)
+            if not self.rect().contains(e.position().toPoint()):
+                self._to(False)
+
+    def wheelEvent(self, e):
+        if self.isEnabled():
+            self.setValue(self.value() + (1 if e.angleDelta().y() > 0 else -1) * max(1, self.singleStep()))
+        e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(.4)
+        a, b = self._geo()
+        cy = self.height() / 2
+        rng = max(1, self.maximum() - self.minimum())
+        f = (self.value() - self.minimum()) / rng
+        if self.invertedAppearance():
+            f = 1 - f
+        x = a + f * (b - a)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(FIELD) if not LIGHT else QColor("#dfe3ec"))
+        p.drawRoundedRect(QRectF(a - 3, cy - 3, b - a + 6, 6), 3, 3)
+        if x > a - 2:
+            g = QLinearGradient(a, 0, b, 0)
+            g.setColorAt(0, QColor(ACC))
+            g.setColorAt(1, QColor("#ff5fa2" if PSYCHE else ACC2))
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(QRectF(a - 3, cy - 3, x - a + 6, 6), 3, 3)
+        r = 7.5 + 1.8 * self.lift
+        p.setBrush(QColor(0, 0, 0, 50))
+        p.drawEllipse(QPointF(x, cy + 1.2), r + .6, r + .6)
+        p.setBrush(QColor("#ffffff"))
+        p.setPen(QPen(QColor(LINE), 1))
+        p.drawEllipse(QPointF(x, cy), r, r)
+        if self.lift > .05:
+            c = QColor(ACC)
+            c.setAlphaF(.9 * self.lift)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawEllipse(QPointF(x, cy), 2.6 * self.lift, 2.6 * self.lift)
+
+
+
+class FolderChip(QWidget):
+    """Dossier affiché clairement : icône, nom du dossier en gras, chemin parent en dessous (abrégé au milieu)."""
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.path, self.extra, self.lift = "", "", 0.0
+        self.setFixedHeight(52)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Cliquer pour choisir un autre dossier")
+
+    def set_path(self, p, extra=""):
+        self.path, self.extra = p or "", extra
+        self.setToolTip((p or "") + "\nCliquer pour choisir un autre dossier")
+        self.update()
+
+    def enterEvent(self, e):
+        self.lift = 1.0
+        self.update()
+
+    def leaveEvent(self, e):
+        self.lift = 0.0
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        p.setPen(QPen(mixc(LINE, ACC, .5 * self.lift), 1))
+        p.setBrush(mixc(FIELD, TXT, .03 * self.lift))
+        p.drawRoundedRect(QRectF(1, 1, W - 2, H - 2), 14, 14)
+        ic = QRectF(9, 9, 34, 34)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mixc(FIELD, ACC, .2))
+        p.drawRoundedRect(ic, 10, 10)
+        cx, cy = ic.center().x(), ic.center().y()
+        p.setPen(ppen(ACCT, 1.7))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath(QPointF(cx - 8, cy + 6))
+        path.lineTo(cx - 8, cy - 5)
+        path.lineTo(cx - 3, cy - 5)
+        path.lineTo(cx - 1, cy - 3)
+        path.lineTo(cx + 8, cy - 3)
+        path.lineTo(cx + 8, cy + 6)
+        path.closeSubpath()
+        p.drawPath(path)
+        name = os.path.basename(self.path.rstrip("/\\")) or self.path or "Aucun dossier choisi"
+        parent = os.path.dirname(self.path.rstrip("/\\"))
+        home = os.path.expanduser("~")
+        if parent.startswith(home):
+            parent = "~" + parent[len(home):]
+        f = QFont(self.font())
+        f.setPointSizeF(10.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(TXT))
+        x0 = ic.right() + 12
+        p.drawText(QRectF(x0, 7, W - x0 - 12, 20), Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(f).elidedText(name, Qt.TextElideMode.ElideRight, int(W - x0 - 14)))
+        f2 = QFont(self.font())
+        f2.setPointSizeF(8.6)
+        p.setFont(f2)
+        p.setPen(QColor(MUT))
+        sub = ("dans " + parent if parent else "") + (("   ·   " + self.extra) if self.extra else "")
+        p.drawText(QRectF(x0, 27, W - x0 - 12, 18), Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(f2).elidedText(sub, Qt.TextElideMode.ElideMiddle, int(W - x0 - 14)))
+
+# ------------------------------------------------------------------ décors : logo, icônes, navigation, ambiances
+RZ = [0.0]  # instant jusqu'auquel la fenêtre se redimensionne : animations en pause
+
+
+def calm():
+    return time.time() < RZ[0]
+
+
+GSTOPS = [ACC, "#ff5fa2", "#a76bff", "#4cc9f0"] if PSYCHE else [ACC, ACC2]
+ICON_C, LABEL_C, SECT_C = ("#6b7488", "#3a4152", "#8a93a8") if LIGHT else ("#aeb6c6", "#c4cad8", "#6c7589")
+HOVER_C, IND_C = ("#eef0f5", "#e6e9f1") if LIGHT else ("#181d29", "#242a3a")
+HUE = {"diff": "#ff5fa2", "son": "#a76bff", "cart": "#4cc9f0", "rec": "#ff6b6b", "mon": "#35d49a", "net": "#4cc9f0",
+       "sos": "#ffb347", "set": "#a76bff", "about": "#ff5fa2"}
+AA = RenderHint = QPainter.RenderHint.Antialiasing
+
+
+class Gov:
+    """Régulateur de fluidité : mesure la cadence réelle de l'interface et, si la machine n'arrive pas à tenir 60 i/s,
+    passe à 30 i/s réguliers (palier 1), puis supprime les effets décoratifs coûteux (palier 2) pour ne jamais descendre
+    sous 30. Il remonte tout seul d'un palier quand la machine suit de nouveau."""
+    tier, ema, last, since, good, ups, timers, hooks = 1, .033, 0.0, 0.0, 0.0, 0, [], []     # objectif : 30 i/s réguliers
+    need, t_up = 10, 0.0         # secondes de bonne tenue avant de retenter 60 i/s (doublé à chaque échec, 2 min au plus)
+
+    @classmethod
+    def ivl(cls, base=16):
+        return base if cls.tier == 0 else max(base, 33)
+
+    @classmethod
+    def reg(cls, tm, base=16):
+        if not any(t is tm for t, _ in cls.timers):
+            cls.timers.append((tm, base))
+        return tm
+
+    @classmethod
+    def frame(cls, active=True):
+        now = time.perf_counter()
+        if cls.last and now - cls.last < .5 and active and not calm():
+            cls.ema += (now - cls.last - cls.ema) * .08
+        cls.last = now
+        if now - cls.since < 2.0:
+            return
+        cls.since = now
+        target = .0167 if cls.tier == 0 else .0334
+        if cls.ema > target * 1.45 and cls.tier < 2:
+            if cls.tier == 0 and now - cls.t_up < 8:      # 60 i/s retenté puis raté tout de suite : on attendra plus longtemps
+                cls.need = min(120, cls.need * 2)
+            cls.set(cls.tier + 1)
+        elif cls.ema < target * 1.12 and cls.tier > 1:
+            cls.good += 2
+            if cls.good >= cls.need:                         # la machine suit de nouveau : on remonte (sans limite de tentatives)
+                cls.t_up = now
+                cls.set(cls.tier - 1)
+        else:
+            cls.good = 0
+        if cls.tier == 0 and now - cls.t_up > 60:
+            cls.need = 10
+
+    @classmethod
+    def set(cls, tier):
+        cls.tier, cls.good = tier, 0
+        cls.ema = .033
+        cls.timers = [(t, b) for t, b in cls.timers if _alive(t)]
+        for t, b in cls.timers:
+            try:
+                t.setInterval(cls.ivl(b))
+            except RuntimeError:
+                pass
+        for fn in cls.hooks:
+            try:
+                fn(tier)
+            except Exception:
+                pass
+
+
+def _alive(o):
+    try:
+        o.objectName()
+        return True
+    except RuntimeError:
+        return False
+
+
+def grad(t, stops=None):
+    st = stops or GSTOPS
+    t = max(0.0, min(1.0, t))
+    n = len(st) - 1
+    i = min(n - 1, int(t * n))
+    return mixc(st[i], st[i + 1], t * n - i)
+
+
+def ppen(col, w=2, cap=Qt.PenCapStyle.RoundCap):
+    return QPen(QColor(col), w, Qt.PenStyle.SolidLine, cap, Qt.PenJoinStyle.RoundJoin)
+
+
+def new_painter(w):
+    p = QPainter(w)
+    p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+    return p
+
+
+from PySide6.QtGui import QPolygonF
+PH_NAVY, PH_AMBER, PH_RED, PH_SEA, PH_WHITE = "#0b1f3a", "#ffb03b", "#e5483f", "#5b7fa8", "#f5f7fb"
+
+
+def draw_logo(p, cx, cy, r, cols=None, width=3, rot=0.0, tile=True, sea=None, pulse=None):
+    """Le phare de Bev (logo). Carré de côté 2r centré en (cx, cy). `rot` (radians) fait respirer les ondes ; à 0 le dessin est fixe."""
+    p.save()
+    k = 2.0 * r / 560.0
+    p.translate(cx - r, cy - r)
+    p.scale(k, k)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if tile:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(PH_NAVY))
+        p.drawRoundedRect(QRectF(0, 0, 560, 560), 125, 125)
+    big = r >= 14 if sea is None else sea
+    # ondes
+    if pulse is None:
+        pulse = .6 + .4 * math.sin(rot * 3) if rot else 1.0
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    for sd in (-1, 1):
+        for (ex, ey0, ey1, bulge, wd, al) in ((180, 44, 209, 40, 16, pulse), (213, 79, 176, 12, 16, 1.0)):
+            c = QColor(PH_AMBER)
+            c.setAlphaF(al)
+            p.setPen(ppen(c, wd, Qt.PenCapStyle.RoundCap))
+            x0 = 280 + sd * (280 - ex)
+            off = sd * (bulge / .75)
+            pa = QPainterPath(QPointF(x0, ey0))
+            ym = (ey0 + ey1) / 2
+            pa.cubicTo(QPointF(x0 + off, ey0 + (ym - ey0) * .75), QPointF(x0 + off, ey1 - (ey1 - ym) * .75), QPointF(x0, ey1))
+            p.drawPath(pa)
+    # tour
+    p.setPen(Qt.PenStyle.NoPen)
+    tower = QPainterPath(QPointF(243, 172))
+    tower.lineTo(QPointF(317, 172))
+    tower.lineTo(QPointF(336, 404))
+    tower.lineTo(QPointF(224, 404))
+    tower.closeSubpath()
+    p.setBrush(QColor(PH_WHITE))
+    p.drawPath(tower)
+    p.save()
+    p.setClipPath(tower)
+    p.setBrush(QColor(PH_RED))
+    p.drawRect(QRectF(200, 230, 160, 44))
+    p.drawRect(QRectF(200, 319, 160, 45))
+    p.restore()
+    p.setBrush(QColor(PH_WHITE))
+    p.drawRoundedRect(QRectF(235, 157, 90, 17), 6, 6)
+    p.drawRoundedRect(QRectF(202, 403, 156, 23), 11, 11)
+    p.setBrush(QColor(PH_AMBER))
+    p.drawRoundedRect(QRectF(258, 101, 44, 56), 5, 5)
+    p.setBrush(QColor(PH_WHITE))
+    p.drawPolygon(QPolygonF([QPointF(280, 67), QPointF(314, 101), QPointF(247, 101)]))
+    if big:                                   # mer
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(ppen(PH_SEA, 12, Qt.PenCapStyle.RoundCap))
+        pa = QPainterPath(QPointF(65, 492))
+        for i in range(1, 91):
+            x = 65 + i * 5.02
+            pa.lineTo(QPointF(x, 489 + 13 * math.sin((x + 280 - 437) * 2 * math.pi / 180)))
+        p.drawPath(pa)
+    p.restore()
+
+
+draw_triskell = draw_logo      # ancien nom, conservé pour les appels existants
+_LOGO_PM = {}
+
+
+def draw_logo_fast(p, cx, cy, r, rot=0.0, tile=True, sea=None):
+    """Même logo, recopié depuis une image pré-rendue (à la résolution réelle de l'écran) : la respiration des ondes est
+    découpée en 40 niveaux, chacun dessiné une seule fois. ~10× moins coûteux que de retracer le phare à chaque image."""
+    pulse = .6 + .4 * math.sin(rot * 3) if rot else 1.0
+    q = int(round(pulse * 40))
+    try:
+        dpr = p.device().devicePixelRatioF()
+    except Exception:
+        dpr = 1.0
+    k = (r, q, dpr, tile, sea)
+    pm = _LOGO_PM.get(k)
+    if pm is None:
+        if len(_LOGO_PM) > 160:
+            _LOGO_PM.clear()
+        sz = int(math.ceil((2 * r + 2) * dpr))
+        pm = QPixmap(sz, sz)
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        q2 = QPainter(pm)
+        q2.setRenderHints(QPainter.RenderHint.Antialiasing)
+        draw_logo(q2, r + 1, r + 1, r, None, 3, 0.0, tile, sea, pulse=q / 40.0)
+        q2.end()
+        _LOGO_PM[k] = pm
+    p.drawPixmap(QPointF(cx - r - 1, cy - r - 1), pm)
+
+
+def draw_ermine(p, x, y, col, s=1.0):
+    """Hermine bretonne (x, y = pointe basse)."""
+    ox, oy = x, y - 9 * s
+    P = [(ox, oy - 7 * s), (ox - 3 * s, oy + 4 * s), (ox, oy + 9 * s), (ox + 3 * s, oy + 4 * s)]
+    for _ in range(3):
+        Q = []
+        for i in range(len(P)):
+            p0, p1 = P[i], P[(i + 1) % len(P)]
+            Q += [(.75 * p0[0] + .25 * p1[0], .75 * p0[1] + .25 * p1[1]), (.25 * p0[0] + .75 * p1[0], .25 * p0[1] + .75 * p1[1])]
+        P = Q
+    from PySide6.QtGui import QPolygonF
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(col))
+    p.drawPolygon(QPolygonF([QPointF(a, b) for a, b in P]))
+    for dx, dy in ((-4, -9), (0, -12), (4, -9)):
+        p.drawEllipse(QPointF(ox + dx * s, oy + dy * s), 1.4 * s, 1.4 * s)
+
+
+def draw_icon(p, key, cx, cy, col):
+    """Icônes au trait (même dessin que la version Tk)."""
+    p.save()
+    p.translate(cx, cy)
+    p.setPen(ppen(col, 2))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    def L(*xy):
+        path = QPainterPath(QPointF(xy[0], xy[1]))
+        for i in range(2, len(xy), 2):
+            path.lineTo(xy[i], xy[i + 1])
+        p.drawPath(path)
+
+    def E(r, dx=0, dy=0, fill=False, rx=None):
+        if fill:
+            p.setBrush(QColor(col))
+            p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(dx, dy), rx or r, r)
+        if fill:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(ppen(col, 2))
+    if key == "diff":
+        p.drawRoundedRect(QRectF(-4, -9, 8, 12), 4, 4)
+        p.drawArc(QRectF(-8, -6, 16, 14), 180 * 16, 180 * 16)
+        L(0, 8, 0, 11)
+        L(-4, 11, 4, 11)
+    elif key == "son":
+        for dx, ky in ((-6, -2), (0, 3), (6, -5)):
+            L(dx, -9, dx, 9)
+            E(3, dx, ky)
+    elif key == "cart":
+        for dx in (-8, 1):
+            for dy in (-8, 1):
+                p.drawRoundedRect(QRectF(dx, dy, 7, 7), 3, 3)
+    elif key == "mon":
+        L(-9, 0, -4, 0, -1, -8, 3, 8, 6, 0, 9, 0)
+    elif key == "net":
+        E(9)
+        E(9, rx=4)
+        L(-9, 0, 9, 0)
+    elif key == "rec":
+        E(9)
+        E(4, fill=True)
+    elif key == "set":
+        for dy, kx in ((-6, -3), (0, 4), (6, -1)):
+            L(-9, dy, 9, dy)
+            E(3, kx, dy)
+    elif key == "about":
+        E(9)
+        L(0, -1, 0, 5)
+        E(1.5, 0, -4.6, fill=True)
+    elif key == "sos":
+        E(9)
+        E(4)
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                L(sx * 4, sy * 4, sx * 8, sy * 8)
+    p.restore()
+
+
+def draw_blob(p, cx, cy, col, size=260, alpha=.26):
+    g = QRadialGradient(cx, cy, size / 2)
+    c = QColor(col)
+    c.setAlphaF(alpha)
+    g.setColorAt(0, c)
+    c2 = QColor(col)
+    c2.setAlphaF(0)
+    g.setColorAt(1, c2)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(g))
+    p.drawEllipse(QPointF(cx, cy), size / 2, size / 2)
+
+
+def soft_pill(p, rect, c1, c2, r=14):
+    g = QLinearGradient(rect.topLeft(), rect.topRight())
+    g.setColorAt(0, QColor(c1))
+    g.setColorAt(1, QColor(c2))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(g))
+    p.drawRoundedRect(rect, r, r)
+
+
+def paint_bot(p, x, y, width, blink=False, talk=0, on_air=False):
+    """Radiobot : poste de radio avec casque, dessiné en vectoriel."""
+    sc = width / 96.0
+    p.save()
+    p.translate(x, y)
+    p.scale(sc, sc)
+    p.setPen(Qt.PenStyle.NoPen)
+    cx, yy = 48, 2
+
+    def rr(x0, y0, x1, y1, r, fill):
+        p.setBrush(QColor(fill))
+        p.drawRoundedRect(QRectF(x0, y0, x1 - x0, y1 - y0), r, r)
+    rr(cx - 12, yy, cx + 12, yy + 46, 8, "#f7f4ec")
+    p.setPen(ppen("#cfc8b6", 1, Qt.PenCapStyle.FlatCap))
+    for k in range(5):
+        p.drawLine(QPointF(cx - 9, yy + 6 + k * 8), QPointF(cx + 9, yy + 6 + k * 8))
+    p.setPen(Qt.PenStyle.NoPen)
+    rr(cx - 14, yy + 40, cx + 14, yy + 47, 3, "#1b1b22")
+    rr(cx - 24, yy + 44, cx + 24, yy + 86, 14, "#eef1f7")
+    rr(cx - 19, yy + 49, cx + 19, yy + 81, 10, "#10131b")
+    h = 1 if blink else 5
+    for xx in (cx - 9, cx + 9):
+        rr(xx - 4, yy + 62 - h, xx + 4, yy + 62 + h, 4, "#ffffff" if talk else ACC2)
+    if talk:
+        for i in range(5):
+            hh = 2 + abs(((talk * 3 + i * 5) % 10) - 5) * .7
+            rr(cx - 13 + i * 6, yy + 74 - hh / 2, cx - 10 + i * 6, yy + 74 + hh / 2, 1, ACC)
+    else:
+        p.setPen(ppen(ACC, 2, Qt.PenCapStyle.FlatCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(cx - 8, yy + 68, 16, 10), -160 * 16, 140 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+    rr(cx - 30, yy + 54, cx - 22, yy + 76, 5, ACC)
+    rr(cx + 22, yy + 54, cx + 30, yy + 76, 5, ACC)
+    p.setPen(ppen(ACC, 3, Qt.PenCapStyle.FlatCap))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawArc(QRectF(cx - 29, yy + 42, 58, 38), -340 * 16, 140 * 16)
+    p.setPen(Qt.PenStyle.NoPen)
+    rr(cx - 30, yy + 88, cx + 30, yy + 128, 12, "#c9742e")
+    rr(cx - 26, yy + 92, cx + 26, yy + 124, 9, "#e8a45a")
+    p.setPen(ppen("#7a4a1e", 2, Qt.PenCapStyle.FlatCap))
+    for k in range(5):
+        p.drawLine(QPointF(cx - 22 + k * 5, yy + 98), QPointF(cx - 22 + k * 5, yy + 118))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#10131b"))
+    p.drawEllipse(QRectF(cx + 2, yy + 97, 20, 20))
+    tc = OKC if on_air else ACC
+    p.setPen(ppen(tc, 2, Qt.PenCapStyle.FlatCap))
+    for k in range(3):
+        a = math.radians(k * 120 + 90)
+        p.drawLine(QPointF(cx + 12, yy + 107), QPointF(cx + 12 + 6 * math.cos(a), yy + 107 - 6 * math.sin(a)))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(OKC if on_air else "#8a93a6"))
+    p.drawEllipse(QRectF(cx + 24, yy + 94, 4, 4))
+    p.restore()
+
+
+class Ticker(QObject):
+    """Horloge commune des décors animés : un seul minuteur à 60 i/s pour tous, et du temps réel (secondes) plutôt qu'un
+    compteur d'images, pour un mouvement régulier même si une image saute. Un widget caché ne coûte rien."""
+    _inst = None
+    driven = False           # vrai quand la fenêtre principale fournit l'horloge (une seule cadence pour toute l'interface)
+
+    def __init__(self):
+        super().__init__()
+        self.subs, self.clock = [], QElapsedTimer()
+        self.clock.start()
+        self.tm = QTimer(self)
+        self.tm.setTimerType(Qt.TimerType.PreciseTimer)
+        self.tm.timeout.connect(self.tick)
+        self.last = 0.0
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            cls._inst = Ticker()
+        return cls._inst
+
+    @classmethod
+    def add(cls, w, fn, fps=60, always=False):
+        """fn(t, dt) est appelée à chaque image tant que le widget est visible ; elle renvoie True s'il faut le repeindre.
+        `fps` : cadence propre au décor (30 suffit pour ce qui dérive lentement : deux fois moins de dessin, aucune
+        différence à l'œil)."""
+        T = cls.get()
+        T.subs.append([w, fn, 1.0 / max(1, fps) - .004, 0.0, always])
+        if ANIM and not T.tm.isActive() and not cls.driven:
+            T.tm.start(Gov.ivl(16))
+            Gov.reg(T.tm, 16)
+
+    @classmethod
+    def drive(cls):
+        """La boucle d'affichage principale prend le relais : décors, Gaël, forme d'onde… sont mis à jour dans le MÊME passage
+        que les vumètres. Une seule peinture (et un seul envoi à l'écran) par image au lieu de plusieurs, décalées."""
+        cls.driven = True
+        cls.get().tm.stop()
+
+    def now(self):
+        return self.clock.elapsed() / 1000.0
+
+    def tick(self):
+        t = self.now()
+        self.last = t
+        if calm():
+            return
+        self.n = getattr(self, "n", 0) + 1
+        if Gov.tier >= 2 and self.n % 2:         # palier 2 : les décors ne bougent qu'une image sur deux
+            return
+        alive = []
+        win_min = {}
+        for s in self.subs:
+            w, fn, per, last, always = s
+            try:
+                if (ANIM or always) and t - last >= per:
+                    top = w.window()
+                    k = id(top)
+                    if k not in win_min:
+                        win_min[k] = bool(top) and top.isMinimized()
+                    if w.isVisible() and not win_min[k]:
+                        s[3] = t
+                        if fn(t, min(.1, t - last) if last else .016):
+                            w.update()
+                alive.append(s)
+            except RuntimeError:              # widget détruit
+                pass
+        self.subs = alive
+
+
+class SeaScene(QWidget):
+    """Décor de Bretagne maritime : phare au faisceau tournant, voilier, goélands, étoiles, vagues."""
+
+    def __init__(self, w=214, h=120, bg=None, light_x=.78, parent=None):
+        super().__init__(parent)
+        self.bgc = bg or RAIL
+        self.setFixedSize(w, h)
+        self.air, self.t, self.n, self.lx = False, 0.0, 0, light_x
+        rnd = random.Random(11)
+        self.stars = [[rnd.uniform(8, w - 8), rnd.uniform(3, h * .38), 0] for _ in range(11)]
+        self.sc = ["#3D6A92", "#6E9CC8", "#BFD7F2", "#2A4C6E"]
+        self._star = 0.0
+        Ticker.add(self, self.step, 30)
+
+    def step(self, t, dt):
+        self.t += dt
+        if t - self._star > .6:
+            self._star = t
+            random.choice(self.stars)[2] = random.randrange(4)
+        return True
+
+    def wave(self, base, amp, k, ph, W):
+        path = QPainterPath(QPointF(0, base + amp * math.sin(ph)))
+        for x in range(6, W + 9, 6):
+            path.lineTo(x, base + amp * math.sin(x * k + ph))
+        return path
+
+    def poly(self, p, col, *pts):
+        from PySide6.QtGui import QPolygonF
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(col))
+        p.drawPolygon(QPolygonF([QPointF(pts[i], pts[i + 1]) for i in range(0, len(pts), 2)]))
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        w, h = self.width(), self.height()
+        s, t = h / 110.0, self.t
+        sea, lx = h * .66, w * self.lx
+        p.fillRect(self.rect(), QColor(self.bgc))
+        for x, y, k in self.stars:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.sc[k]))
+            p.drawEllipse(QRectF(x, y, 1.8, 1.8))
+        mx, my = w * .13, h * .17
+        p.setBrush(QColor("#E8F2FF"))
+        p.drawEllipse(QPointF(mx, my), 8 * s, 8 * s)
+        p.setBrush(QColor(self.bgc))
+        p.drawEllipse(QRectF(mx - 3 * s, my - 10 * s, 14 * s, 16 * s))
+        ly = sea - 54 * s - 5.5 * s
+        ph = t * (2.1 if self.air else 1.0)
+        beam = mixc(self.bgc, "#FFE9A8", .20)
+        for sg in (1, -1):
+            tip = lx + sg * w * .95 * math.cos(ph)
+            hh = (2.5 + 9 * abs(math.sin(ph))) * s
+            self.poly(p, beam, lx, ly, tip, ly - hh, tip, ly + hh)
+        self.poly(p, "#1B2B3A", lx - 19 * s, h, lx - 14 * s, sea + 2 * s, lx - 7 * s, sea - 7 * s, lx + 6 * s, sea - 8 * s, lx + 14 * s, sea + 2 * s, lx + 20 * s, h)
+        y0, y1 = sea - 6 * s, sea - 54 * s
+        self.poly(p, "#EAF0F6", lx - 6 * s, y0, lx + 6 * s, y0, lx + 3.6 * s, y1, lx - 3.6 * s, y1)
+        ya, yb = y0 - (y0 - y1) * .32, y0 - (y0 - y1) * .52
+        wa, wb = 6 - 2.4 * .32, 6 - 2.4 * .52
+        self.poly(p, "#C8452D", lx - wa * s, ya, lx + wa * s, ya, lx + wb * s, yb, lx - wb * s, yb)
+        p.setBrush(QColor("#2A3A4A"))
+        p.drawRect(QRectF(lx - 6 * s, y1 - 2 * s, 12 * s, 3 * s))
+        p.setBrush(QColor("#FFE08A" if abs(math.sin(ph)) > .7 else "#E0A93C"))
+        p.drawRect(QRectF(lx - 3.6 * s, y1 - 9 * s, 7.2 * s, 7 * s))
+        self.poly(p, "#2A3A4A", lx - 5 * s, y1 - 9 * s, lx + 5 * s, y1 - 9 * s, lx, y1 - 15 * s)
+        W = int(w)
+
+        def fill(path, col):
+            path.lineTo(w, h)
+            path.lineTo(0, h)
+            path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(col))
+            p.drawPath(path)
+        fill(self.wave(sea, 2.2 * s, .07, t * 1.2, W), "#14506E")
+        bx = (t * 7) % (w + 60) - 30
+        by = sea + 4 * s + math.sin(t * 1.7) * 1.6 * s
+        self.poly(p, "#2B1E1A", bx - 11 * s, by - 3 * s, bx + 11 * s, by - 3 * s, bx + 7 * s, by + 3 * s, bx - 7 * s, by + 3 * s)
+        p.setPen(ppen("#2B1E1A", 1))
+        p.drawLine(QPointF(bx, by - 3 * s), QPointF(bx, by - 28 * s))
+        self.poly(p, "#E9DFC8", bx + 1.5 * s, by - 26 * s, bx + 1.5 * s, by - 4 * s, bx + 10 * s, by - 4 * s)
+        self.poly(p, "#D8553A", bx - 1.5 * s, by - 22 * s, bx - 1.5 * s, by - 4 * s, bx - 10 * s, by - 4 * s)
+        p1 = self.wave(sea + 10 * s, 2.6 * s, .09, 1.3 - t * 1.5, W)
+        p.setPen(ppen("#5FB4C8", 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(p1)
+        fill(self.wave(sea + 10 * s, 2.6 * s, .09, 1.3 - t * 1.5, W), "#0F3E58")
+        p.setPen(ppen("#5FB4C8", 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(self.wave(sea + 10 * s, 2.6 * s, .09, 1.3 - t * 1.5, W))
+        fill(self.wave(sea + 22 * s, 3 * s, .06, t * .9 + 2, W), "#0A2D44")
+        p.setPen(ppen("#DCE8F4", 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i, (fy, v, ph0) in enumerate(((.14, 11.0, 5.0), (.27, 7.5, 31.0), (.21, 14.0, 18.0))):
+            gx = (ph0 * 3 + t * v) % (w + 40) - 20
+            gy = h * fy + math.sin(t * .7 + i * 2) * 3 * s
+            f = math.sin(t * 5 + i * 1.7) * 3.2 * s
+            path = QPainterPath(QPointF(gx - 7 * s, gy + f))
+            path.quadTo(QPointF(gx - 3.5 * s, gy - 3 * s), QPointF(gx, gy))
+            path.quadTo(QPointF(gx + 3.5 * s, gy - 3 * s), QPointF(gx + 7 * s, gy + f))
+            p.drawPath(path)
+
+
+class WaveBar(QWidget):
+    """Fine bande de vagues animée ; option petit voilier."""
+
+    def __init__(self, w=120, h=8, bg=None, boat=False, parent=None):
+        super().__init__(parent)
+        self.h, self.t, self.boat, self.bgc = h, 0.0, boat, bg
+        self.setFixedHeight(h)
+        if w > 12:
+            self.setFixedWidth(w)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        Ticker.add(self, self.step, 30)
+
+    def step(self, t, dt):
+        self.t += dt
+        return True
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, h = max(24, self.width()), self.h
+        if self.bgc:
+            p.fillRect(self.rect(), QColor(self.bgc))
+        for base, amp, k, ph, col in ((h * .42, h * .22, .085, self.t * 1.3, "#1B6A86"), (h * .64, h * .2, .12, 1 - self.t * 1.7, "#12506C")):
+            path = QPainterPath(QPointF(0, base + amp * math.sin(ph)))
+            for x in range(6, W + 9, 6):
+                path.lineTo(x, base + amp * math.sin(x * k + ph))
+            path.lineTo(W, h)
+            path.lineTo(0, h)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(col))
+            p.drawPath(path)
+        if self.boat:
+            bx = (self.t * 9) % (W + 40) - 20
+            by = h * .40 + math.sin(self.t * 1.7) * .8
+            from PySide6.QtGui import QPolygonF
+            p.setBrush(QColor("#E9DFC8"))
+            p.drawPolygon(QPolygonF([QPointF(bx - 5, by - 1), QPointF(bx + 5, by - 1), QPointF(bx + 3, by + 2.5), QPointF(bx - 3, by + 2.5)]))
+            p.setBrush(QColor("#D8553A"))
+            p.drawPolygon(QPolygonF([QPointF(bx, by - h * .62), QPointF(bx, by - 1.5), QPointF(bx + 5, by - 1.5)]))
+
+
+class AuroraBar(QWidget):
+    """Fine barre de dégradé qui glisse lentement (soulignement du titre de page)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(120, 6)
+        self.off = 0.0
+        Ticker.add(self, self.step, 30)
+
+    def step(self, t, dt):
+        self.off = (self.off + 28 * dt) % 360
+        return True
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        L = 360.0
+        g = QLinearGradient(-self.off, 0, -self.off + L, 0)
+        for i in range(13):
+            u = i / 12
+            g.setColorAt(u, grad(1 - abs(2 * u - 1)))
+        g.setSpread(QLinearGradient.Spread.ReflectSpread)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(QRectF(0, 1, 120, 4), 2, 2)
+
+
+class AirWaves(QWidget):
+    """Phare de l'antenne : éteint hors antenne, VERT quand tout part bien, ROUGE qui clignote en cas de panne.
+    Le faisceau balaie et des ondes partent de la lanterne ; 60 i/s via l'horloge commune, rien quand il est éteint."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(64, 54)
+        self.on, self.bad, self.pulse, self.t = False, False, 0.0, 0.0
+        self.setToolTip("Phare d'antenne : vert = à l'antenne, rouge = panne")
+        Ticker.add(self, self.step, 30)
+
+    def set(self, on, bad=False):
+        if not on and not bad:
+            bad = False
+        if (on, bad) != (self.on, self.bad):
+            self.on, self.bad = on, bad
+            self.setToolTip("Phare d'antenne : " + ({"son": "pas de son en entrée", "flux": "rupture de flux"}.get(bad, "PANNE") if bad
+                                                    else ("à l'antenne, tout va bien" if on else "hors antenne")))
+            self.update()
+
+    def step(self, t, dt):
+        self.t = t
+        return self.on or bool(self.bad)       # jamais animé tant que la diffusion n'est pas lancée
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        t = self.t
+        act = self.on or bool(self.bad)
+        cx, base = 32, 51
+        if self.bad == "son":
+            k = (math.sin(t * 5) + 1) / 2
+            col = mixc("#b86e00", "#ffb020", k)
+        elif self.bad:
+            k = (math.sin(t * 7) + 1) / 2
+            col = mixc("#a8202f", BADC, k)
+        elif self.on:
+            col = QColor(OKC)
+        else:
+            col = QColor(ACC)
+        dim = QColor("#4a5266" if not LIGHT else "#a8afbd")
+        if act and ANIM and self.bad != "flux":
+            sweep = math.sin(t * 1.9)
+            p.save()
+            p.translate(cx, 15)
+            g = QRadialGradient(0, 0, 26)
+            g.setColorAt(0, qc(col.name(), 120))
+            g.setColorAt(1, qc(col.name(), 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(g))
+            w = 22 * abs(sweep) + 3
+            side = 1 if sweep > 0 else -1
+            path = QPainterPath(QPointF(0, 0))
+            path.lineTo(QPointF(side * 28, -w / 2))
+            path.lineTo(QPointF(side * 28, w / 2))
+            path.closeSubpath()
+            p.drawPath(path)
+            p.restore()
+        if act and ANIM:
+            for k in range(3):
+                ph = (t * (1.4 if self.bad else .9) + k / 3) % 1.0
+                c = QColor(col)
+                c.setAlphaF(.75 * (1 - ph))
+                p.setPen(QPen(c, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                r = 9 + ph * 16
+                p.drawArc(QRectF(cx - r, 15 - r, 2 * r, 2 * r), 30 * 16, 60 * 16)
+                p.drawArc(QRectF(cx - r, 15 - r, 2 * r, 2 * r), 90 * 16, 60 * 16)
+        # le phare lui-même ne change qu'avec l'état : image pré-rendue (sauf en panne, où sa couleur clignote)
+        if self.bad:
+            self._tower(p, act, col, dim)
+            return
+        dpr = self.devicePixelRatioF()
+        key = (act, col.name(), dpr)
+        if getattr(self, "_tk", None) != key:
+            pm = QPixmap(int(math.ceil(64 * dpr)), int(math.ceil(54 * dpr)))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = new_painter(pm)
+            self._tower(q, act, col, dim)
+            q.end()
+            self._tpm, self._tk = pm, key
+        p.drawPixmap(QPointF(0, 0), self._tpm)
+
+    def _tower(self, p, act, col, dim):
+        cx, base = 32, 51
+        body = QPainterPath(QPointF(cx - 5, 22))
+        body.lineTo(QPointF(cx + 5, 22))
+        body.lineTo(QPointF(cx + 8, base))
+        body.lineTo(QPointF(cx - 8, base))
+        body.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#f1f3f7") if act else dim)
+        p.drawPath(body)
+        if act:
+            p.save()
+            p.setClipPath(body)
+            p.setBrush(QColor("#d94a4a"))
+            for y0 in (27, 39):
+                p.drawRect(QRectF(cx - 10, y0, 20, 5.5))
+            p.restore()
+        p.setBrush(QColor("#2a3040") if act else dim)
+        p.drawRoundedRect(QRectF(cx - 8, 20, 16, 3), 1.2, 1.2)
+        if act:
+            glow = QRadialGradient(cx, 15, 11)
+            glow.setColorAt(0, qc(col.name(), 170))
+            glow.setColorAt(1, qc(col.name(), 0))
+            p.setBrush(QBrush(glow))
+            p.drawEllipse(QPointF(cx, 15), 11, 11)
+        p.setBrush(mixc(col, "#ffffff", .35) if act else mixc(dim, PAGE, .3))
+        p.drawRoundedRect(QRectF(cx - 4, 12, 8, 8), 2, 2)
+        p.setBrush(col if act else dim)
+        dome = QPainterPath(QPointF(cx - 5.5, 12.5))
+        dome.cubicTo(QPointF(cx - 5, 6), QPointF(cx + 5, 6), QPointF(cx + 5.5, 12.5))
+        dome.closeSubpath()
+        p.drawPath(dome)
+        p.drawRect(QRectF(cx - .8, 4, 1.6, 4))
+        p.setBrush(QColor("#3a4152") if not LIGHT else QColor("#c9ced8"))
+        p.drawRoundedRect(QRectF(cx - 13, base - 1, 26, 4), 2, 2)
+
+
+class Segmented(QWidget):
+    """Sélecteur segmenté façon macOS."""
+    changed = Signal(int)
+
+    def __init__(self, labels, w=56, h=32, parent=None):
+        super().__init__(parent)
+        self.labels, self.w, self.h, self.val, self.pos = list(labels), w, h, 0, 0.0
+        self.setFixedSize(w * len(labels) + 6, h + 6)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(140)
+        self.an.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "pos", float(v)), self.update()))
+
+    def setValue(self, k, emit=False):
+        k = max(0, min(len(self.labels) - 1, k))
+        self.val = k
+        self.an.stop()
+        if ANIM and self.isVisible():
+            self.an.setStartValue(self.pos)
+            self.an.setEndValue(float(k))
+            self.an.start()
+        else:
+            self.pos = float(k)
+            self.update()
+        if emit:
+            self.changed.emit(k)
+
+    def mouseReleaseEvent(self, e):
+        k = int((e.position().x() - 3) // self.w)
+        if 0 <= k < len(self.labels) and k != self.val:
+            self.setValue(k, True)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#e3e6ee" if LIGHT else "#1a1f2b"))
+        p.drawRoundedRect(QRectF(1, 1, self.w * len(self.labels) + 4, self.h + 4), (self.h + 4) / 2, (self.h + 4) / 2)
+        x = 3 + self.pos * self.w
+        r = QRectF(x, 3, self.w, self.h)
+        if PSYCHE:
+            soft_pill(p, r, ACC, mixc(ACC, "#c04bff", .5), self.h / 2)
+        else:
+            p.setBrush(QColor(ACC))
+            p.drawRoundedRect(r, self.h / 2, self.h / 2)
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPointSizeF(9.5)
+        p.setFont(f)
+        for k, t in enumerate(self.labels):
+            on = abs(k - self.pos) < .5
+            p.setPen(QColor(ONACC if on else LABEL_C))
+            p.drawText(QRectF(3 + k * self.w, 3, self.w, self.h), Qt.AlignmentFlag.AlignCenter, t)
+
+
+# ------------------------------------------------------------------ navigation latérale / haute
+class NavBase(QWidget):
+    selected = Signal(str)
+    bot_clicked = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.active, self.hover, self.air = "diff", None, False
+        self.title_txt = (SET.get("station") or "Studio")[:18]
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bot_blink, self.bot_hint = False, False
+
+    def set_air(self, on):
+        if bool(on) != self.air:
+            self.air = bool(on)
+            self.update()
+
+    def set_title(self, t):
+        self.title_txt = (t or "Studio")[:18]
+        self.update()
+
+    def leaveEvent(self, e):
+        self.set_hover(None)
+
+    def set_hover(self, k):
+        if k != self.hover:
+            self.hover = k
+            self.update()
+
+
+class Rail(NavBase):
+    BG_HZ = 12             # halos colorés (ambiance Psyché) : ils dérivent très lentement, 12 images/s sont invisibles à l'œil
+    LAYOUT = (("sec", "Antenne"), ("diff", "Diffusion"), ("son", "Traitement son"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"),
+              ("sec", "Contrôle"), ("mon", "Monitoring"), ("net", "Réseau"), ("sos", "SOS"),
+              ("sec", "Application"), ("set", "Réglages"), ("about", "À propos"))
+    W, RH = 214, 40
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedWidth(self.W)
+        self.pos = {}
+        y = 84
+        for k, lab in self.LAYOUT:
+            if k == "sec":
+                y += 12
+                self.pos[("sec", lab)] = y
+                y += 22
+            else:
+                self.pos[k] = y
+                y += self.RH + 3
+        self.ind_y = float(self.pos["diff"])
+        self.ang, self.spin, self.tick_n = 0.0, 0.0, 0
+        self.rip = []
+        self.sea = None
+        self.erm = [(22 + q * 34 + (r % 2) * 17, 44 - r * 24 + 20, .13) for r in range(2) for q in range(6)]
+        self.gl = QVariantAnimation(self)
+        self.gl.setDuration(220)
+        self.gl.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.gl.valueChanged.connect(lambda v: (setattr(self, "ind_y", float(v)), self.upd_items()))
+        self.t_anim, self._erm_t = 0.0, 0.0
+        Ticker.add(self, self.anim)
+        if OCEAN:
+            self.sea = SeaScene(self.W, 120, bg=RAIL, parent=self)
+        self.badges = {}
+        self.items_bottom = self.pos["about"] + self.RH
+        self.gael = GaelView("rail", self)
+        self.gael.hide()
+
+    def resizeEvent(self, e):
+        H = self.height()
+        sea = bool(self.sea) and H >= 695
+        if self.sea:
+            self.sea.move(0, H - 120)
+            self.sea.setVisible(sea)
+        top = self.items_bottom + 10
+        bottom = H - (118 if sea else 6)
+        avail = bottom - top
+        if avail >= 128:
+            h = min(262, avail)
+            self.gael.setGeometry(10, bottom - h, self.W - 20, h)
+            self.gael.show()
+        else:
+            self.gael.hide()
+
+    def upd_items(self):
+        """Seule la zone des onglets est repeinte (pas Gaël ni le décor en dessous) : changement d'onglet plus léger."""
+        self.update(QRect(0, 76, self.W, self.items_bottom - 70))
+
+    def set_hover(self, k):
+        if k != self.hover:
+            self.hover = k
+            self.upd_items()
+
+    def set_badge(self, key, color):
+        if self.badges.get(key) != color:
+            if color:
+                self.badges[key] = color
+            else:
+                self.badges.pop(key, None)
+            self.update(QRect(0, self.pos[key], self.W, self.RH))
+
+    def set_air(self, on):
+        super().set_air(on)
+        self.gael.on_air = self.air
+        if self.sea:
+            self.sea.air = self.air
+
+    def key_at(self, y):
+        for k, _ in self.LAYOUT:
+            if k != "sec" and self.pos[k] <= y < self.pos[k] + self.RH:
+                return k
+
+    def mouseMoveEvent(self, e):
+        self.set_hover(self.key_at(e.position().y()))
+
+    def mouseReleaseEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        if y < 80:
+            self.spin += 14.0
+            self.rip += [(time.time(), 0), (time.time() + .11, 1)]
+            return
+        k = self.key_at(y)
+        if k:
+            self.selected.emit(k)
+
+    def fits_bot(self):
+        return False
+
+    def select(self, key):
+        self.active = key
+        tgt = float(self.pos[key])
+        self.gl.stop()
+        if ANIM:
+            self.gl.setStartValue(self.ind_y)
+            self.gl.setEndValue(tgt)
+            self.gl.start()
+        else:
+            self.ind_y = tgt
+        self.upd_items()
+
+    def anim(self, t, dt):
+        """60 i/s : logo, halos colorés, hermines. On ne repeint pas la zone de Gaël (il s'en charge)."""
+        self.spin *= .94 ** (dt * 12.5)
+        self.ang = (self.ang + ((1.8 if self.air else .55) + self.spin) * dt) % (2 * math.pi / 3)
+        self.t_anim += dt
+        if self.erm and t - self._erm_t > .48:
+            self._erm_t = t
+            i = random.randrange(len(self.erm))
+            x, y, _ = self.erm[i]
+            self.erm[i] = (x, y, random.choice((.07, .12, .20, .30)))
+        bg_moves = PSYCHE and Gov.tier < 2 and int(self.t_anim * self.BG_HZ) != getattr(self, "_bg_key", (None,))[0]
+        if not (bg_moves or self.rip or abs(self.spin) > .01):
+            # seul le logo bouge, et seulement à l'antenne (hors antenne il est fixe : rien à repeindre) ; 30 i/s suffisent
+            # pour la respiration des ondes
+            if self.air and ANIM and t - getattr(self, "_logo_t", 0.0) >= .029:
+                self._logo_t = t
+                self.update(QRect(14, 20, 50, 50))
+            return False
+        if self.gael.isVisible():
+            g = self.gael.geometry()
+            self.update(QRect(0, 0, self.W, g.y()))
+            self.update(QRect(0, g.y(), g.x(), g.height()))
+            self.update(QRect(g.right() + 1, g.y(), self.W, g.height()))
+            return False
+        return True
+
+    def _items_layer(self, dpr):
+        """Icônes et libellés du menu, pré-rendus : redessinés seulement si le survol, l'onglet ou une pastille change."""
+        w = self.W
+        sig = (self.active, self.hover, tuple(sorted(self.badges.items())), dpr, w)
+        if getattr(self, "_it_sig", None) == sig:
+            return self._it_pm
+        pm = QPixmap(int(w * dpr), int((self.items_bottom + 6) * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        sf = QFont(self.font())
+        sf.setPointSizeF(8.5)
+        sf.setBold(True)
+        for k, lab in self.LAYOUT:
+            if k == "sec":
+                p.setFont(sf)
+                p.setPen(QColor(SECT_C))
+                y = self.pos[("sec", lab)]
+                p.drawText(QRectF(26, y, w - 40, 16), Qt.AlignmentFlag.AlignVCenter, lab)
+                continue
+            y = self.pos[k]
+            on, hv = k == self.active, k == self.hover and k != self.active
+            if hv:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(HOVER_C))
+                p.drawRoundedRect(QRectF(12, y, w - 24, self.RH), 14, 14)
+            hu = HUE.get(k, ACC) if PSYCHE else ACC
+            col = hu if on else (mixc(ICON_C, hu, .65) if hv else ICON_C)
+            draw_icon(p, k, 38 + (2 if hv else 0), y + self.RH / 2, col)
+            lf = QFont(self.font())
+            lf.setPointSizeF(10.5)
+            lf.setBold(on)
+            p.setFont(lf)
+            p.setPen(QColor(TXT if (on or hv) else LABEL_C))
+            tx = 62 + (3 if hv else 0)
+            p.drawText(QRectF(tx, y, w - 70, self.RH), Qt.AlignmentFlag.AlignVCenter, lab)
+            if k == "son":                                  # étiquette BÊTA
+                bx = tx + QFontMetrics(lf).horizontalAdvance(lab) + 6
+                bf = QFont(self.font())
+                bf.setPointSizeF(6.4)
+                bf.setBold(True)
+                bf.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 106)
+                bw = QFontMetrics(bf).horizontalAdvance("BÊTA") + 9
+                br = QRectF(bx, y + self.RH / 2 - 8, bw, 16)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(qc(HUE["son"] if PSYCHE else ACC, 46))
+                p.drawRoundedRect(br, 8, 8)
+                p.setFont(bf)
+                p.setPen(QColor(HUE["son"] if PSYCHE else ACCT))
+                p.drawText(br, Qt.AlignmentFlag.AlignCenter, "BÊTA")
+            bc = self.badges.get(k)
+            if bc:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(bc))
+                p.drawEllipse(QPointF(w - 30, y + self.RH / 2), 4, 4)
+        p.end()
+        self._it_pm, self._it_sig = pm, sig
+        return pm
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        w, H = self.W, self.height()
+        er = e.rect()
+        if PSYCHE:
+            # halos colorés : calculés 20 fois par seconde en basse définition puis agrandis UNE fois dans une image pleine taille ;
+            # chaque image affichée (60 i/s, et les repeints derrière Gaël) ne fait plus qu'une simple copie
+            dpr = self.devicePixelRatioF()
+            key = (int(self.t_anim * self.BG_HZ), w, H, dpr)
+            if getattr(self, "_bg_key", None) != key:
+                q = 4
+                small = QImage(max(1, w // q), max(1, H // q), QImage.Format.Format_RGB32)
+                small.fill(QColor(RAIL))
+                bp = QPainter(small)
+                bp.scale(1 / q, 1 / q)
+                t = key[0] / float(self.BG_HZ)
+                for i, c in enumerate(("#ff5fa2", "#a76bff", "#4cc9f0")):
+                    bx = 107 + math.sin(t * .35 + i * 2.1) * 70
+                    by = H * (.12 + .38 * i) + math.cos(t * .27 + i * 1.7) * 40
+                    draw_blob(bp, bx, by, c, 260, .26 if i == 0 else .20)
+                bp.end()
+                pm = QPixmap.fromImage(small.scaled(int(w * dpr), int(H * dpr), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                    Qt.TransformationMode.SmoothTransformation))
+                pm.setDevicePixelRatio(dpr)
+                self._bg_pm, self._bg_key = pm, key
+            p.drawPixmap(QRectF(er), self._bg_pm, QRectF(er.x() * dpr, er.y() * dpr, er.width() * dpr, er.height() * dpr))
+        else:
+            p.fillRect(er, QColor(RAIL))
+        if er.intersects(QRect(14, 20, 50, 50)):       # le logo n'est dessiné que si sa zone est à repeindre
+            draw_logo_fast(p, 38, 42, 19, self.ang if self.air else 0.0)
+        if er.top() < 70:
+            f = QFont(self.font())
+            f.setPointSizeF(12.5)
+            f.setBold(True)
+            p.setFont(f)
+            f.setPointSizeF(17)
+            f.setWeight(QFont.Weight.ExtraBold)
+            p.setFont(f)
+            p.setPen(QColor(TXT))
+            p.drawText(QRectF(66, 18, w - 74, 28), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, APP)
+            f2 = QFont(self.font())
+            f2.setPointSizeF(7.2)
+            f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
+            p.setFont(f2)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(66, 46, w - 74, 16), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "BROADCAST TOOL")
+        if not OCEAN and not PHARE and H > 60 and not self.gael.isVisible():
+            for x, y, a in self.erm:
+                draw_ermine(p, x, H - y, mixc(RAIL, TXT, a), .95)
+        now = time.time()
+        self.rip = [(s_, i) for s_, i in self.rip if now - s_ < .5]
+        for s_, i in self.rip:
+            if now >= s_:
+                k = (now - s_) / .45
+                c = QColor(grad(.3 if i == 0 else .7))
+                c.setAlphaF(max(0, 1 - k))
+                p.setPen(QPen(c, 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(38, 44), 46 * k, 46 * k)
+        if er.top() >= self.items_bottom + 4:
+            return
+        hue = HUE.get(self.active, ACC) if PSYCHE else ACC
+        r = QRectF(12, self.ind_y, w - 24, self.RH)
+        if PSYCHE:
+            soft_pill(p, r, mixc(RAIL, hue, .26), mixc(RAIL, hue, .08), 14)
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(IND_C))
+            p.drawRoundedRect(r, 14, 14)
+        dpr = self.devicePixelRatioF()
+        layer = self._items_layer(dpr)
+        p.drawPixmap(QRectF(0, 0, w, layer.height() / dpr), layer, QRectF(layer.rect()))
+
+
+class TopNav(NavBase):
+    ITEMS = tuple(i for i in (("diff", "Diffusion"), ("son", "Traitement"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"), ("mon", "Monitoring"),
+                              ("net", "Réseau"), ("sos", "SOS"), ("set", "Réglages"), ("about", "À propos"))
+                  if not MINI or i[0] in ("diff", "cart", "rec", "mon", "sos", "set"))
+    H = 44
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(self.H)
+        self.box, self.widths, self.x0, self.show_name = {}, {}, 56, True
+        self.ux0 = self.ux1 = 0.0
+        self.gl = QVariantAnimation(self)
+        self.gl.setDuration(220)
+        self.gl.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.gl.valueChanged.connect(self._glide)
+        self.layout_items()
+
+    def _glide(self, v):
+        a, b = self.box[self.active]
+        k = float(v)
+        self.ux0, self.ux1 = self.g0 + (a - self.g0) * k, self.g1 + (b - self.g1) * k
+        self.update()
+
+    def layout_items(self):
+        W = max(self.width(), 400)
+        fm = QFontMetrics(QFont(self.font().family(), 10, QFont.Weight.Bold))
+        nm = max(QFontMetrics(QFont(self.font().family(), 13, QFont.Weight.Bold)).horizontalAdvance(APP), QFontMetrics(QFont(self.font().family(), 8)).horizontalAdvance("BROADCAST TOOL") + 8)
+        for name in (True, False):
+            x0 = (58 + nm + 22) if name else 56
+            full = {k: 36 + fm.horizontalAdvance(l) + 8 for k, l in self.ITEMS}
+            allfull = sum(full.values()) + 4 * (len(full) - 1)
+            widths = full if x0 + allfull <= W - 250 else {k: (full[k] if k == self.active else 40) for k, _ in self.ITEMS}
+            if x0 + sum(widths.values()) + 4 * (len(widths) - 1) <= W - 250 or not name:
+                break
+        self.show_name, self.widths, self.x0 = name, widths, x0
+        self.box, x = {}, x0
+        for k, _ in self.ITEMS:
+            self.box[k] = (x, x + widths[k])
+            x += widths[k] + 4
+
+    def resizeEvent(self, e):
+        self.layout_items()
+        self.ux0, self.ux1 = self.box[self.active]
+
+    def key_at(self, x):
+        for k, (a, b) in self.box.items():
+            if a <= x < b:
+                return k
+
+    def mouseMoveEvent(self, e):
+        self.set_hover(self.key_at(e.position().x()))
+
+    def mouseReleaseEvent(self, e):
+        k = self.key_at(e.position().x())
+        if k:
+            self.selected.emit(k)
+
+    def select(self, key):
+        self.g0, self.g1 = self.ux0, self.ux1
+        self.active = key
+        self.layout_items()
+        self.gl.stop()
+        if ANIM:
+            self.gl.setStartValue(0.0)
+            self.gl.setEndValue(1.0)
+            self.gl.start()
+        else:
+            self.ux0, self.ux1 = self.box[key]
+        self.update()
+
+    def set_title(self, t):
+        super().set_title(t)
+        self.layout_items()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        p.fillRect(self.rect(), QColor(RAIL))
+        cy = self.H // 2 - 1
+        draw_logo_fast(p, 28, cy, 15, 0.0)
+        if self.show_name:
+            f = QFont(self.font())
+            f.setPointSizeF(12)
+            f.setBold(True)
+            p.setFont(f)
+            f.setPointSizeF(13)
+            f.setWeight(QFont.Weight.ExtraBold)
+            p.setFont(f)
+            p.setPen(QColor(TXT))
+            p.drawText(QRectF(52, 3, 300, 20), Qt.AlignmentFlag.AlignVCenter, APP)
+            f2 = QFont(self.font())
+            f2.setPointSizeF(6.6)
+            f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.3)
+            p.setFont(f2)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(52, 22, 300, 17), Qt.AlignmentFlag.AlignVCenter, "BROADCAST TOOL")
+        p.setPen(QColor(LINE))
+        p.drawLine(0, self.H - 1, self.width(), self.H - 1)
+        if self.air:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(BADC))
+            p.drawEllipse(QRectF(self.x0 - 14, cy - 3, 6, 6))
+        for k, lab in self.ITEMS:
+            a, b = self.box[k]
+            on, hv = k == self.active, k == self.hover and k != self.active
+            hue = HUE.get(k, ACC) if PSYCHE else ACC
+            r = QRectF(a, cy - 17, b - a, 34)
+            if on:
+                if PSYCHE:
+                    soft_pill(p, r, mixc(RAIL, hue, .30), mixc(RAIL, hue, .10), 12)
+                else:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(IND_C))
+                    p.drawRoundedRect(r, 12, 12)
+            elif hv:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(HOVER_C))
+                p.drawRoundedRect(r, 12, 12)
+            col = hue if on else (mixc(ICON_C, hue, .65) if hv else ICON_C)
+            if self.widths[k] > 46:
+                draw_icon(p, k, a + 19, cy, col)
+                f = QFont(self.font())
+                f.setPointSizeF(9.5)
+                f.setBold(on)
+                p.setFont(f)
+                p.setPen(QColor(TXT if (on or hv) else LABEL_C))
+                p.drawText(QRectF(a + 35, cy - 17, b - a - 35, 34), Qt.AlignmentFlag.AlignVCenter, lab)
+            else:
+                draw_icon(p, k, (a + b) / 2, cy, col)
+        hue = HUE.get(self.active, ACC) if PSYCHE else ACC
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(hue))
+        p.drawRoundedRect(QRectF(self.ux0 + 6, self.H - 5, self.ux1 - self.ux0 - 12, 3), 1.5, 1.5)
+
+# ------------------------------------------------------------------ vumètres, forme d'onde, liste de titres
+SEGCOL = lambda t: (grad(t, ["#4cc9f0", "#a76bff", "#ff5fa2", "#ff5d6c"]) if PSYCHE else
+                    (mixc("#35d49a", "#c9e85a", min(1, t / .6)) if t < .6 else mixc("#ffb03b", "#e5483f", (t - .6) / .4)))
+TRACK = "#dfe3ec" if LIGHT else ("#12284a" if PHARE else "#1b2030")
+_SEGC = {}
+
+
+def segcols(n):
+    """Couleurs des segments de vumètre, calculées une seule fois."""
+    if n not in _SEGC:
+        _SEGC[n] = [SEGCOL((k + .5) / n) for k in range(n)]
+    return _SEGC[n]
+
+
+def seg_strip(key, w, h, dpr, rows, x0, sw, seg, inset, gap, sh):
+    """Image (mise en cache) de toutes les LEDs allumées d'un vumètre : chaque image affichée n'en recopie qu'une partie
+    (un seul appel de dessin par barre au lieu d'un rectangle par segment)."""
+    k = (key, w, h, dpr, rows, x0, sw, seg)
+    pm = _SEGPM.get(k)
+    if pm is None:
+        if len(_SEGPM) > 24:
+            _SEGPM.clear()
+        pm = QPixmap(max(1, int(math.ceil(w * dpr))), max(1, int(math.ceil(h * dpr))))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        q.setPen(Qt.PenStyle.NoPen)
+        sc = segcols(seg)
+        for y in rows:
+            for k2 in range(seg):
+                q.setBrush(sc[k2])
+                q.drawRect(QRectF(x0 + k2 * sw + inset, y, sw - gap, sh))
+        q.end()
+        _SEGPM[k] = pm
+    return pm
+
+
+_SEGPM = {}
+
+
+class LevelMeter(QWidget):
+    """Deux barres de niveau (G / D) en dégradé, avec crête et seuil. Repeint seulement quand ce qui est affiché change
+    (nombre de LEDs, repère de crête, valeur en dB) ; les LEDs viennent d'une image pré-rendue."""
+    SEG = 40
+
+    def __init__(self, label=""):
+        super().__init__()
+        self.setFixedSize(300, 52)
+        self.val, self.hold, self.ht = [-60.0, -60.0], [-60.0, -60.0], [0.0, 0.0]
+        self.lamp_t, self.thr, self.note, self._t = 0.0, None, "", 0.0
+        self._sig = None
+
+    def x_of(self, db, w=None):
+        w = w or self.width()
+        return 22 + max(0.0, min(1.0, (db + 60) / 60)) * (w - 22 - 54)
+
+    def _nseg(self, v):
+        return int(max(0.0, min(1.0, (v + 60) / 60)) * self.SEG + .5)
+
+    def set(self, peaks, thr=None, clip=False):
+        now = time.time()
+        dt = min(.1, now - self._t) if self._t else .016
+        self._t = now
+        if clip:
+            self.lamp_t = now
+        up, down = 1 - (1 - .55) ** (dt / .05), 1 - (1 - .14) ** (dt / .05)      # même réponse quelle que soit la cadence
+        for i in (0, 1):
+            tgt = max(peaks[i], -60.0)
+            self.val[i] += (tgt - self.val[i]) * (up if tgt > self.val[i] else down)
+            if self.val[i] >= self.hold[i] or now - self.ht[i] > 1.3:
+                self.hold[i], self.ht[i] = self.val[i], now
+        self.thr = thr
+        if self.isVisible():
+            W = self.width()
+            sig = (self._nseg(self.val[0]), self._nseg(self.val[1]), int(self.x_of(self.hold[0], W)), int(self.x_of(self.hold[1], W)),
+                   round(self.val[0]) if self.val[0] > -59 else None, round(self.val[1]) if self.val[1] > -59 else None,
+                   thr, now - self.lamp_t < 2.5, self.note, W)
+            if sig != self._sig:
+                self._sig = sig
+                self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W = self.width()
+        x0, x1 = 22, W - 54
+        if self.note:
+            p.setOpacity(.45)
+        sw = (x1 - x0) / self.SEG
+        f = QFont(self.font())
+        f.setPointSizeF(7.5)
+        f.setBold(True)
+        p.setFont(f)
+        f2 = QFont(f)
+        f2.setBold(False)
+        strip = seg_strip("lv", W, 40, self.devicePixelRatioF(), (6, 26), x0, sw, self.SEG, .5, .5, 10)
+        hold_pen = QPen(QColor("#ffffff" if not LIGHT else "#333333"), 2)
+        for i, y in enumerate((4, 24)):
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(2, y, 16, 14), Qt.AlignmentFlag.AlignCenter, "LR"[i])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(TRACK))
+            p.drawRoundedRect(QRectF(x0, y, x1 - x0, 14), 7, 7)
+            n = self._nseg(self.val[i])
+            if n:
+                p.save()
+                p.setClipRect(QRectF(x0, y, n * sw + .25, 14))
+                p.drawPixmap(QPointF(0, 0), strip)
+                p.restore()
+            hx = self.x_of(self.hold[i], W)
+            if hx > 25:
+                p.setPen(hold_pen)
+                p.drawLine(QPointF(hx, y + 1), QPointF(hx, y + 13))
+            p.setPen(QColor(MUT))
+            p.setFont(f2)
+            t = f"{self.val[i]:.0f} dB" if self.val[i] > -59 else "-∞"
+            p.drawText(QRectF(W - 52, y, 50, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, t)
+            p.setFont(f)
+        if self.thr is not None:
+            tx = self.x_of(self.thr, W)
+            p.setPen(QPen(QColor(ACC2), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(tx, 0), QPointF(tx, 40))
+        f3 = QFont(f)
+        f3.setPointSizeF(6.5)
+        f3.setBold(False)
+        p.setFont(f3)
+        p.setPen(QColor("#566074"))
+        for db in (-60, -40, -20, -6, 0):
+            p.drawText(QRectF(self.x_of(db, W) - 14, 40, 28, 11), Qt.AlignmentFlag.AlignCenter, str(db))
+        if time.time() - self.lamp_t < 2.5:
+            p.setFont(f)
+            p.setPen(QColor(BADC))
+            p.drawText(QRectF(W - 54, 40, 50, 11), Qt.AlignmentFlag.AlignRight, "CLIP")
+        if self.note:
+            p.setOpacity(1)
+            f4 = QFont(self.font())
+            f4.setPointSizeF(8.5)
+            f4.setBold(True)
+            p.setFont(f4)
+            fm = QFontMetrics(f4)
+            tw = fm.horizontalAdvance(self.note) + 18
+            r = QRectF((x0 + x1 - tw) / 2, 13, tw, 20)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(PANEL))
+            p.drawRoundedRect(r, 10, 10)
+            p.setPen(QColor(MUT))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.note)
+
+
+class MiniMeter(QWidget):
+    """Petits vumètres du bandeau. Repeints seulement quand l'affichage change (hors antenne : jamais)."""
+    SEG = 28
+
+    def __init__(self, W, label, ox=54):
+        super().__init__()
+        self.W, self.label, self.ox = W, label, ox
+        self.setFixedSize(W, 27)
+        self.shown, self.hold, self.ht = [-90.0, -90.0], [-90.0, -90.0], [0.0, 0.0]
+        self.thr, self.clip, self.note, self._t = None, False, "", 0.0
+        self._sig = None
+
+    def _nseg(self, v):
+        return int(max(0.0, min(1.0, (v + 60) / 60)) * self.SEG + .5)
+
+    def _hx(self, i):
+        span = self.W - self.ox - 4
+        return int(self.ox + max(0.0, min(1.0, (self.hold[i] + 60) / 60)) * span) if self.hold[i] > -58 else None
+
+    def set(self, peaks, thr=None, clip=False):
+        now = time.time()
+        dt = min(.1, now - self._t) if self._t else .016
+        self._t = now
+        for i in (0, 1):
+            self.shown[i] = max(peaks[i], self.shown[i] - 28 * dt)
+            if peaks[i] >= self.hold[i] or now - self.ht[i] > 1.2:
+                self.hold[i], self.ht[i] = max(peaks[i], self.shown[i]), now
+        self.thr, self.clip = thr, clip
+        if self.isVisible():
+            sig = (self._nseg(self.shown[0]), self._nseg(self.shown[1]), self._hx(0), self._hx(1), thr, clip, self.note)
+            if sig != self._sig:
+                self._sig = sig
+                self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        ox, W = self.ox, self.W
+        span = W - ox - 4
+        sw = span / self.SEG
+        f = QFont(self.font())
+        f.setPointSizeF(7)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(2, 0, ox - 4, 27), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.label)
+        if self.note:
+            p.setOpacity(.4)
+        strip = seg_strip("mini", W, 27, self.devicePixelRatioF(), (5, 15), ox, sw, self.SEG, .6, 1.2, 7)
+        track = QColor("#d5d9e3" if LIGHT else "#252c3b")
+        hold_pen = QPen(QColor("#ffffff" if not LIGHT else "#333"), 2)
+        for i, y in enumerate((5, 15)):
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(track)
+            p.drawRoundedRect(QRectF(ox - 1, y - 1, span + 2, 9), 4.5, 4.5)
+            n = self._nseg(self.shown[i])
+            if n:
+                p.save()
+                p.setClipRect(QRectF(ox, y, n * sw + .3, 7))
+                p.drawPixmap(QPointF(0, 0), strip)
+                p.restore()
+            if self.hold[i] > -58:
+                hx = ox + max(0.0, min(1.0, (self.hold[i] + 60) / 60)) * span
+                p.setPen(hold_pen)
+                p.drawLine(QPointF(hx, y - 1), QPointF(hx, y + 8))
+        if self.thr is not None:
+            tx = ox + (max(-60.0, min(0.0, self.thr)) + 60) / 60 * span
+            p.setPen(QPen(QColor(ACC2), 1, Qt.PenStyle.DotLine))
+            p.drawLine(QPointF(tx, 1), QPointF(tx, 26))
+        if self.clip:
+            p.setPen(QColor(BADC))
+            p.drawText(QRectF(W - 40, 0, 38, 27), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "CLIP")
+
+
+class Wave(QWidget):
+    """Forme d'onde défilante, fluide (60 i/s) : les niveaux arrivent ~20 fois par seconde et le défilement est interpolé
+    entre deux mesures. Tout est dessiné d'un seul tracé rempli par un dégradé mis en cache : très peu coûteux."""
+    PITCH, BAR = 4.0, 2.4
+
+    def __init__(self, height=34, accent=None):
+        super().__init__()
+        self.setFixedHeight(height)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.hist = [0.0] * 400
+        self.t_push, self.dt, self.alive = 0.0, .05, -10.0
+        self.accent = accent
+        self._grad_w = None
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.on = False
+        Ticker.add(self, self._tick, 60 if ANIM else 20, always=True)
+
+    def push(self, db):
+        now = self.clock.elapsed() / 1000.0
+        v = max(0.0, min(1.0, (db + 60) / 60)) if db > -59 else 0.0
+        if self.t_push:
+            self.dt = self.dt * .8 + _cl(now - self.t_push, .01, .2) * .2
+        self.t_push = now
+        self.hist.append(v)
+        del self.hist[0]
+        if v > .02:
+            self.alive = now
+        # en silence (ou hors antenne), plus rien ne bouge au bout de 2,5 s : on ne relance pas l'animation pour rien
+        if not self.on and self.isVisible() and now - self.alive <= 2.5:
+            self.on = True
+
+    def reset(self):
+        self.hist = [0.0] * len(self.hist)
+        self.update()
+
+    def hideEvent(self, e):
+        self.on = False
+
+    def _tick(self, t, dt):
+        if not self.on:
+            return False
+        now = self.clock.elapsed() / 1000.0
+        if now - self.alive > 2.5 or now - self.t_push > .3:       # silence ou plus de données : on se met en veille
+            self.on = False
+        return True
+
+    def resizeEvent(self, e):
+        self._grad_w = None
+
+    def brush(self):
+        w = self.width()
+        if self._grad_w != w:
+            g = QLinearGradient(0, 0, w, 0)
+            a = QColor(self.accent or (BLUE if PSYCHE else ACC2))
+            g.setColorAt(0, mixc(PANEL, a, .12))
+            g.setColorAt(.55, mixc(PANEL, ACC if not self.accent else a, .75))
+            g.setColorAt(1, QColor(ACC2 if not self.accent else a).lighter(110))
+            self._brush, self._grad_w = QBrush(g), w
+        return self._brush
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        now = self.clock.elapsed() / 1000.0
+        frac = _cl((now - self.t_push) / max(.01, self.dt)) if self.on else 0.0
+        n = int(w / self.PITCH) + 2
+        hist = self.hist
+        L = len(hist)
+        mid, amp = h / 2, h / 2 - 2
+        rects = []
+        bar, pitch = self.BAR, self.PITCH
+        f1 = 1 - frac
+        for i in range(min(n, L - 1)):
+            k = L - 1 - i
+            v = hist[k] * f1 + hist[k - 1] * frac
+            a = v * amp
+            if a < 1.0:
+                a = 1.0
+            rects.append(QRectF(w - (i + frac) * pitch - bar, mid - a, bar, a + a))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.brush())
+        p.drawRects(rects)                      # un seul appel de dessin pour toutes les barres
+
+
+BLUE = "#4cc9f0"
+
+
+def pcm_peak_db(b):
+    """Crête (dBFS) d'un bloc PCM 16 bits."""
+    if not b:
+        return -90.0
+    try:
+        if np is not None:
+            a = np.frombuffer(b[:len(b) // 2 * 2], dtype="<i2")
+            pk = int(np.abs(a.astype(np.int32)).max()) if len(a) else 0
+        else:
+            from array import array as _arr
+            a = _arr("h")
+            a.frombytes(b[:len(b) // 2 * 2])
+            pk = max((abs(x) for x in a[::4]), default=0)
+    except Exception:
+        return -90.0
+    return 20 * math.log10(pk / 32768.0) if pk > 0 else -90.0
+
+# Polices intégrées (OFL) : Inter (Rasmus Andersson) et Space Grotesk (Florian Karsten), sous-ensemble latin.
+_FONT_BLOB = {
+    "Inter-Regular.ttf": (
+        "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"
+        "oEbkiNYjZ7QJyQG//QEx7mgXIG034KcJDYJxZhn0T0/0AlIA8lYgH3QY+aIXAYlHcC1qBowdQiPQS2gkehn5oVeQPzqOQtHraAw6"
+        "i8DroHBAVzQ6j2IQ9AV0AcWji2gseg+NAxyNR++jiegyxIBX8HLUilLQNZSKbqIp6BPoU59CfPgZSke3UCb6HOWieygPTUdfowL0"
+        "DZoBMfBqnIVLcR4uo5DLhtptRHugzU9DW1+DHN+jJ9gWJ+F1eCduxifx2/gygxlDxpEZyAxjQph4JoXJZcqZhUwds5v5nPmeecLK"
+        "WDPWjfVmx7JT2ensLHYRu4rdyu5nX2LPspfYb9hfOUduIDeSC+PGc1O5fO4Yd4f7jnsskUpMJeMlKyUbJXskRyWnJe9Krkk+l3wv"
+        "eSL1kE6QbpZelF6XfiF9KBsiC5LFypJl2bLZssWy1bJXZOdk/5F9Irsve6SDdQx1eug46QzSidap09mkc0XnF11G10i3p26AbrRu"
+        "om6m7gndt3RbdT/Vva/7SA/pGeh113PQW693Rb+bfqj+WP1U/Tz9mfrV+mf0L+pfNzA36GPQ18DHYLRBpEGCQYZBocFcg40GZwzO"
+        "G1oa2hu6Gw4xDDLMNSw3XGi40nCj4R7Do4anDS8YXjW8Y/idYZuRuZHcyMNohFGqUZ7RLKMaowajLUb7jI4Z/WBsZWxvnGScZVxi"
+        "PM/4mPEZ43eNrxrfMf7O+HE3STeTbtbdXLqlddvW7Uy3i92udbtj4mgy0GSYSYhJvEmdyVGTT0zumzwy7WnqZDrQNMO00HSu6VLT"
+        "NabbTQ+avmz6pukdM1uzfmbJZivM1pvtNnvR7B2zD81um31r3t083fy4+SMLe4sMi/0Wty0eWTpbFljWWb5rZWXlZlVjdbm7R/fo"
+        "7vndj3T/pUf3HkN6hPdI7rG1x+2eaT1zexb3nN1zYc/anqt7bu75Ri+rXvJeil6hvSb0Su9V2Kuy16Zeu3od6NXS67Ve7/b6qNdX"
+        "vX7qpbLWtza3drMeYh1kHWedYp1lPce63nqz9T7r160/tv6+N9u7W2+X3uN6z+i9pfee3od7v9L7bO93e1/p/Unvu72/t0E2BjYu"
+        "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"
+        "SH8kDopj4iTW6by4LK6LOzhuVGP/H4X9eBJMQUZzYAF0wHJYBWthE2yFXbAfOZ2AU3AOLsJVuImNJ5bDZb1slGORw/NympgLKzH3"
+        "Zsx9Ln0h6C3RI9aJd8Q2+rLJUfEH8ZH4WFwS18QtHL+G4KjTgKPHBBwXpkMbzINFsAxWwGrYAH2wA/bCQTiG3D/CEi/AZSS/ytFq"
+        "diHNIcOhhEMphzIX0qyrWVezrmZdzbqadQ3rGtY1rGtY17CuYd2EdRPWTVg3Yd2EdRPWTVk3Zd2UdVPWTVk3Zd2MdTPWzVg3Y92M"
+        "dTPS/SW1ndzXzjfOT5yfOj+Xt2e9Ubz8mOd9IY7oy2Elnvn18A62tZ3Y5/7enes6DmkOGRfSnKo5VXOq4VTDqcalas5Zc86ac9ac"
+        "s+acNeesOWfNOWvO2XDOhnM2nLPhnA3nbDhnwzkbztmQ66AzUud87fw8Xrt47eK1izcu3rj4PB9JexLDQko5RNbKBjlGTsD+O122"
+        "yXlykVwmV8jVcoPskzvkXnlQHpMn5Rl5Xl6W1+UdFeAINkKNUmPVJDVFzVRz1ALVoZarVTiiblJb1S61Xx1WJ9QpdU5dVFfVTU94"
+        "sTfcq/dGe+O957xp3iyv3VvoLfW6vV5vvbfZ2+7t8Q54H3gfeqe9T7xPvc+8277nV/naH+k/60/0W/0Z9htR/mK/y1/pr/E3+lv8"
+        "nf4+/5B/3O/3z/oX/Cv+DX8giIKaIA0ag6agOZgavBzMDV4LOoO3gp5gXfBOsC3YHbwfHA3+EHwUfBxcCq4Ft0IZDglrw4ZwTDgh"
+        "fD6cHraF88JF4bJwRbg63BD20VekDobHwpPhmfB8eDm8Ht6Jgqg6GhGNisZGk6Ip0cxoTrQg6oiWR6uitdGmaGu0K9ofHY5ORKei"
+        "c9HF6Gp0syAKcWF4ob4wujC+8FxhWmFWob2wsLC00F3oLawvbC5sL+wpHCh8UPiwcLrwSeHTwmeF27EXV8U6Hhk/G0+MW+MZ8ex4"
+        "frw47opXxL3xunhTvCXeEe+J348Px8fjk/Hp+OP4Ynwlvh7fLspiXKwpjiiOLI4pji82F6cUZxTbiu3F14odxa7iimJvcV1xU7Gv"
+        "uK24E1ZwH1vBfWwF97FyKOFQyqHMhTTratbVrKtZV7OuZl3DuoZ1Desa1jWsa1g3Yd2EdRPWTVg3Yd2EdVPWTVk3Zd2UdVPWTVk3"
+        "Y92MdTPWzVg3Y93M6WrmrJmzZs6aOWvmrJmzZs6aOWvmrJmzZs6aOWvmrJmzZs6aOWvmrJmzZs6aOWvmrJmzZs6aOWvmrJmzZs6a"
+        "OWvmrJmzZs6aOWvmrJmzZs6aORvmbJizYc6GORvmbJizYc6GORvmbJizYc6GORvmbJizYc6GORvmbJizYc6GORvmbJizYc6GORvm"
+        "bJizYc6GORvmbJizYc6GORvmbJizYc6GOSfMOWHOCXNOmHPCnBPmnDDnhDknzDlhzglzTphzwpwT5pww54Q5J8w5Yc4Jc06Yc8Kc"
+        "E+acMOeEOSfMOWHOCXNOmHPCnBPmnDDnhDknzDlhzglzTphzypxT5pwy55Q5p8w5Zc4pc06Zc8qcU+acMueUOafMOWXOKXNOmXPK"
+        "nFPmnDLnlDmnzDllzilzTplzypxT5pwy55Q5p8w5Zc4pc06Zc8qcU+acMueUOWfMOWPOGXPOmHPGnDPmnDHnjDlnzDljzhlzzphz"
+        "xpwz5pwx54w5Z8w5Y84Zc86Yc8acM+acMeeMOWfMOWPOGXPOmHPGnDPmnDHnjDlnzDljzhlzzsi97e5i33Z3sW+7u9jcT5yfOj+X"
+        "105eO3nt5LWT105eO3nj5I2TN07eOHnj5I2TT5x84uQTJ584+cTJJ04+dfKpk0+dfOrkUyefOvnMyWdOPnPymZPPnHzOR5KUJBlJ"
+        "KRIyO1Pi7qvyMaUJJtNMlCeqRL0YK1ppBkqKefKqgLhVCLffKSbgfhPvPyf7RflrsXnMDJrzApJAg8CehbtzM7RV2ZkisGsXPFhi"
+        "JR6YPtl+f1YMgW7Kw/5W5IOWpZ3jmSkWwWiYBrOgHTrtjJAYIUaKMRCIJrQJ38T87TqOcfbb2OR3kj8eujC3n8HP8XcprQ66JOz3"
+        "cW7AG05uGc1o1KD92SSaxdQKK3SVWCM2iM1oh+4S+8RBcRRWcynlULMLtXBci4trYbkWlmthuRaS+42rQ+7n+y1u36b/wh1D7reQ"
+        "3+L2bQ6/xrqvhF78RVsaKVULDT0urx6Xx6/Iurb8u+hIbejnFMqZ2zzG0W+zi+mlmF6nF2F7GQ+TMa8l0AHd2KYCWj27UewRJ8R5"
+        "tMlHwEyYD12wFrbDMTgNn8IdORxtwmmyHa3BtXK3PIQ24Hn5mRKqRjWq59RstUFtVwfUSbTx7njVXqP3vDfb6/TWeNu8Q37kd/g9"
+        "fp//vn/KvxVUoU3WGswL1gRbgwPBqeBKOCWcE3aGveGW8HB4OrxKbRHwnEo8U73UGgNqVaOpVW6hNBCLK1LqKKXHpbxckaIpZZFL"
+        "mVCRYihlpksZUZEygtq+B0VarWNXl4F3zvULK1FwvW+E638T4C9IYzT8EDWUf9Q/KpaiTv6WohKev8c6MQ/j3nFxvr85d2I6xva4"
+        "2AA5OSfGY3yHiw/R2mVn6+q1ledtQVGZ0/3pVOYxLnOidVTmPi5zZO6ozC1c5pCyozJXl8v0btx1VGYnlxnaMr0z3hlbph+Vy/SO"
+        "W0dl3iyX6e3LHZV5sVym11d2VGY/l9lz11GZB7hM354v+SxutgV8kI9RMsVtnZB+G70ja2Ni3LqRSKvfKrbmcXAT4xbyGbTn/S2M"
+        "acOUSyQh5RTbRvAX4AzFKNkkm8RsjMOxDo7nxydT63B8pXIhL9GXQe5sO5H2+999bvyswfA1bBfXoIdG10B0id9hyK43bhC7xb9h"
+        "e7RfEl9IK/O6aX3Y23nrhwO4TeP62pgdmNMOmDAobgOOCagFDYNiu3FE6CYXD4pfIHxYkDtxvYLFOVfWuYq4Exg3Xkh124Y4dh/G"
+        "pkKpS+qSDbt4qfpxVAWwzyg2V8QepB55jUPl+G3Ud89iPttcOE9RarVaTb33aEUvtvGdqlNMxP2dqJ2Hyiltqo2etayrCNs0SVej"
+        "NzBs1z6+If4TpOiip1tr6DnSb+FV+FuxFtbAb8U/0TfZ/7l8zuhNtnIuAcRQjbsJ1IsQfog9vIhj5ws4quarArtx9K8lOQX2H7vU"
+        "4egR0pOwIo6zk1DuJXgJ5ZbgFc3+bzsF2yAf1dZWtEcPx1p0eJUCbCN3431YljvbEkV7RUoAc8pO2FG9tSItxKsEO/vVR1o1dnd8"
+        "i+nXo9pU49HdVxta/3n7/tqIi87dVxvxIbv7aiP2Vrj7a5PfMUS2NliTXrEf9w8Oqk0nOdvrtw+qzWzn7q1/gHUoO9u6lg6qTX2F"
+        "s6N/W8XZtk8Oyz30d2I3/Ej8K4yFV/C8vwrzsN3Mh5/C38Dr2ONepVoPod+8b+BIKI7j9tHdlo7t+Gjea8gvx27DuxIQffY/klTE"
+        "rsU7N8BjsaGNFX2uFrcOjF0murmeID4XX+bjlJiF9zdzMcb+F5+5d3uGmIRnoZVWQksK3y2pER0IjaF6CrkzgXdS9ir2OiymEm5Q"
+        "CeDu2iT2x1HwPPYG+1z8CaiCodh28utfPfKZjG2txa6mRZm/hFZ4AfsH3lvACvgF3tH8ElbBr6AHfg298BtYTaTtKmVBvQao10TU"
+        "a4ZQr3mCek0t9Zo6If4XreYG5A=="
+    ),
+    "Inter-Bold.ttf": (
+        "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"
+        "ckbLkAwtRy5oBXJD7yA5eht5g8X4oA1gaRvBfjYhX7Qaz0GbkT/aihRgefNhvr6HgtBusMQ9eC7aBTa2E3VDB1B3dBCFog/A/vej"
+        "GPQRikUnUBw6ieLBunqhj1Ey+gT1Rp+iVHQO9UGfozSwo77oAuqPLkEMeBnPQxdRJrqKstB1lI1uwHy6CfHhdygP3UIF6C4qQnVo"
+        "OCpBj1Ap+gGNgLm2GBfiUXg4Hk1Nbij07B2QdC/o6hy6BqP8FDWA5Q3Gy/B6vAsfxmfxJYZhTBlXxpfpysQwfZgsZjgzhpnG1DCb"
+        "mHvMU6aBNWCtWW+2MzuALWDL2Sp2Lruc3cC+xx5hz7KX2Ocsz3lznbmeXCqXyRVxo7mj3GPupYgTmYvaibJFy0UbRO+Jjog+Fl0W"
+        "3RI9Fr0Uc+JgcZZ4o/iy+Jb4sfilpIcE/KKkQFIumSFZJFkjOS35UnJD8lDywgAbtDJoY+Bq4GvQ1WCwwVqD7Qb3DMWGloaOhh0M"
+        "Uw0zDYsMKw0/M7xqeNfwieErI87I3KidkbuRv9FWowfGMuPBxoXGFcaTjOcZrzC+Ynzb+EcTD5MAk1CTeJN+JrkmpSbjTGaaLDbZ"
+        "bfKVyc1W3q06t4psldxqcKuprapbvdPq3VZ7Wx1vda7VtVZ3W/3Uqt5UYmpj6m0aahpn2td0nOlM06Wm60x3mH5gesr0CzNTs0Cz"
+        "MLMJZrPNlprVmn1ldtvssdlv5qy5mbm9udzc37ybeaz5dPOT5vfMn5rXW4gtYiz6WGRaFFmMtnjf4qolY9nKso1lqGWcZZrlPMsV"
+        "lhstd1setfzE8orlLcvHVsZWCVb9reZaHbX62Oqy1S2rl9actbm1vXW09RLrOht3mzSbt22+s7Wx7WA70PZd24/tOLtkuzy7E63N"
+        "W5e2XtB6Z+vnbQLb9G8zrs38Nmvb3G7r0nZT251t97c91vZM2/Ntv2r7nb3IfoD9UPtK+/n2q+232R+0P21/x/4H+1/sVe3E7azb"
+        "ydr5tevWLrZdWruMdhXtprWrabe63bZ2e9t90u5Gu4ftXjiYOng4dHVIdkh3GOWw0eFDh8cOLxx4R4mjuWMbR2dHT8cAx66OiY4D"
+        "HEc5vuN4vr28/cL2x9s/dwpxKnaaL5VI20qjpDOkS6VbpBedLZw7Ooc6JztnO5+W9ZYNkJXKKmVVspmyatka2U7ZUdmnsmfk7SJ1"
+        "SXYZ6jLP5YjLD66sq5trjOsq12duzm4pblPc9rodcTvlds7tstt1t3tuj91+cWuQc3ITubW8nbyTvKs8Vp4vHyEfJ58pXyxfKz8p"
+        "f+iO3G3dvdx7upe7L3Y/4H7X/Zm72qOVRyePgR4TPDZ5vO9x3ONzj2886jx4ZIR78pnsS0ko+LVW4E1swFvIwRMowB9HwwIntZBi"
+        "G6lCplRIbfxZC6mFRKbwx3CV2fgr/G1kCjkptXElOVLFxgLKKU5TImDZl6pezHu8AQ69epU/fu0aDg09flyNcOhxSIRCTo2OV/HH"
+        "q0JDq3Bo1XEcWl3NHy/lMw1uvUShoRPDQnEV1IY6mLRCVVCnKvTW2qrQtaGhmdgpM/RWKGRCM+GPrKy+sJf8GPZ/pEeoDByDlHVj"
+        "5P5iRsKyII8vVuFqxojf8ZNnf9/wjikeD6xYe9HF332YC3Nw3KnT/PszVb54wE8/IVgxKS3JArEbXaUleAEaj8t1+Gk6fD56qYdf"
+        "psPnYpcW8Tn4Xov4GizTwz/X4ZfhaahRnsE6fB7urFd/kQ6/CNZLiueTRfWiizr82+xNJOhI8hHoyAzWYqIjGxhqAWTYimiJmSIy"
+        "UiUwE1WTmP0NLnGqOlPmV9FFFb/kFT9XJTL//SnO/vZbsJsZsNtuAEpWsOJAFFFmIfWztbWxFoslNo4MucpcpX6BigA3N5lU4e8X"
+        "SJIy2QwmacO3w6PGJKQuGVx+dwt/BBtMH9e1NIF/+iysILhs2G+iiznbS/tNSbE0Y/uvKak4NKy+IDU0S/llx74hyfnk5CFd/Vi0"
+        "WPQAYggU6ezCKAIsXfz9HBk7qQ8rcxaLbaxtbf39ujFKqSnLWp7hz+7bj7ucmvjt1iIL/jOjzn2KQ8vfy8zeWRY6vG9nY6wwydlw"
+        "x3ovTnv+M+67N3rm6fFdMyJk5TdWr7teKovIDBlybGkaaDOdH0R4gjZbUW0uwevUPMETWegothJGt4Fqvzm+Bgfr4Zfr8NX4cYv1"
+        "F5L6MFqgY1Eh6NgG4g2UBcOkUSNoFJKcpY01w5FZySzkJ+Ky6pPZOR8t4Kfi+bdwxM6d/CE+gr+AJflfvbvpSj6WvM+/X/eQ3/M+"
+        "sXggCVwpdcrVSsMVTQeumI5sMVQxpqOqs5AZ7H1VvMYuiD0sf8XPUmmocMWUio3G8tEm2qfm+Byc3yK+Bm3Uwy/Q4ReoeT38YB0+"
+        "Dx3Swy/S4RehM3r45Tp8NU7T4Plkbi2dERr8UmYqQi3Is5DII2hhIGjBUF8LM9jLqsFMlmoN0UDmK9UprUWuBouU/5lFwsDZSWF+"
+        "wZCx9l/yp3cfBLOc8PWWYeb8p+adkwu6lb2XnfVeZdHKlFB+HFO0ib9p/QHu+8Nz3Hd/zPQDxYo+Ie3Lrq9efaM8sTrbsO7QKf77"
+        "ZUiwnNVUeifB0pQ6i1pNteMk+IV+evjlOnw1rtPgeWfSBx0+Gz+l53zERsp0tqB7z8C+zCzsx59XjQZNbGIGgBcdq5qmtaoyKpGr"
+        "IJErteU4hMQeQIkF34PCYJWw0qMn9vjd+S3sp6XJfbpzZ31gE8oaWfBBSgGFQRt8kL+gMWa1Wr0DnNtiaj3uGuvh15N+qX8gbag0"
+        "GnyuOlZrJUwfPXwOMqb15wJ+rx6+Rh1D8acBP476fQ0+X+1I8bC3YsKpdWrweeoMij8L+DFU/xr8IvVQyteMT8aPqBUSvBgvPU90"
+        "Nh6kPENHRVO7Wl1PbbCH+jHnBj22oJalIOZDTEkBvbfmGGUd/wL7FvbvX4B9+JfWP9/uO2hYcXERZ1v/052fgSq0FjnTvvgJI3EA"
+        "qFLPLZpPLdscdhCgS/CWsFrKiSth7WDpV2Jc4NNvaA+IvCtUc9qolmFfsZgZzkd9xGTDTsk2Ze68FLxd5W7YoBJd5Av5qUtUXzFr"
+        "7zWMo+MPljSf9jBAsKQPtZbEBQNXkWBJNsSGpogu1ntqvUgwlTVQGA+JMGudSSsdPhtH6WZtsNhBh1+O6yneDvDzRBc5wPcm+l1v"
+        "d1PDW/wEeHtT3laOrJ2sG6u0IpYXAJ33N2UlrJT1YeX+jqwNGPfl52Zyd5lxsLHMXW72BH/Ff85xHLay8unYwew3Xl1v1qFjJ9vW"
+        "mBOxYKOpnZa/t6lryMb3VnZitoO1fthp4ZZt8Sm7N83xVoUxH3rP2rS7T8+t2xb5qcK0M2ohyGJPZcHgJ2Q+DBlRKfaBaAXWThAg"
+        "FV91iU1way8xhg0sv41P7dirb4hcbCIBfqZdZm4qSDmyPYT5DLhtT6h5b0zRmXX+qhTt7FtI7TREY6fYSGvvgF+mw+fg37T6JdLo"
+        "8Nn4OUIt1F+IAzUrEp8gWkbjB0+wHAX1bNQuxTJnN/ya/rALW3vZRCmw74G9Xr0arr6+d3zGQ5bz8L3/6zvrDPHWP+0ryEJ82Tnw"
+        "u2aovb7n1ayLrHapFDwwa3OaP33gAA4+fQZ3OXCAP3OmfEdm5o7ysp2ZmTt1EcBefsvPz/mte7HZiBtr1t0YMfLG2jXXRwp+8xz1"
+        "L+FCPLhc50/PUX2HC/q2EvAfic6JzXX4FbDTR7r6y3T4XNxdj04jPodBLeJrcDc9/GAdPg+U2ohfpMMvwhkt0hmMJXQ80yFzgEYY"
+        "UogwtDqEwdMuXBAX6sUArPQy/9F7u3HoFdyLPzLpcH7eBxNwdC37QBsZ7MdJd+/jpP38q4IrmzZcKeBf6WIFwQfcBm52+vEihIe6"
+        "uEZmMYOJ3Ppk/MRn2/nZODJ9THDwW+nfii5Ourto8e2Jv4aNjIsb2a2+AzlDS1dPpaMvAWpysmexs7OSyuWSv7AD5gAWzR77ir+7"
+        "NWXOn1gEg3ZX86cvj7rz55YhxGi2tE/2r+8V7EVwY89G4f7plSEhY9K/ZUz4JTgOjxRdrPxm0aIrI37zz4uNHxJY34HZpBqgnYe2"
+        "dNyShHk7WTdvbem8TRLm7VLUUv2F6DhdSfqoH3F1oC0/OlPc5FJHRojJ3eRyNzdFQGCgP0huJ23UlJ0dOENrMcdseZ//bTGHPcSJ"
+        "k3v3HtOj68jeG45+VaOq3fjrbIb/2mDWyITiLhHDu89Ir30rYibP2xZfWx2X59cxrbN/pJ+Vh8/p2hmflo74ZMqAbK9EP2WMt5nU"
+        "pmdhdfqMT4pBXioXlTdF6N8s2r/m+Br0sQbPp5N+6PBLsIL2u3n9haQ+9BuiDpEJjI4EoRQFtWGLOO4jvjN/nruiUtV7cldI6zg+"
+        "ndSC1v0EqmGUKm1NqfYTqF7RxIbqH0R96Kyh2qTrsRDkkSTo7MkH/A8rsG/CnPTBcxKw30r+B5tZv6xnzzb07jsjIWFGX3ZnQ+f1"
+        "v8wiI0ZoUR4DBY9gpxnhZvgcfK1FfA221cMv0OEXoFI9/DQdPh/9oIcfrMPnYS89/CIdfpEQUWrwz3X4ZbhSY3HN5BmMvtPG20RH"
+        "Ovw7+DGNAxp36SgLS61sLe1kgZawFmMmWPUrTnni2c83vFOqxwOczDPgO3xn8h+cOIUjZzIXfvcR2hu0g/aumvZkvYEl3Eovpbfv"
+        "xx/xpThhh43M2TzQ0sXNbj/uus/OzdUyyELqar0DJ/Il/IYzTt7t4tvLZaeBm2zQl5eysi59OYi5oZ+Gtef3idjjnRX89RkqsbAf"
+        "N2hHez1EMwpMErUMf+jdPpCuPdld22CpnSCVUooVIBdZEU1BLn9miOoTnL3eJ9jXMdnRL8RnEx6gusT055de8PD3sO/UtkNAh6/Y"
+        "YXVs0u/RIwqDggpGRv/ecOJ6QzUO6t4vybdTUv/u/MdabW6m6zHKsiDqtAV1BhIlWDD9VddwXoM8xCmifRfXX3Cu6jbTia3lO0XN"
+        "zsyaHYm/aEhXfaE9W9hM+zJUsLSrurMFfXwNdKgRv0CHX4BKaN9LwbvfEry7AoMUdho3aIPFYokcHIzUpowZFDS9h13uJ7l8G264"
+        "alfwnGi7wi8L8FcH2D6JqxJyDFnVwYZDvdcnkxSRjdKkMhQLsi2hMmjwy3X4ajxND99YfyG6TNe5HuAfXLkiWCk6kzlLPB6MSjdG"
+        "oV0bJK7dGLJrs7GQKmSmjJLMZQXEhaYM8YX44NAtWZGjl6VkjVa6J3bukhbYiv/RYfrZcQO3zkji7xnZD5jIRA8LaRUYHtpGmerj"
+        "FWcbt6Rk8IR4dwMjC1cXUadwmayLi0/WzJ6eA6rzVWZvByT5XArKDB5jZG5ixBq4BPt4BjvSiB2kFMtA+pFCb4PoHNPg2+vwi9Ay"
+        "Pby2vhjXjGrE2uuwC75oqW7uaB1W9FBHOQ/N1VDm07i+XJEOv4oJ1uO4Q4dfjK7p4S101PPjEN2/PBLXg9ZTG3XuL5UECmuMdmOs"
+        "FJkyED26ya2EIbARog+NQ20yQGDfrMyUxR+P3JXTe96ebPZRT0lAUWJCceewigRFWjcLbGs39YtZxfsmu5p6TVifXXxsQa/6lLgC"
+        "ZUZs9NAQD/2hK9+Sb2aeZpNWPtM2bmlxxsw+7oq0KTE9xyZNy5kS5hjsaZO3PLVbaQJT2zNfGTXvcnWqe5R3ZA8YNVzYMUI7npGz"
+        "C1U1AclBjmBjVeofuQ/A/m2Rm6a/chldcPyp4CQaEcubRyPPB05IsjHlv8ZehjYJEzLGnR9bef5G4jClcmhSQlFQ5yKrbgO93wfH"
+        "9IVXemiVGn14iFdPe5a2PDt7aVrKkvy8ZamEL6yJzfhavBFfQ/7yn/FVbZOU/wljGN9kGPUhML70LM6NxF2B9ORD1OwsTmTKMuVb"
+        "Xkyb9mJLzubJqeb8Q0O3wGjPXsOVyuG9PHsGuRlgO/PUyVtsazC7fSdmawIyZ6cFeEX6tk1bmZe7op+9f09v//5zcgPA0pKht0Oo"
+        "ZU4U1moJtUAqC7XvicLcSW8RX4NW6eFddPhqnNhi/YWkPmg5GUZ3jp6Whd6CQfoTbeuchr6W20y6UDnu/LiMCYlWRtiL/9rMOmkC"
+        "ji8KUhYlJA0LVA6zmobxoQ/JyXa6F9Ppd5/3vQd2e5a6LC9/SUra0uzs5WlUnh9FhnQdnUblWYP3Mh0F/E9iB06LX84NRdoxGU09"
+        "XZMxgUmlkEoCWph6zJhtL6dNfb6++Fh1ckMftvVcRWFiwvCgsIpERVpXc2xuP/0T27mY2b0DcwvpPDji13dSNJknWVPDYZ74D5oT"
+        "L+htNPU6MzVepw7psDIBS04HF6CW8Dk4qUV8DZrfiKd+aqbgpzbo1W+vwy9Cu/TwLjp8Ne6uwfPJRDs6/GomrUW+Cwlf0OZ52GqY"
+        "i1uTZ/bKLDRBsp2EKtHG4nzGhiHRFe0CrfwdI4O4vaNXJ9kZ3BEZhQXXp4G9WENLe2jJ0jMWet7VrD3zROV2OmNDQXSFPaHRozOX"
+        "fv9+fW1TSiBbFZjfCXFrTowW7qGWyEdx8+msg9g3jMx3VxrNK4gNypz1onl/BYlGxX/YA5XO+WJyG8yYBmf3LJtiZx0/duCE82PH"
+        "XxiXXpVk3QrL5/yyImFYUNAwMFKlsoiPih6X1LN9sFthyXnvVMWo5x8c5au6Z3gdqd+27JMcZmf8gtycxb37LM7MXpBINQzSUU0u"
+        "EUZwjaB5gm+vwy8izynq8C46fDXupYdfpsNvwIV0REAb3Fg6D+kpIOxPNZ21IYc5tIt4O/g1t9Ze788v35HBXx6W0T1HycxQjQE3"
+        "WjF3Rd7RKarOzKKCUcoCtVr9UkMNuKzUzC71SDK71OMJnsYRK4VzwC40voDVDR+m0q6mVl79VJAJb+fSyckkOduqwl5cen0t9EJd"
+        "CwM2i86K1cK55HLSO/UhwI+g6+Vq4TzRiuJvEUpUe6uF80qN3RIbiNXhxTiH1p4M2K16tWs0tdW/AF5JZ8tq4VQyleKPAL6YjsFq"
+        "4VQyg1Jn+WR8U9crN7z0hK5v6vN8Ou2bCeygqDXJZOR2jmIi9s49PLmre3xX6Gth1ZrYx2GhhNZIPp19IHbhtLQIFTl6l/HUjC5j"
+        "TyUhVDV6fFerR9IfPl3oz7uN/QGtkjF/G8ZcjIyQKRl3f9hPyzA9ZFJiXO2Ni/FA3iGad4FNzHz+vU9wHY7GhXin6oLqEjkjxo+u"
+        "qMKoHnlnQgk4bBP2zT2QbgT1zpbBhHRny09AayG0zQ4qa+0TYUTY6fSkcQel5IanML20I0UtZ4dwkomEO3LOhIOOSvbvWiqW1Ivv"
+        "EM4x52nlEX/OlSAPzYmljC7ldpqLnqnrp6qwrZlt27yZcWMWy2RtRrzdZ8i6wfzlIXFBKd78zawERR9fLp1/NGRytxVrh82JGLDl"
+        "LZUp80HGIN9+wapezEe9szoNjlAN0s0w8C/aGWbV8gyzF1mSKbY9U2+KAYeHTaaY0EduLLX1vZrYcCyiUUsC5WJG1tPmJ4lsy3yZ"
+        "Ua19raMV2OvA+95JD1uQQThAzBv1zjpDzvdP5ZEJ8pC1ZwjS2sZYujbsFWwjB7VUfyHaJEQEj7hltAftm0QELUdc5Zt/nTbt182a"
+        "KKhXUWBgUa9ewwIDh+linhpetXM7r6p53P/trJyV/fqtzMl6u792bVpGfcghzcr6ayPWQofNH6HBXgSZ5uqwK1FjXZmAJavwqhbx"
+        "+jGTPl4/ZlpG/cohYRXeo1e/vQ6/CB1tgY4YD84TsJKVXBEn1EYzWRlC2jiW2h1YRIqF1EYvgJVpwlqrZlqtwnJTXfw6ica0j/Si"
+        "WD5djI7oBbA0qGWqmsXPJKKco+UbBgsKXUX14juFFDfjy83hLxtBMDewMcAzw3LVI73YDlxZHwjn9CK8Iw1V+rGdZqaxDtxwei+e"
+        "9FcTH1i46Wa0s0n7mnQ7hY11vHOPYnC0JwuGikT8LxKD4MIo1VTBfzhQDZ8VvM37VPMBvDOhLODB29DdNMQL7GBdbTFe+JzM90QY"
+        "pU7Qf09h9+CqmYsBTU8GRZqoxdrWzk5zwsmEzPhiqhW2sy0e1Cc3Ouaj2rWjLs6feqLSmv/VIqt3bG5Y0ie1q6tu2yYsKuiUmBjm"
+        "5xVk5i5dM77o7dSY6QM7do7p5u/ZxdxduqSyeOMgkI1KQWX7TLBFT9qTpnjY4w6lWBizTnSuamovQV+3WHvhUO29p59FD0gPtVEc"
+        "6YLERjir1axo5PkE3ZMKJECbMeHeiuonC8ryF22tvDr35OLcUVNGlCcqk7yKs7IquZhJH+QMfH9q2UZHc6Pz70w6mPXr0LT+wx8r"
+        "+gakFJcMqr9DYkD1U+ZTUQGsKlZCDEgOCoEFPRpxdlMw21SFK7FXR6VFN3NPvxzvzXtIDIiN6r9T+Btyt81MNqwg618jHXLaTSnh"
+        "11BjljWnyHx17Bie2Zwq6MoaTPScqAB09SXV1RI6O4EXGyzO4zRYsiLtRz2Jraqfg3dMJ6sC3ctbCMzpkaeU9QeDwOU7M7BXUXpo"
+        "thJ2O/c5C699puB7mbOq4eB7C2OZGfW12G7ecmK3hBr1aVc0Pg0jHdZCh80fR9cjGOsG4OxKvUKTk1Zbf38b0nOFvzWZtD6Mwh9m"
+        "jacyK6RbeiDu4O7tNWHhAj+/pEGeXum9/H2JP1ANSxji55+fwCxpuNlB/sOiOXkli1JlstRFJQ3fNsogE2QgvnIzagmfQ77j0wK+"
+        "hsQuWjz1lVcEX3lEr357HX4R+lgPv0OHX4wNWqAPPrREs1Ylczu5dF3tpcxCGjfASsTtAF1pT1d1x4H4MJ+Lux9x9rcPbevnfAgH"
+        "8zlcuurI8JujR98czvSAaFXTWgxUkazZ2azeKW3jGSYu5Pfj4Kw2XVo7t+1mn4+tc+Di3FrZNgt35/fyF8ZZujhbKixkLpbjYBnO"
+        "KeHrV6/E4pF4FZ8zgq9/520sgjQYxK6wVeujo9evDuWTSc+oDLS/d4RTR81OrAP07C2QjdxlwRIstRP6pjlZBU8lBxOUSDrg3ZjP"
+        "xz3yOiW4j/SI9yvE3SDU3MMfG+eb5FEmj+s0jnn/EbNkd9qWXklb03arCr5XpVzqszUxcWufS0QDfBq3G7i0BVtT2tkS+k3USJeG"
+        "ykjXkPTOYgN+ENGoZ7so+0CXU6BRV+ehq0tDCvjyO4bmpt2CQrgs1ZHi65WVN4iCHQdM7WlB+kc4UMu/r7H8H5EOKxOwxLr6oJbw"
+        "NWgx1UYlaMMB5DSmZ60KespqI7WpZGARYiepXjL2+5mdBs/PqnIMnhM6tD6l81Cg74sa8S46fDWWoj/WBz9aQlZo2G9wh2mU3Ibu"
+        "BqRWIr3bXd0YzbNJk3EAf64aT97z68SJv+7hJ+DJA8qUyrIB/AQSUnMf4tGfT5r8+ajHuHNmcEhOCFBLVtdxb4ldIOWIfMC/YTnG"
+        "MJd121gwOaUtZ9liYMUeUg2yZdbzx1Y/mVr2+bSo4tR25j477k9zrsW+z+dPebqmV0mwoiQtZbhSWSwax2+eg/u+uoNnPFuz5MfZ"
+        "8u4uQ46vC6rtsFON+H1n9vG/1Hzfa35635p+vecPHLgwlfS5j1rJ1YnfBtkCwfNZ+FvI/+79s6LK4L93B+0TSe7Ld95/49toNBaF"
+        "kRlCR8aD3AkgUv7FeZxidNAbnMiREdv8V6dySATjhrhyyp88JU+fLgzDEkMG9mfgp0XCgoX74aAvYDrehykbwg9oxV9i0hqGsUsa"
+        "hsHe3ORtdoHKgvmpYcTnDU9Zc4vdu/lbu3eTO71A+7SoDma+nKzgoxV+gXLWrUlYIrazsjVlJeSWq7CHgDlhk57Sn3MwHPdg8cTP"
+        "p1nz35vm9onN8GSs2NiKqsI2bBuHtthuw9qGG2znCx2TEpjeq++Ozdo71mtQdueiWNW5hEx/G/YCb98uKGjZambmiRMgSRf1Y5ER"
+        "xBGkl+Ses0SqxBR8GP0nvTTrsfY+tC2XEN0QEMwmJjScCuaWjHRIHRqWv6JPnxX5YYXJ9mVJn4w4yl/ftAm7HC3/mL2wahX/ZW0t"
+        "c+xnW19Z4Tfbtn2T79zJ+ll4xD6c9vQZ7nsgUvvkg+R1Tz78Yeex5wj/6/z52OjIEWw8fx7/4uigiREREwcNrAoPr7Leh/s8B7r7"
+        "D/Bbnz3nt+1TVd5bv+FB5Zj7G9bfqySeZjAw/FFzB5XsBmUiC1fmR/6CEb8Nx9D5fPoZtvue1ARD5FaCVO2pTxK8ARFC2hhygYcG"
+        "NzWOMe8x2DekICKyIIi/Pu3xytWPp4S9u+I2M+o6/il82JCQiMyAoIKYmqsVI85MSqn9ZO5N43rCIUf9mCP3/AOESFVvFjaGbpq7"
+        "BVJhq2ytfR6VYxbV1tcw2J+NGBkVWxoaMa7v7NkxJd0Cs8LCisIx/w0z7/myFQ8mvj2uaEn8Ql5tXXJmUlCKj/+grt3SFXf9+4d0"
+        "SfPtmNpl4qni0mPl4ze3NjZNXzh4wpkRZDzyEBK1ok9UmZH7zNjfQka8MbYgxp/HlFwYy49gy3mpGLfHhs/Ya/x7qlkmv/K/4d5F"
+        "nPXvPkTL0LN3gIJbCz1zFktcraQ2EGMFao5ySfBdvuKnORzuwIYN7R5XFh5RkRAx1pl/Es1OV412M3BflZm3bULUnFfWI85M7NLf"
+        "N6IyKWlsD4V3J9a0gZ8RGNVzyt5hS+umaSyJuwIadSZ3Lgln6jSa+jJ/nSr1nK/mvhizfcTld7NTV9+ctejOHFP+stXoftkzehg5"
+        "j1iYPPVC5dyX78aW9wgvj1WmR8vDK6zjt+DWnx/B7l8UlZ0cmzSw/MqisHTfsd/MXfZo2vPoMfFxldEdYjOVMWNikObOPTdIY3dl"
+        "dIGzwLuZIpUPZ6FayJ0zalCjeh/NcyCPuavU6jqi7sL9eLA3paLRK+sZQfPJ0XxDyax8l+cX9akZOHrx9EdLl/wwY2l5/5q0Rbzq"
+        "3YSRoeFlsbFl4d3L40NzOgflhIXlBAXlWhcfqxy8qtDMsM3Bt8r2FRTsK3vrYBtDs8JVgyuPFd9R5oSG5wV3yYsIzQ5i3gkYFBwy"
+        "wM9vQEjwoACq+0eg+0eNupdLhdBW7xzXDuSn656Y9dObUkTUcYvuzjbDPpaj+mfPiASd1/Se+uXoub9vHHHx3ew+q25OUGZEuUeU"
+        "x8VU9Igosy07O7ZXesXVRaHp/uO+nbPshxlMwha+7vMj/FdfDGdegN6DelbGRI+Jg0EQ7iKI+oruoVDtnTvQqCvlr1vesFRvjaZT"
+        "W9S4xEBATuY6GGrEyluV0RNTcLv2fg49I7zCXXzTgpiP+FOq/d3K43L3vTV6e7pvv678F127B2aGJr8zMa4+pCA8ofdF29IjZQNm"
+        "lnU+Yu0f7Ozf07lbB9+soWENV5ia6Or1mcO25WSsyYp8q8D7W+/+wUGp3j2nfVA6++vVfn4RoWRGblH/yBhrnzZNYaUs60w6AaKC"
+        "pOdtcYTtnMScnMSk7Gx8jf29QczbpMfFp6fHx6XT1nwNY8yNElpD/Kvf+gNb2PPWCq35GtKaW0haEgqkdZL6R64NWKSUPG8YRlXX"
+        "smOCOWSjTxlP9+7TLWKQb2//TmlKlr/FTPlmcvX18ZVDOsfLpiXm5lJxP209cWFfV6/8mID4Dh16d605kp65d0LV1q7OkYN6tuZl"
+        "um4wKIuv5Dy5EYIcdIT01iipzsbobXArKoGMSsP84p3WtcdA3xQ/3z5KFjsxU69NWXBzXOWQLrEu00jHQRZmMciR5gZy+CcQOaqP"
+        "CnLIItKjW+MbOjkwaPMhc0LsTe6hpARYWiqlYgbmoqUlOBhmCxgotutZoOyY35t/OHEKk7EJ5+PYyrf5XfzepVP43/iLRy7hk0Al"
+        "AqgMFKgEWloqAhgG5guNCSURKXk+yiE9sW18efjUCfzDY7gjNpi0FMfj5Lcr+f38io13+K5fErveD1RWAxWJ5oRJZuFvsx/XnT3L"
+        "P5T0uPf71HukTj7USRLqwH5SBq4n/+xZ/JB/eE807t7LI8TrzOUfskQaK01MkqIggQe5vW3jTO6umTKYbEbJdFHQm2+wUyXH1XPH"
+        "Z0dPPVA8uZ9b4WnGp/jA1Ojs8etOF7r1m6zyxUbMuKV5pbum1qY43s0r+kZZ2Nu3YbhDau3UnaX5S31TCpVfDxvCBGFz/imRAKRk"
+        "AxolCPsjv0aZxIJMIgsRG7D2TKFrv8nF+6dG54xT+U3u51p4Zi0Raz+Tyf9KhPDtXaj8pijvrmNK7dRdpXn1V+8MGfa1sjDFdynO"
+        "K905tTbVgbXH2BzTSIRPlZwUnUUxqD+RwYWuHzQWIV5LuK8vo8cTWnds5w9KFY4OAkjgxImJOdhymtDJlGl+u4pze8Cv+H3S+Bc4"
+        "v+5r3P/nKp+cVaVh5YlGBvarRs06nld8elL2PAfj814+3WOdUjc3bN7NPzs4OOMwttrXe+k4jyTfd45VpxQplEWJ8cOC/Av51AnP"
+        "ccbtazgLo9mT6vizB8dfqx0oi+scN3jC7SWLbk+MUuarBncKSn538sKftg/OOcI/27aT//lAemsXiy9a+zgwb4dPzsgcFdijMil1"
+        "KrnzuUUdDfY9RyzGZDVSowjID6R5jub3Q341zYtoPh/ySTQvpvm56mhWU1+iLYeRJXkDmk9Xd5ScFNeKJdgQ9mLfIo6cwYja6kXb"
+        "KMvKn8VKqQQLV2bPi7svGibJuZnyBsNf7v7C33HjZrrROyEVd+7wc0iKfevuXSRGM9R1oqXcU7AjGbWkjprViLh2zeMYdqZs81UT"
+        "y5V2LIBIuLLGE2++m5Hx7s2J429uzsQ4c/PN8aM+Kiv7aNToEyNHnmB8Z52bP//crC/rx84+P3fu+dlfWGdsuz9t2r2tGRlb702b"
+        "dn9bxpGKj8eOP1tefnb82I8rmMfzLsyvn35+zmfz5382h7l5fv4FMi/bqZ1YRO+owt5CCsrmnfgGfEvc+pWB+CWUP+GdGCPJHu09"
+        "HMaIvyfZ82ux4UKw0yt8Hb4taIzuXMlsvIJN+F8orFbFih+pEpj3m/GJBD64gXfCHL51S/zylQEpn4t/ZP2Y65QPbGpYP9UA5vpP"
+        "P9FfPPmRQ40lHGpAjSUGeiUG6KW2ZCO2ZF3ZhfRbEc5NYhYxvt9vYVrawn4QgaTVYEttqj9gyR59LlPK+rEZYBd2YBdT6HcRSjlE"
+        "Ma0bMQYaTBsBsxFvYV05D8CQb3gvIxKw+Yzmmxmw1vmzGw+e6weYItXi5mVSdmM/7HVQKITST9l8/INQCmvsw/ZY6iiUAicoZdeQ"
+        "O2TkTAFJQJV76dkC0GTVFN+e4tvjr3T4JxSv+Q6KEz5N8aP5ClyPbnOAUV+sNyMrCqzuLO5BTj8i9dfPtJjc3BgAq5yYmOzsmJgc"
+        "Ojt/lAzEPYAq+Z69HLsx2zX360T9KHVKi+sg1pRLyCfzgODRpwwrkojlFH9DU8Ke1MjD2HAdOLkgDymx1LRh7BiWLRZrqHQASfuj"
+        "ataDCyXfesjDxJjwI74E1+Du/Cg8uxpfw9d4d95dE+9Ws201NUfTmnF4NlTqhmv4El1F4AEUOZ4Lhf54UXm98BXhWdVq7ieK96Z4"
+        "b4IHupuQFbeOW0y+xwQ7EwustJFji01svSrc0JA5hq/+hs/w3/F3zF1M+bv8bdLic2jxsaZFGDSQKOzgk/u4QcR8aGioCmPr8VU+"
+        "BEbNwdTFHDtiKd+FrASn0QNuK3tcmGHkPArgNHu/wZ69z5yur+elDQ2k3gHUmzvIpWrq5Vn4W5B6TBCvmsTh3hxTz+NZT5+CFEfx"
+        "JW4Pc1E3l/Y0GDMXoZ8M2oYiuTNclkABK7FIju24Vg2rD7FZDWsOsdkfRLKZRxpWffABm3MEah1F1twebiGN5uyF03O3RqthxY1p"
+        "wgX/3jMvr2dUXl5UdH5+dDSEOueeP1f1xLkxkbm5kTG5rBum6OjofLIOf4A6c3u5iYIvRqOFnougZx+w9Q0i0PRUvvOzZ8ygR4/U"
+        "zEOVHfRtBS7jrrCdiTQpmoMMOxqVyf1t6VIpp67WbhWXUJ0ZOa6XZxc3RTh+yCVVp8dMjOuocA3oweAls45kBEW7ynv3hUTXsA6y"
+        "xIGgnU1oC7dO1AEssBOM/lLAfA6YjynGV8CcxuO5rVxfwJDvBS0DzAGYXQe5u4AB348WAOYoM5TbwxYCJkCosw1dB62/BIxCwBxF"
+        "27g9IuJJAgXMB+gst1fUCjDkNz/mA2YFI4aengNMEP2NJoyuYgcukzUldg5eGmIrNkdVzs7CDhg/5c3ob0up25BfLCEjn0X864UG"
+        "3++/h3GPZH3YtaJdgAc9h/nbyDD2xzIWVrxrAQH8cOz/Avt//3mrz0X+vfg4ZpJqIr7Ik731WmYue1XzLaowK4nc1RUWLH9WaSex"
+        "k8it8HWrJ1kY8+qsJ1bHLZ9kqNUZTyyZubjdms3jx29dg9vx99ZsHT9+8xqexoYH0H1uO/cjuQuTZ2WH5a42rkosAXJggiKFCDpu"
+        "xYTYpfLTKvBaPnMUfivV7gfbNDx2FJ+B11XwU9Ns7+OTMl712bmMzz/j62X4JN9VhkWffZ5x7jPMyviusLpn4QHcY9g/aFbkrkJs"
+        "J6zGJKhqvhwr5f520sZvHjTezbJgNlVeWjtgwNpLlWM01zGjT5aVnxg96mR5+ckbZdXjeB8s8Uv1V6QF7Fvm6O3tMAAPGAi1odVA"
+        "7XUF1B99olzTauPLl0xrj8TOnZM9Bnbw7ODCJ5Bx2qx+KN4segh7cH/6/XHtaaisUUZym8pfEw9iIUwM1IaJDNmXk80liQbJwYIj"
+        "w1iWHBmZu2W4yWWT/NDOmZ3hLzTD5JLx0I25I4+U4KVr+EeXR4++jG3XrMG2JMU/WlN8fFHv3ouOFwtXpq7sUGm/JRmdewZldOlM"
+        "LunL0koOq0Y2a0ZJ/ajXkF7BPnuzh7iPdE+dWNLnIVh/K1gipRbkmT8NkMnOVl6tmDG94iv+wBQcNrXBfxr/Nf6EPcS05t/Geao6"
+        "prUGcB3fGm8tLgZbLmNt2C6i65oTvObrvrzpRh9fy6nNzKzNzl6Xmbku2zPSwyOqQ4co+GRtMmqzaFlOVm3GJ9gjsgMpjSSlwCOI"
+        "mccmip6AFfk18hCeeSaHSnLtE88yhUw42lGYMpo9Is5Om5GQsbJ/UoZnbGRUmuk1u6LV2VEzikK/M2g/yaVLX1/T8Nh2kclJzLyg"
+        "0pRBRf4Sg1bt2nJ+QYHu0p6FSmnksFjVpxXBsevdI736GZoac4YBHX18QaZwkGkryNRyv5uHmb9OPzV06Knp008OG3ZyelhfL89+"
+        "YWH9vLz6MfOGn5g0+WRR0cnJk04MPxg6omfP0rDQ0pieI0LJ/hshrgeMmwnZK5L7+Vo2UhbGi1PwBWnr75SV3VmPn9z7matThb51"
+        "Zcb0S2PJ0z6/+9A9zSXOR1SHuqFewvN1Su0dcTe5q3DmodSuINrH+ciRiEhzOCeRaK4suX8USO8QkL03VGC6TTg0wkplNqBvQl+3"
+        "cE/+Vc+hnbuVRDODB949/sGX0t+t4pPikj2ifbA4Ol/ZvTgK90iSFZ80ax0ewHJ2Qb5P2oT5iTj7rl78pZQVhT7RyaFd3Tt3MCty"
+        "GDg6PCpXySoX5m76cPda79i4iBDPrh0shtkPGBEamR/McdLMkqBh6/oy54wtlT7SroGWecYWyo4uYQpL4tVK2HFMZ/FBzRmvzEIm"
+        "USiZzg+Nrn4hPthwihkz4TS9D5vFjmNjxCdQOxpJaA+DbGTC4gmmQ852R+LcDoFtewV3jbl5evWO01YhY4Yk40XsuI0YOfp4tO6o"
+        "6Og9fsHcEbKY5HRlkMEBoJvJjmQLgK63oG1/rbYbPRlYq+yP9+3xd3k7h+EnuHe30KTkHsOGBcdFBock4Vs5m/IL1/Qv7ldZlreb"
+        "HRk+KsG5Qye5u/80P7mbp4c0YWRYWEl0eD+JgUlGXOyI7gjzpeDEumvi2CxYU3iIoi80IGoOIB9YAb7OhuhrB1//zPDgu2wIaGfx"
+        "3APk67vE7zE72Uhy55B++6GZdoST777YReEV5u0ddOLdyQs2SIcWd8Hd5mNrv57unQI6epVPnTXErf+UId2MNpCIUP0b8xVQ9BJO"
+        "B1+jF72DbnrBc3rXDGQucD28OnUP79qvX6dQf0/vSOYjnDY3pf/knn2jstIPGfpnR1o5+Ll7BC0M8nDzdnOKKuwSVhwaMcDY0CQj"
+        "adgsmAXx0J+n0Gt6pj1agWG9ZaEDIoUSJlE8jqjpuwt/xd+QHCpdw3g/5M+ZrC9dG830aTgFqz5oTHwCInk5Jl/UXApRd28mj0al"
+        "qZw1jVZJjSkt1khjF2m/eyWxF30LNfroajRoanDkWUIROqR+IMkXPYJ1vT3yRd3J73RRj6JzKYJPEfwdORTBf1EugtHH6qE1sfE1"
+        "BUOr4+KrCyN8O0aG+/tzuYU1cfELhwyrjo2r0SD9/OpPUTthjQcs7Zc4YMkA+INL/wMDlImBg9MVicoBDS56Rf2X6hetouYlIb0w"
+        "ytXrRTLKIL809q978p/2lA1tAfnyzL/o/oG/UAzZTXGPyTOvHH3aFSxyK/cYIkmZJu4Pk1lJrQDwuIvDsMmhq1twe+4xVvKfQOgJ"
+        "bddB23DaNpdYEzbiXrLPxPaQ1zx/vlbkydwVPYR8Hs0/5tOZIcgL8kvorknJO+N31bO1+15lf2y3GlAF5PFdrJVMW7plDra9oOFO"
+        "SgXedOfCSq1wyXlsO0coxlrO2n0Nc1d1VPTw2DEoeVfEsOliC/qEjzO9oyiRae740OBJLGbmd4wP9m/dXspsYEcM6hTbxb+tc3u2"
+        "likXMe092gd6TpwNF7+OE+bQvbn6gLhWlEX2GJEY20nAPSvJ129spMSXyB1ZOzt2jcqT+WrjI0XNHG8T99JKX7ayYaZvZam7iXN2"
+        "8RDXhzHMFebKhoeB5QVShaGN2U9mtgaKNjFpfdzqNPQND4ky/5L+lY0PdfTF1a9Km9G/vP619Pdal4tyyI8qEvrkp2owW6tyZ65t"
+        "5HtYPHxih4/EM9eYq+v5iJ/4HiQKhRYgUQ54BkPy/AtthV3lsB9TQoimaar6jFHwqXUGkt9e1Unaawiozqk+47//Hk+DXQbGCPR2"
+        "TdCbXNmNVULP6Jd5yR19H0YuV2KO3fjQdUhxtrOJvLTSr2EmW+lXWSo38Z5THfhoI/NVzIY6tz5pMW0UBrbQJxtDhbSgPPDhBpWn"
+        "hrrhU0Frr6Eusden/qpUXK2j/nAjc6Vl6utVXpT6Xuutgs7kGMjC5tji0iZ89ImtxSM+YhNzNX4DPvITPrpe5QEaI/Whr40ak2Py"
+        "OLVCCns8qR3HbGQCVOegQ7+7c88e1b/iJI/i1zMKJgBa858ICtNQgT69hoqkzSZGofoMWP9mbiCpe3lb0r6uBSpkvOuASid6+qhv"
+        "T3qawY0aa7SxEtVAZuOGgzob4/J16jq4gdmoGrjhYKM261c2mt/B1swGZsOGg1rz0+ry4AbVINWgDQd0WtaZ5QFBzlaB/4Gcku1/"
+        "IufL1H8pJ0dng2ZUhOcx6LgYspo5ARtV/bF5tUd/dkgSb79aVCeadls3UKS02UyhHEATf8rBKH0j4bCRufZrkT4Ho8W3f02oM/js"
+        "TzmAriFKKIfdAjknwVgiB/Xa0Q0LeYhTqTRlJZJPqY+qC6wY4hxoYGP+1NzGQNE6tk+aax3bhrmi8tz4MBA03opO1JHsfKLzVs45"
+        "xfluD+lY3hOXa36LIwxEJ1/WlZMfr/C3oPEaDKJSXK7qoPIiDAqkzRgwH2jcW2DNbJ9W8hGj/dj5DSP9Ro/QMSBnoMgGvPCHEKsW"
+        "0rN8yIOPOgb5oULeErzcR5Afps1DOckXkTxG0P4abT9cm4dRJe2LhbwlzHhSv0Sbh/okX6rNQ32SHyHQj4T8PMiPRIM1eRhDki8T"
+        "8tr65Vp5oJzkKxC5l3cWZYqXc9fI6U2KkjjYs2dxKvPk44ZYpuIsv4d5dLYhicySkepayWPQLENO2/FIyVsNEaKLr74gJRDC/SAm"
+        "+yxUhvFI9ih7ROzz6iKUHFI/l9SK52rOHa2w1ApWdyvOR/XNN6przIYvLjK1qm+u4Ql8OTMdz2emq97iR6reIk+sQjC4n34TwyqB"
+        "PKu27g56LXaG+rE4j2LpL+0gP0bz/RpYMrnumt+N4TTPwX2seqn9BQC9XwZYi86qbwrfSNlCv/FDfR79ngQ4XH/MEt+3nb/MefBi"
+        "/r2tWNGK/+IePkC+D8Slq7Kv4TP1tfizhar1ENFooxKYP3TNbzyHlOql2YHd+vXrBsBLaKJvX+5lWkhInz4hIWnaK2hvMvcUfyZ2"
+        "oWdj+mfibj0yM3v0yMring4IDR3QPyx0ABmfCO4XdhjEKAZkhwzBPbaRynFPvh5LH2Ap//t87hcJduevSbY2q2sHSymWYQXuuWA+"
+        "FvPfPeC/E8u2bpXw17C7hDzHwtWxZuL2ursZ/pofLCJPA+D92W8P2pUV0zPrvYHvcHUp8/p2T03t3nce/S2XHG4rM1O8Qzih/eO5"
+        "gBC4Qtw7Kn58bOz4+PhxsbHj4v2iovx9o6K4rVEV0dHlUVHl0dEVUbOj/PwiI/38okAeIa4j3ilFdyym9LeRBNLb3Y8ndnJ37zTI"
+        "tUyUPmTkeD59dDtnqf0Nr35ccq9ByURPYXwy0w7Z0ufZqFaVIu1Xk8lTXjimfHF8KHboleriYudmEepayieX5EVN8LZ1SVU4u5sa"
+        "vmNDvhmcIzZkZkqev0nvksdFRY1LTh4bFTU2OSA8PABAbBhWEhlZEhpKPsOmhvr6hhIA6dZwq/E0sQONQy382TUPFICYyE8ikrdW"
+        "f8RdEZuTsr5ybLd9MeexuHue6FE+lPVWX+SWcnO1ZYcL2W8LfQZx6YOgzAt67IDMX9vjsPJ1cSFY2SvFxcXWzSLMdQyfXJ7bo9LT"
+        "3C0lQNtjjEL5ZLaQMSZnBZRKNxF5RJvTo9OzYlHipLdXTkpMSxo/d3ySQI3qr+eQhKiEvPm5k3aPSekR1amRahifBqNh/kajITcn"
+        "o5FWkhtV7m3umqRwlmup+EIPzbGDbs51Y5SupqwemaDyRZayju1whl1MjC8I5mopDKwsrFt35xdJM0oHy53dWxkRckBvOrOA7cNG"
+        "0FFQSG2mMxeYBXv3khI/Zgq7gk3SlvixQ5gp585pSzL0S7y1JYjxYRI58qw/SlZgGyaR8bmP+9yn9xBPsr24vbTEAluwvfBJbIAf"
+        "8q+gbD13AZ8WL0NGhF6A5hFEG5v1rqHuS9oFcBdmx48Z5BDlNS1lAv3vFjvJr09z5G5yNT1nJ2kMbauFNANzfaWQZpEzqhXSHHjV"
+        "U0JahALRNSEtRtbYVEhLUCp2FtIGyACPEtKGyAlPENLGkF4tpE300q2wMz4mpE1RIHML9vQlqBSNgVWjEA1BBagcOSE/1Al2yoGQ"
+        "SgVMHlxjUDGU5EEtJ9QLPkvQUMjl0NphqAKuBYAbicog706plAPVMtQFdYQ3+b1pUqMCZSMfaFWChgOW1B4O0BFKtdQ99DiFQ70i"
+        "lKuH8dbhgqFdOdDLhbYlTaTT1kij+TJaXgz4AODcifYrWJDHG3pI3gFICTJ1AtmyW+SlT70P5JxQFmBym2mlkPY9C6Ac8llQnge9"
+        "y4L0MMCVoHz41PbYR5fqDTVIqoK2DqN0NXKXUbmba7KRwnCo15GOj4ZzFK1PxiOFcitHoyn3PJ1sRXDNgXwx5PKo/BU6fk50fPJo"
+        "6xgUD9ck4JpHNddIOb4JBS/ANNeyL0hGwElPsqZ8GzU1CqAQSrNA70W0ZLRgJxo9RoE+kmm6HHrv9AddlAgS5gvyNeXjQ+1xyD9s"
+        "xWp+g50/Sv6XSwsvjDD5rUH6268m2p9vRxaQHw8wEdXA5yK0CT43wxujbegCfH6JrsLn1+gxfP6EyD3YX+CN0a/oN9hbirAYPk1w"
+        "K0RuTcfDZy+cDJ99cV/47I/7w+csPI/yJGCEQiBi5HpExaeitjljRhYhtyEj84Yht6Ks8mLkhsg/TCCRFyb/C0aXBjmH5Y0sRqb0"
+        "05bKjXX/M0ZDmUFixUrqoxhkZLIQ+BZQCruYQX98K6c3fTP5kglN39xN7iZTDu9zzGSAB6xX0/LmFMibzQYoZfdwuaR1C+97IjG8"
+        "rUVuwjtVeKdLJohKxavFGyQdJB3EO8VHyFUSJL4jMaApSJtMMCF8e0tKNfwNr5O3ZKbwXih5R3hvp+9a4dr4PqGsUlZJTgjvywax"
+        "xtcNCgzeMjgH1+fGd4zvGLoYJtLrEYDzJEVz1w2fKOcq5xpf12Lo+7FyuvFzE85kAmjbna4SCCJea7i2h7cl/S1/K/pr+HbgpeJQ"
+        "G/pr/gqIl0eA56qEdzKahmaAL1kE7z5oFdhdGljdHpSJ9sF7GDqMjoCdn4W9RjH6At0FC7+P6tB09CO8Z6Nn8J6DXsB7LnoF73mI"
+        "h/d8YjZoAbbG1qga22I7VIPtsT1ahD2xJ1qMfbEvWgJhbSBaioNwEFqJQ3BX9DbujrujVTgMR6DVYMUJaB0uhJ3XBlyJ30Lv4hl4"
+        "BtqKZ+PZaBuei+ej7RCjd1LvwfPUECthN/VhLFf3xhHqw5DzVK+Hsgocrl6OLLGdejW2B/AE8AcIAAgECIJaIXDtCtAdIAwgHKAH"
+        "4CMBYgGGQ74YoES9GvYpdurlQKUKWu7C4fwLqLWL1EIWULIPeOyD0n3AYx/w2Ac89kHNw8BjH/DYBzz2AY99wGOftiXQ3wf09wH9"
+        "fTByQ0H6YQBFAMOhJeHnBFcXAH2+PSAfCRBLeot4SGn6Hwzx1yj1LjQWYBb0/TDAEYCvAK4C7pq6I3oAbUgLK6BNNOYBND3V6aCv"
+        "dNDeXPDNLVG4ol4AVBYAlQVAZQH6GuAbgG8BrgPcALgJ8B3ALYB76rWU00P1TvQI4AeAxwBaznZwtRfGTCPBYSqBP1wDAAIBNLo7"
+        "DLo7DLo7DLo7DLo7TKTERDvFACXAw/Fv9fm/5IwBsxx8HeF/BOyAB/qGdKx2Ac1CaFMFNdLpGC0XOBUiTrDPuZQPsVFjoLAMVaqj"
+        "oRejUa16P/oIRoKH1jCmUHs51O6IFdCK1GYESlXgWfuph6L+AAPUQ2EmDIU5boIiYc5HgheIRDYAtgB2AK0B2iByDywSdjqREP1H"
+        "IgcAR4D2AK4AbgByAHeADgCeAJ0AfAECAMh/0AgEUAIEAXQG6AIQDBAC0BWgG0B3gFCAMIAEgCSAXgDJAL0B+gH0BxgAMB5gAsBi"
+        "gJUAb0Otd+C6CmA1wBrIrwVYB+lagPWQ3gCwEWAT5DcDbIH0VoBtkN4OsANgJ8AugPcAdgPsAfgC4EcUCX4pElbDSBKbwydD6ME4"
+        "3YVxWkc5RAK1SIiKVwHN1ZR3MvBOprw3AWwG2PKGtTSSGfxpLUKHhV5Ggj9FmPxPGzH0O5L2ewNcN+qVSCAWcEQXAS4BXEaOgHXF"
+        "s6BHswmVJjlGyMVRX7mL2DCk2oNnlKkrwHo7qc9A7weApc6C8RfRlFCPeFKK5QBL7JCUHKbW7AARzC7EALAAHIAIQAwgATAAMAQw"
+        "AjAG8APwB+gHFt0fYABAPlhxMeBKAEoBRgBPW7Dy9jAnZACuYO1uAHKAGVBGfLxEZxGNlhCpswCOfiOa/H+5SwCX6X/vacqxCg0B"
+        "TgUAQ2EODgMoAhgOcBu0cgfgLsB9AOItvgeog/7GAfd4QQJDoFgBFCuAYgVQPAyUKoBSBVCqAEoVUKsC5l8/4NEfYABAvvod4Dsb"
+        "+M4GPsuB/nKgvxzoLwf6y6EFaApapEOLdGiRDi12oULwJUOhxjCAIoDhtCb5fi1W7wHN7wHN7wHN7wHN7wHN7wHN7wHN7wHN7wHN"
+        "7wHN72lGFfZoAAUAhdCXoeoooB4F1KOAehSMRhWMRhWMRhWMRhXlxulrULPOQm4W5GYBjZ20fDlglgOGyLccjaXepxX0wBTADMAc"
+        "wALAEuCfeCUnaCcFcAaQAbgA/K88VTjQjgDoAQDrM4oCiAboCRADEAsA9oDAHqhXS4TrHzybns0NhPJBAIMB0gEyADIBsgCyAXIA"
+        "cgHyqJ2kt+AJIwVP6AR27wR27wR27wR27wR27wR27wT+5TR4j9N/6fneB9gLsA9gP8ABgIMAHwCcBjgL8DHAJwCfCp7yNsh0H+AB"
+        "wPcAdQDEe4IlQPwVSfYUxLPobAJTG+GaRzEwlhjwDLEfUg4gAhCTOQ1gQGYWgBGAMYCf2gT8hcm/jWPAb8ylXq83eLMKxDhPJfsQ"
+        "WQc3d9gddm+yI3MUrjbozV5T/qTM9TX4yJbR0AfiqUjqW4DW6kxdyRld6qp6CvkEuKde2bSt+hKUHoY5q8E8oPSa1nhIU1P+vEvq"
+        "GwBd1CUtli3/Y0rIf64mzzevfw1N8mtvP7XUrsXac9XLIQb+Oy8HLZc3ezXTzdYmuc3qD3XpxXr4nbrUefq5qWnbpjSb8XuhT0Er"
+        "p/pL2t5R/THNXVNXqB+qM9QkkheBBm7r04X5pslVqIfrcXVUP1F3VKerC/kX6i/V3WiNQo0NgC0cVi8jVqIZS6ilodiaforUjwWK"
+        "j+heESFv9TN4H1bf1Ikt0kn+G7lTAC8PSOn36xg5nSU90lIT8D//QQO/of/mtQz9Zy/1tX/U6vA/bUv+a8W/eo2nn4n/ioaIeBdi"
+        "R7CGPm7sE7x36SxT1GJLPyjfDVAFbR11Lb/940z/k747wdwxo7Xc1fc0GGHG7yP3E/UwmtnUnuYsNFhi11AT2pJfwadWd/4NNf+R"
+        "cHVSvwfzm/yaXieNpNAXBBHJePVXsGNuoQ86f7pZPY7qKUOvzKkJjwp1lK72Ty1pRZ0J0n8I87ujmsSdRJOFyBKuSyjlF3qemvpR"
+        "qKvx54dICvJR6lg9mpn6NqmuAA+w/I9eB2Z9OuH1Gr0UtlzW6Mf/6NXUT//ciwt+fv0b+N3x6pw/eldIk98MvUhTX/xRon8x35c3"
+        "WY+C9Xq5XH8cdXO8Cv2HL60/1+Wf6VLfv6bJ4Ne1/Q+k+Wtf1EKc8vc1QmKVv7KDf0vtT+rrNKv+VZc69QarweA/p/Zm6wm1sp16"
+        "s1q77mfDfuiwbv09/AcN79SfDa/zrHrWfEe4NqGomUF6L3PB087+R5q/2NQ//FUcR2JWTfSkb2ngsXcSybWabGlW68dcf4yAIb0P"
+        "qOh0oX6uvqQZG831X740a2vhfzLDPtYlTZqV3PmrGafX9p/xPtM4YtSfJcLaUdlCFJPdqNVmWu4BLYLVvRHiNRFgcKN9qrPJuKkH"
+        "NqXwJ35+fWNef8TfPF7/r/x+s5fl/4Tb8aYjoY09mo57k/kU2XLbvzMjX+9X/3IntfNNvPFf1VFfFuKQXVovCJEhRHTqr2j01jxa"
+        "NNbsJgC+1HgIiIUOq7c1pdboE18bVd5vti44qBv0Sj8kOnrjtcbhdavMX/b9nm6e1f+Z1bU4OoXUJ1c0p/Y3uK9UH1Kfp7vC2U3m"
+        "9jaquV9aWAOIZN5kH0tmNdQZrk+tKW+t99ZZsbmG4h8s9b88OXnjiEQ9Rf1UvZPsjdUz9P2Leo5+rCJYj6NeBAMrLO17sHZf3fxk"
+        "RH2uhb4LfVS/0yTSJb9M/6CJVFfeYD5pItC05nHzG7+maHdKqKAJ/pBun0jqJAqYnTocor+krX0l/wWXxjhop476n/UqHf1/+Gp5"
+        "pvy3UbyO6qZm+XH/NKb925xfc2oknNfcbmk8NKdGevgnWt/zH74aT1Ib6Rb/x30/TVYXNfnfkjdpRH34zW2BzrgK0raR2t8886mC"
+        "1XwuX4da0VMIBNeyvyX9v+v71eYzjOzE3/zF/wfR1j87Kf2vZvY/t9em5xx/d6aq39OPgGn6xt/S/MX/SAP/8O7Av95139CcLP+j"
+        "tsF/o3LzOyau6hevvYvS0sse/R/0+vc2/z+V7tL/lPoY9XiNJ1GPJymI88a/puZ4beSmntmspNELjXljvk25yFqeO/o7KvW5/5EG"
+        "qtD/ta/mJ2Jvcs/wf8Fdc+bOv2h+XkHxVcL18L++q/P/55GoaBGr29GrO/9HfMh51Qtyn1Jzj5pc9fdD6ud/0b7kXzCPRC3fk0/W"
+        "2x9FtrgLjWwW92qe/UCoHJnjVs32VmQn5dzizkrTg39xd+DfnY2R2aWWNZ7MveGp3KF/sL6/ToY3ixLN/5j6770kefbg/4WJxZDn"
+        "t+h/BJyBauBKnvKvRpvRPrQBHUCP0R70BD1FdegX9AL9gH5DL9GPqB6p0E8YYyP0HJtgE9SATbEpUmErbI34/6e36wGuokjz39fz"
+        "5817D5IQIJnJzIQQQsTAQogBIUE2ICJy6GKWUoqlLNfzULjIIotWRMRslkKWQo51PYrjOI5DpJSjkHIpikPK4pC1LI/yXIpTzvIo"
+        "lqU8l6JYi0VEFvPu62/6fXkB3AX0Nl/Nm37d39fd8+tf95uvp3ui11YjYAWGqLASh6CNdTgUi3E4jsA+2IBjSK8ZJ5DGJLwbB+L3"
+        "SIbiXGzDYdiOT2O9XlWNjXpVNY7C53E1jqZaPssryfXO4SykoBdJKfSmI4C+dDdqQ3+opHi9wlzv46iBGG4m8enbCPpsgFvAg0YY"
+        "RXqjoQkqYCL8FVlNI0nB3SSD4R4SG74HrZTf9+F+6AMzYRaV8QP4G7KdQ1LD+y+qyaucC+UwDx6jWsyHx6nkhfA01XEJyU3wDCzj"
+        "/yDzHEyAFWbnxC+oXi+SjIG/h3+ACNbDBtL/J9gIafhn2AS18C/wEoW3wMsU3kqSpjbYRp//CtuhDH5J7aHfhPdv9LkXfkV5vk0S"
+        "8Rr4LPwH/CcUwfskpfBrOAIu/Bd8CBYcJbkD/huOU/g3JBk4Ab+FgXCSpIrXzGfgd9TGfamNz/Aejt8TLp+RNPBOjrG8in4QtfoX"
+        "cCu1/AVoprb/I9wOl0huJRZ8BWOJBwhN1NYKvosWWtBILW7DKHTQobB+Z+koTGGKwh56FE5jGkZghtgzlNkzlNkzlFjRFybx+vxB"
+        "xKEyqCMelUMx8aQCQl6rX0x8qqTwABwAI7EKq+A7xJ9qGI6DcBDF1GANxQzGm+Bm4t0QGELMq6NPvcJf8284jCMOjoDbiIUNNDLe"
+        "go0UPwpHUZ6jiWXFeCveSvF6/X8xcbSZwnoXQDGOx/Gko/cCFGMLtlD8BJxA4Ul4B9yCk3Eypd6Jd0ILTsEpdHV34V0wGqfiVErV"
+        "e1/qiel303UR12E87yAoJr63UT56H0Exsf5pCuvdBHW8m8Am3j8PvYn7q6n1FTxFrZMl9mveI/PeplYbQGHNdZv3VCAzvh/vrEDm"
+        "fT/eH4bM/mpi/wQKTyTG28x4LGA8XsH4NDPeZ8bHzPjSAsaXEeOXUM95Bpaa/UGKWV7DLEdmuWKWI7O8mFleySwvZpZXMsuLeT9R"
+        "MbxKXA+I66+T/i+J5Rax/CC/I/JXFNZcV8x1i7meZa5jAdc95vp45rpXwPWIuV5RwPVy3iWCzHjFjG9ixt/MjB/BjG8sYHw9XCQZ"
+        "wbwfx7xvZsYPZ8aPYsYPZcYPY8YPZcYPY8YPZcYPY8YPwCxmYSD2pt/jgTQaFtOnZvxtzPi+zPixzPgiZnx/ZnwRM74/M34IM34w"
+        "M76WGT+EGT+YGV9FjK8jFmquFzHXRzLXGwq4XsRc789cLyrgelEB14uY6/2Z60XC9YkU1lyvY673Z66PZq4PYK5/h7lex1y/ibl+"
+        "Cz6GPyKrBfi4YfYgZvaYAmZb+T1Zqp7ZaPOdyVrYjp7yYDe16ClCsIh+F84qD5twBs7C0yT6vIhlOa7CzdhFchrP4gXsUp4qUlWU"
+        "WzVZ/4F/tb6k9tO/WF30q5QmtMsIzSqNImFYQ9jV4k2E2ki8XV8hXdkUuqKpdA2zqM4ODsitw0G810FWoFON9ZOHi3R4lD/g4Nyv"
+        "sZaOm+iYlNM7cD7HO+mYmvucevLg3FuU+halvkXWL1Gv+TJ3Gr6ioyv3EvbJraK8J+PtXW/gLD0pnuhgWa6Dyp6MA6nMajoGUfjO"
+        "3GHUa34tSn2DUnXsG+DStw307VWs4pXqr2IN56n7Uhfdl7hwlHeBPEFlAcU38x4jvabYppr8gWryCeRy/4uP5P6dSi/TK+fhj7m5"
+        "FJpLuTZTjs34HOVWCucon8/pDu0LOl8gb+NLOl+k4xIdX1GeacJI72Ioyz1Alq+R5WuExxOExxM4hfcWPYF3k66uV7JP5TUOv0aI"
+        "djG2ev3/7Xp9P9l30PXoPQEddD3JvoDXQaVnapakP8o20u9YzdfMVFxlNrV7hpLXIm2Re/0jV78XTe7Abswruf55rut6/jz4G99Z"
+        "/tkVTH8Jn9+sWh2fG1UQNy2/Joa8gTu7nzIkrVU4w5F7g72FN8xMcKVee5pfeXrlutOvWXn6bV7NLxK20F37qq4vuj69HMfcS8ka"
+        "BrPyufAp62u5jq5jV2NBboo8Nfnwm7RNbmsyW37964Iv06mVtRc7r16fy+v2dT4ZtYteI5600lXWh1/LCvHc/3T97mqzwdexPm/w"
+        "1VH4dmeNvsmM6TfLqfDpb+G8xXU/dTh4zeMG99CvX5H87YwrPWZA91yW9jL9SlxzS35bT0oNZ1v/1NjOK5U6ZOT6f/bt8zODf0ar"
+        "z58eEfKzWT3WY/3jDdTmN9/K9fDsUPfvM4eO537W8zrzuwZyv+U3Nl21Ra75aWDJDdT0+F90XvTyNVXxDe0+UdCfPSiQ9zhcoLtz"
+        "fdfs8TxPlj31/uypl/E8TznvoQ/0PA95HZXkbcd6nod8kuHkddTpeR7yfJrJS76F7qunQhN7BRPIA74XJurZHrpPbCev9y72De6m"
+        "GozlGlSxTxayT9abfbK+7JNZcJ6kkj2zUvbM+rNPFrFPVspzEX3ZM+vHnlnAnlkxe2Yl7JkVs2dWwp5ZMXtmJeyZZXkuwuMr9PgK"
+        "PfbMYvbMLPbMUuyTKfbGFHtjvdgbS7M3lmFvrBd7Y2n2xlyef7B5/sFmb6yMvbFy9saQ/TDFHhiy74XsdSn2t5A9rSL2tBR7WhXs"
+        "aWXZ0+rDnlYRo2nxfIKP03E6+WH3ErIOzyogzycgI6vfsXUUdhY+QbqGv1hWivYhX38gedClHB7Qvd+C+oa+iyqSw71KPlX85pGo"
+        "xxs59DkLafLHM3xOsTgsSXrf5Pkyv8kD2Sr/To+eMTquN4kNAZVerN+rBsm6r3Ly/270GSyyKP2+uWv+8yD/DpMaGAOK32FSxO8t"
+        "KerxrhL86x+2LWJtmy1suuYUlPRp7bO9z6E+5/quDreZFA+wTy19lsFqWE095QP8wDrkLKHcT1Gf6CL+lmJEvms9NilfVatharRq"
+        "UVPVDPWAelQtVEvUcrVGrVdb1A61Rx1Qh9QH6rg6pc6pLsuzSq3IqrXqrSZrknWPNdN6yGqzniTeTcMZVoe1wlpjrbM2Wa/AQtyL"
+        "jxELR1K5esZnOayB9bAFdsAeOICbcBvuwjfxHTyMH+Mn+BleVDb539dZHzgER+BjqlWJ5VtV1hCrHk5aY/BH1HPKSUaakC+hwIR8"
+        "SfUl1ZfUQFIDSQ04dT71nHJz9s05iddXOhR2w354l+p0DD6Fs3CJxo0S6v811I/H4ETC6D58EOfhIlyKK/AF3IBbcSfhdBDfw6N4"
+        "Ak/jeSJPRvVTlapWDSccxqvJMBOXUO5NlPtMfj/Qk9ABK+FF2MhvNtkHb8P78BGchDNwgcavXjTqVNHo0UjjwhRsxdk4BxfgYlyG"
+        "q3EdbsbtuBv3E+7vU4nH8VNCfqlBq8mEfAkFEgolFEkoNiFfbH2x9cXWF1tfbH2xDcQ2ENtAbAOxDcQ2ENtQbEOxDcU2FNtQbEOx"
+        "jcQ2EttIbCOxjcQ2EttYbGOxjcU2FttYbGO2fYa5k5x9cw7MOTTnyJwTfd3qtXDPDbb7wzSiL8Il1PKr8EXi2hbqc39r2rpcQr6E"
+        "AhPyJdWXVF9SA0kNJDUwqb7k7EvOvuTsS86+5OxLzr7k7EvOvuQcSM6B5BxIzoHkHEjOgeQcSM6B5BywzOMWKTdn35yTeN/E+ybe"
+        "N/GBiQ9MfJKP4m+KwqCU6qXKVJWqU43Uf6eoVjVbzVEL1GK1TK1W69RmtV3tVvvVu+qIOqY+VWfVJculEazCqrGGW2OsidY06z7r"
+        "QWuetchaSiPqC9YGa6u109prHbTes45aJ6zT1nkb7Izdz660h9gN9jh7sj3dnmU/bM+32+1Oe5W91t5kb7N32W/a79iH7Y/tT+zP"
+        "7IuO7RQ5vlPtDHNGOy3OVP2OKOdRZ6GzxFnurHHWO1ucHc4e54BzyPnAOe6ccs45Xa7nlrqRW+vWu03uJPced6b7kNvmPul2uCvd"
+        "F92N7ivu6+4+9233ffcj96R7xr2QUqleqbJUVaou1Zgan5qSak3NTs1JLUgtTi1LrU6t47dI7U7tT72bOpI6lvo0dTZ1yXO9Eq/C"
+        "q/GGe2O8id407z7vQW+et8hb6q3wXvA2eFu9nd5e76D3nnfUO+Gd9s6nIZ1J90tXpoekG9Lj0pPT09Oz0g+n56fb053pVem16U3p"
+        "beld6TfT76QPpz9Of5L+LH0xY2eKMn6mOjMsMzrTkpmamZF5IPNoZmFmcaYzszLzQmZ9ZnNmW+b1zN7Mgcy7mcOZjzInMqcyZzMX"
+        "syqbyZZmK7LV2bpsQ7YpOzE7NduanZV9KDsvuzC7ONuZXZl9IbsuuzG7BRdLH1ssfWyx9LF8KJRQJKHYhHyx9cXWF1tfbH2x9cU2"
+        "ENtAbAOxDcQ2ENtAbEOxDcU2FNtQbEOxDcU2EttIbCOxjcQ2EttIbGOxjcU2FttYbGOxjY2tLzj7grMvOPuCsy84+4KzLzj7grMv"
+        "OPuCsy84+4KzLzj7grMvOPuCsy84+4KzLzj7grMvOPuCsy84+4KzLzj7grMvOPuCsy84+4KzLzj7grMvOPuCsy84+4JzIDgHgnMg"
+        "OAeCcyA4B4JzIDgHgnMgOAeCcyA4B4JzIDgHgnMgOAeCcyA4B4JzIDgHgnMgOAeCcyA4B4JzIDgHgnMgOAeCcyA4B4JzIDgHgnMg"
+        "OAeCcyA4B4JzKDiHgnMoOIeCcyg4h4JzKDiHgnMoOIeCcyg4h4JzKDiHgnMoOIeCcyg4h4JzKDiHgnMoOIeCcyg4h4JzKDiHgnMo"
+        "OIeCcyg4h4JzKDiHgnMoOIeCcyg4h4JzJDhHgnMkOEeCcyQ4R4JzJDhHgnMkOEeCcyQ4R4JzJDhHgnMkOEeCcyQ4R4JzJDhHgnMk"
+        "OEeCcyQ4R4JzJDhHgnMkOEeCcyQ4R4JzJDhHgnMkOEeCcyQ4R4JzLDjHgnMsOMeCcyw4x4JzLDjHgnMsOMeCcyw4x4JzLDjHgnMs"
+        "OMeCcyw4x4JzLDjHgnMsOMeCcyw4x4JzLDjHgnMsOMeCcyw4x4JzLDjHgnMsOMeCcyw4xyxPmbvYp8xd7FPmLjY5h+YcmXOi7xt9"
+        "3+j7Rt83+r7R941+YPQDox8Y/cDoB0Y/MPqh0Q+Nfmj0Q6MfGv3Q6EdGPzL6kdGPjH5k9COjHxv92OjHRj82+rHRT/BRrKVYR3GK"
+        "wljPlJj7qmRMqcexPBNlQxFUwnBo4RkoBbPVacBMC4D53gaN9L1evo9ThyD/ttgkZirPeSFrkEOgW6F7boaPIj1ThHrtgo1ztcZV"
+        "08fq989CL2znPPRnQT7kWeo5nmkwB4fgZJyOs7BNzwhBBVRDHbpQTz7hE5S/XscxEhcRGvrcxucGXEi5PYY/ps/5vDroJJyGfnAO"
+        "Hzd6C3hGo5T8z3pogkkFXuhSWA6rYS35oVthB+yGfbhMSsmHmkyoWeKaTVyz6DWLXrPoNbPeT00dknPyvdl81+lPm2tIzs18bjbf"
+        "dQ4/obovwU76JF+aUCoBHztMXh0mj2fZu9b4L+Qr1aEfcyjBXOcxkj+bTEwnx3QaO4/40oBjKa+5OA/biVMur55dA9vgIBwjn7wC"
+        "p+EDuBBX4Cbcj4fxE7yk+pFPOFnNIm9whXpF7SEf8Jj6zAKr1Kq1xlkzrNXWJmuX9S75eJfsErvWHm/PsNvs5fZGe4/jOfOcDmed"
+        "87rznnPBLSKfrMWd7S53N7i73PfcU6mJqftSbanO1PrU3tTh1GnmIlKbKmqpTmajy6wawqxcz2kIjxaklHNKh0m5pyDF55Q5JqWx"
+        "ICXglGkmpaIgpYK5b2OWV+vo1WVoHzX9QmukTe+rMP2vEW9jiyF4M1lYzj5nH8wnm2SXogW2s00LzKa4F02c46xNBKZQbIeJdQkn"
+        "I9BA8fNMfIq8XRFdV7s1P2+LFpc5xZnCZe6XMkdr4TJ3SJnViXCZ66XMXnnhMpfly7TPdQuX2SZlpnSZ9hH7iC7T8fJl2ge0cJnn"
+        "82XaOxLhMk/ky7TX5YXLPCRldnQLl7lLynR0e6lhdGgGvJmMUSqiYyUop5X3yOqYDB3thEiL0wIbkjg8T3EPSwvqdn+SYlop5SRr"
+        "KDVRc4Q+EY9wjKXqVT3MoDga6/BAcn0q0kLjK5eLSYmOchPRPFH6/d/rzPhZSuEzxIsz2MGjqwsL4ecAvN5YvzXwQ+KjfpP4w7wy"
+        "r53Xhz2VsB930TFZ6qtjNlNOm7GxR9xqGhPICqt6xLbTiNDOkukR/yA4+GAicLYAi6OmrKMFcQcprgGUdVGHJHYHxUZgWSetkzps"
+        "4pV1iEZVRP2MYm1B7G7ukWcklI/fyH33A8pnowknKZa1zFrGvXdfQS/W8W1WG4ym71vIOgnlU1qtVn7WsrIgrNMU/xo9TmG99vFx"
+        "+D0qWMhPt5bzc6Tn8H78AazA5fgcPM/vZP+7fJvRrwZILi5msIS+hlgJKbyZeniWxs4JNKomqwLbafQvYz0L06RXTqNHip+EZWmc"
+        "HUN6d+AdpDeXftHKdI1xIyaj2ooCPto01pLQrxT/7x+Jd3BBIpqJMKsgxcX78gJ6VG8pSEvRr4SIfusjrxrrHt8y/GlzbUro6q6o"
+        "Da//vHhlbeCEkStqA++IXFEb2F4gV9YmuWPwdG2oJp2wk77v7lGbNhbd6zf1qM0MI5fX36U65EWza36P2lQWiB79WwtaWz85zPfQ"
+        "n8MrOBRexuF4L7X7/TibePMA/hC/j49Qj7ufa92LP5O+QSMhHKDj/W6mE4/3Jb2Gz/nYjXRXgrCO/+98d+wK0P+Hu5NDawr6XBkd"
+        "8yh2AbRLPRE+h6+ScQqm0/3NTIqZSsfM7p4BY6gVWngltOJwd0m1JAg+hSo5ZFqC7qT0r9gj+CiXcI5LQHPXpqg/1uB46g36uXhv"
+        "LMJi4k7y+1dJ+IwlrjXr1bSk811swQnUP+jeAhfj03RH8wwuxWexA3+CnfhT6jEaab1KGbjXIPcaj3tNL+41vbnXlHGvKQf4PyUX"
+        "nZQ="
+    ),
+    "StudioDisplay.ttf": (
+        "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"
+        "tg11Msi26OSujmuHyYSzflt3d1neukkJ69axjW0znGVt5ro2T5csiyKpCPwlYtxHNyu8xThd3D5t0NN8oV3QMntwP4lkl88vq6nT"
+        "GVaX5nv2MUuCQZNcml02v5yFKII5r2teUpIbV3r5JWfZYvNtuqTokiWljdWampEjazTVjZznOjBgF+0g932KVqGzUoqp6zaEWodn"
+        "Fk/O7XY7i9HBef6ls5hc15V7TjBzUdHo2kteL/eIdFw6EmLHvJMohI0NJ6/X2+MtohOCOlemagNL9PW2bqeaDwZ5QU8++fnfdj7H"
+        "+9o1v+z10htvKPHpYF/PX9et9Pygq4zsAqUIusmpSE1pWH8F+m7qVhsiSvNcFXqDvnx49qisboc9I0ecWG/h0JT0JIsjdUyp5xVW"
+        "lp7udno+9F19PKMsU2BZ/aS02hBeVe0TEuutjMsJFJFP4wvRynplTBmohVfacH7jipqaFY3yubhpVElxUxNsqkXX0lmqXDpG1Wnq"
+        "RomT7CeKpBbkLyxqcgCXoutGeak2fVS/QsC0vqFaeAhYVcoQw4aS0c3F0JvD0kuliVk+q0rSe7wsbYBFyRorW69e0U5XoOqy/vV5"
+        "xaCxy95ofklNPdyT55KvMMYweFIKy0osvdzQrzBZ+qyDnSVtn/S5WclNOsRpLS3PLWe9ReaEDqfL8wVP4fCeZWfAn0P2mG6zJHfT"
+        "Si/NeVT7Omilf2bG2asjlqmT8hIzHWmZCQWTCtqnjF+sXx6al5xsT7MmFE133aSd0Gy2pemHxcQMDQ3W2MrzGsc0libbLUOjY2NC"
+        "gjVJZQXNExU/sEO6m/uB2XwOx12BU/gAMboJyitbvbp748aEWWVOFtu2fXubx2Nu4yM/7wXJynqVsWxAT+1SHCJT+TSsm+tbqGtm"
+        "GUvzfCpUzKOrHJrL667j/RxyCeitn3t0w1LD0g2Psl5PO3vQo0OsNMT6ErEG6a0X163JNFQcqTBkrql7t8IAbfbMY48I6PhVriF0"
+        "uVf01u5U0VurY/iMLm7f3i03GW7asnffg7hcPP/UU+cvPvOMqFuRqFsidDPQo/WrJNzdaqZNgMMpzvLXtDT/8GLzGr01OrC23KMh"
+        "V+52jyNX0aeniD49GH16AdN5LrL7Pb0sduunujYOUsbKk65prFyzeuvW1Wt++MM1o+rHVNeOHqm96549d95775177rmrc1zTK6PH"
+        "jGt8ZcwYLu1wvh4oj41m621qG8brTDLM3HDfX6SZp1ip8FTQQikT5aZzLmEibne55LraTF2LaW2SyZE7vao6JT++pqS4/lZ0sg3L"
+        "qt0zSysycqPYLRNGzh5hNIXb8i1B+SUjSgy6poVF7huqNdXXlUQZI4alxAV1+karvIdNGThaFWNTm8stxKU2+ctmuWNW1t7aXFFZ"
+        "bym0bvrUA3V5PyVnanHVzdqiBQ0GbVF1eY7Gkha1qUvX+WyHzj5mRHjNPDfkyrWhFSVpuDbNRrZ80mKymRifubBOz66zXyxb5tl5"
+        "ynB084Nsu6emczMjttDzNOeSj7IKkTZtEC75iENtEzPWwNEOyxl3c8W66qqq+npXoj029BF2yrPToLEWppS3lo1YoS1eWKcJy6+v"
+        "H64pqtLFhrONy34aEasrmNcY3the4tODKrRHEh/Z9ffENqVVnFd6ZrtvAMSKWlZU1N7SjGHAuuKa6pEGfV112fyKqq7mESOTyhzp"
+        "5UkjtaULa/8+8aaigjk1jvK68gZjcsENdeG1C0o6q9yhKYVmc2FKqLtKGTNIBmXUzN/hRIlWUfGSbg83/tWziV24EKGJS3Xb2GO6"
+        "zm2e2pjkOP7GPwF1KEUdUshJlQG1cLuypf4di/9NyYD5Vn+Nz2xZVWt1xsRkJ1auGDNmRWViVmxsvrV2VUvtqJH1dY2jaivqGsrL"
+        "G+q0udPLw3NHJKsNocmljnD3+Jyc8e5wR2lyqEGdPCI3vHx6bqcrMzTTJU6sNNsR6sgWJy75NKGTgZJ3+l4pyH1Uf9ZV+YWBTIJL"
+        "LvOS6poGg762prQNMm8RbdHoKEsaOQLiL9cKkdeXKSKvaytRmoK1c6EXVVYW8QbgvYpXwyZJ59Af89G9eNMmBmvCSe/OGj4869lV"
+        "8fGrzg/PUpmzhrebLzvM7cK/Ip1FSedy5iOhePMkv6PT8STP8sTn283ScXP78KxLn2YN5+mSke4A0tl8b/ZEssByMcE2yRnxbiI2"
+        "a3j80qXxgo0Mm05nyxDMsMLErkRWyDnyfG3NNmRbPV+DMZmv5+T8J/szdtn6ilIyVorS9eX6rK8k8MwMIk9m4Kx7jqAszxGZ/3zk"
+        "v0Gut9w78ZYyya8inWzDkm2jR29bsgh/55sfX82iVz/e3L7mDs/ZO9bw1SmknSCnnehS3mK6xAgKrby4vX1xx0OjRz90HgmY9o41"
+        "7cjA04MMiHl7vUXsQXn0V8+cTMfs3Z6Th1XrL60Wb1m8GnpdZeehk/lboe7zQQnfnhHvMPwh8MzjEaYS4d3dbDF7ydNweQc/98+/"
+        "FvmzaM/JbmYXBWBcW8juol6MYNU0FpkmyBR2VDoSlCpTiId85AvhcYMiaSyzS+7X6TvT59BYSeKxaED8wXJHTQu9Z+kc7eE93eSA"
+        "975b093u9LTCQq3L4XBxkIi7iHrpOT7+EJoglMDX1dnGpGbr01yutPSCjgdqsi25KWn5zoylHbx0XgbzhNiphfjuFJxZs6AvEvRU"
+        "mUIh4J3k+NKXtCdIjs9DL8rp2DmxPinyE7KFd7sZ8lcHcD7x1hEK71+w4x7HOX8FeLoiXp6cjrerSqSQa4F0SJOGtIfZe55s6VBf"
+        "zSXR58XCvyRTrjyTUt6JK767r6/1vxQPZOnd9Gx9Vm5igS15eNK6mmUN9UsqMqtteoO2PM3tTksHp7HOquhQU25aYnp0bG5ytLF2"
+        "rqtgRmnp6Bx9aGhMtOFcIC8Or0OyoBaCl1rl/YHgR7w1FsXLs2mFEhJYTWbxl74+LSeQrTIwkg6GjouSc3W8ZK1RMJaT7mfshkLp"
+        "g0CdqKFDrJ0VcT2/GR1MDUs71Nkp06WgQPrrfrqqIIAu9YKONtfSr+koWxOEVvaeoLcRs4iWsCnsPtHGvrckiogPp1WmplSlOypT"
+        "UquW2KvS0yrtKZUOPHKOKr0zpQzvMWG7KKGS9exEydxyi1QvoQ1raXxg7+zrFGy+ty22/i8NXGIc2Te+8b+tcJpU/bo6Kfy+txe3"
+        "H747unt/26RJxTn5htBhuSkjpuflTC5JyTVrDCu1+qDEuMr187TztowZ+3D7sb/kFRfn5RUVHV50+K7Yu95sX7B/TeOC5XaLZEo2"
+        "VXfU6uo6qgxmQ6nnUb3e7W64/q7Gph8u0i3aOrqTZTdVhVc1iRNqlgC1qIQ9WPk8f6lPI1y+N0sm5YWh0zdbSHUqb5P+Wn5dwbDC"
+        "pPyKwutKF03KKknMSZjdPWPGZ/PmZZaOyJpYklHh0GgjG8vKJmS05eYkOYzTprV53ms7lJ+XnwdJZ9IF1otyc+AJXc4Yd2qqOwZn"
+        "lKKOcbtj1DijuFR1TIw6FWeYiTtVrU5145zZ3BBc6i4oSo+IaIyISC8qcJcGNzQPRmQvfk+EACL0SKwHqbrga/g+BjWbSfcQDUKv"
+        "pjcHoYewpol91JV+6tpZfdQtfmpLQNyZfuqCmwbLty6Aus/PxVL6mcyFd5J0p7TfT1/EfiM8HeKrTOLdoonPA8SIFQNgXKNwVQFq"
+        "djPb5um5eJElXLrcs8qw9I7d+coKjbS/zvPoyu08/3z4jGn8jQkFifwb6QWS6WelaYLLIEUqxwehQypzB6OODKBu8ecxjt4XeSgr"
+        "UqAHi9hdZ/1UkYdMHTklMG4I3STSilUoEStExJq54koq53bvoLGbKgajjgygbvFTWwKoM/3UBTMGy6FuxpU58Po+L3OBNtSI+oYo"
+        "bVgzQJahMnfzr6SqWR3dTv2lGarkftxfx2YRP0zOhWukF/2htEOUKVNvPsqpvLd8T8TVyNJ7T/SqcI7aAGq1lsc9CGpNALVpB6f+"
+        "HtThQv9l6tpn+uJu8VNbRNzToKYJ2cnUBS/x0py4/0NA3HFDFBnRGcGvTF1k7suhj4c6kQNfgRsnqEOEJJroWVLqIYUIekRfPXyr"
+        "ZgpVzRq43GBBocraTbC8SsnX01JSU2I2rmcVl8+ksRlpYmXtz2N3jx0sl7EswnNWoc8QZUYqmnfC3yp9dOhYax91pZ+69iZfy3aK"
+        "uDrFMz1Og9Gr6aNB6GiZhX3UlX7q2uV91C1+aktA3Jn+nBfQhkFLnEOPDEqv88d/AvQIf+7LJojZLnxTsvBN8QN8k/IGxKSs7LIN"
+        "Pg/lmbNz796dHbNmdSgu6sntFY880XHjdU3X3ajIrUmUH6VI4pd+KffRIeVaThWrZoJq7Be7Px1yqx2M6svDwVfe/Hk0Km0iVr9E"
+        "bJMcu9xPFdohU7uE7xDrYCJutNKuj9Jg9Go6OQgd/LX1UVf6qWuX9lG3+KktAXFn+nNeQOsHLbGuH32fn76UXh80/hx6WKFP4it7"
+        "fvoiViXoYiVOxI9VLPJPgh7q7+vilJoeGISOmrb0Ubf4qS0tvh7AKOLGK3k8T1fS0RJlfdQt/tjjaDcFrjCbaCgfXwbu4PC9sA6G"
+        "DzgkLy3vkBeaPafX3y2vLHcpS813i6UAecyorJlH9181jxHzHz66tlV9e5dhPbBjZsKtpfmBy+iH28xVUwpKkU8yJL1H8JV41f0E"
+        "yh27afnG9WVFruIWltyy1vMAv2hXLDQaA3cXsGYWhLtLXBZiPVG0VoKQ0HXzrqSq2XB6igaLPSqvj7rPT+0u7aMe8lPHDO+jbvdT"
+        "20YPlm/tqD7qZ34uOukuhYtJUoGYESYoGrZY7FVCfFUF5jaxZKNKauib3wxcVEvpWxKNkWda/RdQY/h7Y60UJa+9SfPrbywpmV/d"
+        "MNfl+alUUeB0RVwX5WryTHdVrrFnZCVOXrJo8ob83Ox8TYe2cEp52ajYhOiwhLC0kW+cYBjIF2sbbhk5cnlN1ZLqspzyjOjq+Pxh"
+        "rWV56sT4eGvruKbRzYnW7MwkvtRqN//i5UiHhQ3PKXQLPYV/SRP1NCv+5UFZq/l6qJCWWWmdVweho3XqB6PWB1CP+PMYS78QO3ez"
+        "vf+QilQ6yDCVzwdqQ3xv8AohFbtYtFDe2vV7bYexO3OOXlFV3lrmrIkxRK2dndbx0Oiq5WNSS21ilcha/HCJllUsb9KMWlzOmDV+"
+        "zDLrvJR7f90xd0PNEmtVTlB9U1N9UN1otifj/UyFP8wOMIsfJvfIUoO/jt2iNjL9Fib56TGCbpH1uPNKKpfU3kFjjyofjFofQD3k"
+        "p46p66Nu91Pbpg2WQ608PoW+xoh2tCj6GhfAxRE/fawynhfrWCIXq8zdrMGotSv7qEcUKs/j9zwP7xt8bVB4PpvsPX9EYr+0WOX0"
+        "U285weP+G/fvcqqyTnrduzwuf72mD6AO1yv5stoA6iieL+bLxAq4B1Co3bs49W1Qy7jkFOqYpziVf7GVziWnUNte5qUVYGz3uX+t"
+        "1s7XavkIbxhP8TFSZASUWftLTn3TW8TqBVVexx31mH8dl/Uq67imQdZxWe8v5WVclMo3q0QKKaXKo8FIzgtf2VstdC9VGQ1+IPoH"
+        "jF+Ut3Jq9A8YBzL4c1cKuz7F4+1+ddTuUZ6HuetXcvhFQA5j6SvPRpmuyD+9n+X2p/tsVKbu81O7x3GqS7RsgZ9a4/XpUqHIwSG3"
+        "YfeVVF7eazRY7FGNfdR9fmr3xD7qIT91zLg+6nY/ta11sHxnrxqMWjtXpr4MqtNPXW6X/c9Z1XPw4amoZ2n/dRD/KnqAJ7fxnScD"
+        "FxFSlD0TGfVLq6uX1tfPSTSYZ5X22zpRMLmqeu5QQ+KcCmUVmzWLrRRlvtVsV1aWK3A7RWFmlitgafv3GQWFSjt3iJplyTYyVxnp"
+        "8R0Xfmp9L6eK1V9BzVba4gd0JR1tkTgYtV6hOvgKsp/auFjoPOS7VDrik1eqO7pv/5foAP1bcOWNBwFvG/nbPv9WsGdHTMoL6wzN"
+        "SktON1hjHZnpSZbYVGd6UqWju6aruXxOkTkvPjQsbqij2p47TZtRmZRidaSbjfFRoZG6/CRbVow+a1hiclJTpaeZPTdtbXVGU25G"
+        "WYYhWKPWhoVFOiry8pqzfDtSlsGOtAN3pOjXL1wodqP49qJcPsJrzeMfk75BrXNke2Rp8E5SwIp29KBr2il8M1XfurbnbrYucG37"
+        "2IQJ8qzygmQVks4NsJz+1D7LGRhbthyZus9PlS1Hph7yU2XLkanb/VTZcgbmK9uITP3Mz0Un7RyUC9nO+DuEGtbrj72IdYvYYlVd"
+        "xM4X9FHKPEWsfgt6wYA6BtL76lik1KYgoDZirVvEdSl53E9X0qG/CX3UI/7YY/n7Nd8uEWhEDF8XnjxgH9ngu0QCNpL5t4mI7UWH"
+        "VesD95JduVFEKU/eOWO52t6ZgDF6/200K8YldJfmX7GZ5nC7uXxKfrnclxWxT6Uj8P7JYuUhhWlELa1sArtPOoSeGmYwfsDAs7Aw"
+        "cOdeav+Nez92NzQWT423DLMEjx0yqqpqXFRSVdwwKVwV7dDZ0lui4xPYhOFu13BdnAX2mDa8uvZ2U0OsKSzO2GhNGRKjN/DJJ1lQ"
+        "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"
+        "ynfLEX9THyT2yuXgjvctOUT/D7JWNFg="
+    ),
+}
+
+# Logo de l'application (PNG 256 px)
+_ICON_B64 = (
+    "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"
+)
+
+# ------------------------------------------------- monitoring, alertes, dialogues
+def probe_stream(url, thr=-50.0, secs=5):
+    """Écoute `secs` secondes d'un flux. Retourne (statut, détail) :
+    statut = "ok" (audio présent) ou "down" (inactif ou silence)."""
+    if not shutil.which("ffmpeg"):
+        return "down", "ffmpeg introuvable"
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-rw_timeout", "10000000",
+           "-t", str(secs), "-i", url, "-vn", "-af", "volumedetect", "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=secs + 30, stdin=subprocess.DEVNULL,
+                           creationflags=0x08000000 if SYS == "Windows" else 0)
+    except subprocess.TimeoutExpired:
+        return "down", "Flux inactif : délai dépassé"
+    except Exception as e:
+        return "down", f"Erreur : {e}"
+    m = re.search(r"max_volume:\s*(-inf|-?[\d.]+)\s*dB", r.stderr)
+    if not m:
+        lines = [ln.strip() for ln in r.stderr.splitlines() if ln.strip()]
+        why = lines[-1][:90] if lines else "aucune réponse"
+        return "down", f"Flux inactif : {why}"
+    level = -99.0 if m.group(1) == "-inf" else float(m.group(1))
+    if level > thr:
+        return "ok", f"Audio présent (crête {level:.0f} dB)"
+    return "down", "Connecté mais pas d'audio (silence)"
+
+
+def fetch_listeners(url):
+    """Icecast : nombre d'auditeurs d'un flux via status-json.xsl (None si inconnu)."""
+    m = re.match(r"^(https?://[^/]+)(/[^?#]*)?", url)
+    if not m or not m.group(2):
+        return None
+    base, mount = m.group(1), m.group(2)
+    try:
+        req = urllib.request.Request(base + "/status-json.xsl",
+                                     headers={"User-Agent": "Bev/2.0"})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        src = data["icestats"].get("source") or []
+        for s in [src] if isinstance(src, dict) else src:
+            if s.get("listenurl", "").endswith(mount):
+                return int(s.get("listeners", 0))
+    except Exception:
+        pass
+    return None
+
+
+import smtplib
+import unicodedata
+from email.message import EmailMessage
+
+
+def norm_txt(s):
+    return "".join(c for c in unicodedata.normalize("NFD", s.lower()) if unicodedata.category(c) != "Mn")
+
+
+def log_class(msg):
+    m = norm_txt(msg)
+    if any(k in m for k in ("erreur", "impossible", "inactif", "aucun signal", "panne", "echec", "non envoye",
+                            "refus", "perdu", "coupee")):
+        return "bad"
+    if any(k in m for k in ("retabli", "retrouve", "installe", "en direct", "passe par", "reussi", "ok")):
+        return "ok"
+    if any(k in m for k in ("bascule", "secours", "conseil", "retard", "dump", "alerte", "mute")):
+        return "warn"
+    return "info"
+
+
+class Alerts:
+    """Alertes : bip + message (Discord / Slack / ntfy / URL), mail et SMS pour les pannes."""
+    KINDS = ["Discord", "Slack", "ntfy", "Générique (JSON)"]
+    SMS = ["Free Mobile", "Twilio"]
+    OUTAGE_S = 60
+
+    def __init__(self, app):
+        self.app = app
+        self.last = {}
+
+    def cfg(self):
+        return self.app.data["alerts"]
+
+    def send(self, text, key=None, force=False, urgent=False):
+        c = self.cfg()
+        if key and not force:
+            if time.time() - self.last.get(key, 0) < 120:
+                return
+            if ((key.startswith("out-") and not c.get("on_output", True)) or
+                    (key.startswith("fallback") and not c.get("on_fallback", True)) or
+                    (key.startswith("mon-") and not c.get("on_monitor", True))):
+                return
+        if key:
+            self.last[key] = time.time()
+        self.app.log("" + text)
+        if c.get("sound", True):
+            self.app.ui(self.beep)
+        url = (c.get("url") or "").strip()
+        if url:
+            threading.Thread(target=self.post, args=(c.get("kind", "Discord"), url, text),
+                             daemon=True).start()
+        if urgent:
+            if c.get("mail_on"):
+                threading.Thread(target=self.mail, args=(text,), daemon=True).start()
+            if c.get("sms_on"):
+                threading.Thread(target=self.sms, args=(text,), daemon=True).start()
+
+    def channels(self):
+        c = self.cfg()
+        out = []
+        if (c.get("url") or "").strip():
+            out.append(c.get("kind", "Discord"))
+        if c.get("mail_on") and c.get("mail_to"):
+            out.append("mail")
+        if c.get("sms_on") and c.get("sms_to"):
+            out.append("SMS")
+        return out
+
+    def beep(self):
+        """Bip d'alerte joué en arrière-plan (winsound.Beep bloquait l'interface 0,3 s à chaque alerte)."""
+        if SYS == "Windows":
+            def b():
+                try:
+                    import winsound
+                    winsound.Beep(880, 300)
+                except Exception:
+                    pass
+            threading.Thread(target=b, daemon=True).start()
+        else:
+            QApplication.beep()
+
+    def post(self, kind, url, text):
+        try:
+            hdr = {"User-Agent": "Bev/2.0", "Content-Type": "application/json"}
+            if kind == "Discord":
+                body = json.dumps({"content": "" + text}).encode()
+            elif kind == "Slack":
+                body = json.dumps({"text": "" + text}).encode()
+            elif kind == "ntfy":
+                body, hdr["Content-Type"] = text.encode("utf-8"), "text/plain; charset=utf-8"
+                hdr["Title"] = APP
+            else:
+                body = json.dumps({"message": text, "source": APP}).encode()
+            urllib.request.urlopen(urllib.request.Request(url, body, hdr), timeout=8).read()
+        except Exception as e:
+            self.app.log(f"Alerte non envoyée ({kind}) : {e}")
+
+    def mail(self, text):
+        c = self.cfg()
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = "" + APP + " : " + text[:70]
+            msg["From"] = c.get("mail_from") or c.get("mail_user") or "radio@localhost"
+            msg["To"] = c["mail_to"]
+            msg.set_content(text + "\n\n" + time.strftime("%d/%m/%Y %H:%M:%S"))
+            port = int(c.get("mail_port") or 587)
+            if port == 465:
+                s = smtplib.SMTP_SSL(c["mail_host"], port, timeout=15)
+            else:
+                s = smtplib.SMTP(c["mail_host"], port, timeout=15)
+                if c.get("mail_tls", True):
+                    s.starttls()
+            if c.get("mail_user"):
+                s.login(c["mail_user"], c.get("mail_pw", ""))
+            s.send_message(msg)
+            s.quit()
+            self.app.log("Mail d'alerte envoyé à " + c["mail_to"])
+        except Exception as e:
+            self.app.log(f"Mail non envoyé : {e}")
+
+    def sms(self, text):
+        c = self.cfg()
+        try:
+            if c.get("sms_provider") == "Twilio":
+                data = urllib.parse.urlencode({"From": c.get("sms_from", ""), "To": c["sms_to"],
+                                               "Body": text[:300]}).encode()
+                req = urllib.request.Request(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{c['sms_user']}/Messages.json", data)
+                tok = base64.b64encode(f"{c['sms_user']}:{c.get('sms_key', '')}".encode()).decode()
+                req.add_header("Authorization", "Basic " + tok)
+            else:  # Free Mobile : le numéro est celui du compte, « sms_to » sert de mémo
+                q = urllib.parse.urlencode({"user": c["sms_user"], "pass": c.get("sms_key", ""), "msg": text[:300]})
+                req = urllib.request.Request(c.get("sms_url") or "https://smsapi.free-mobile.fr/sendmsg?" + q)
+            urllib.request.urlopen(req, timeout=15).read()
+            self.app.log("SMS d'alerte envoyé à " + c["sms_to"])
+        except Exception as e:
+            self.app.log(f"SMS non envoyé : {e}")
+
+DAB_BITRATES = ["32", "48", "64", "72", "80", "88", "96", "104", "112", "120", "128", "160", "192"]
+REC_FORMATS = list(RecordOutput.CODECS)
+
+# (clé, libellé, type, options)
+FIELDS = {
+    "internet": [
+        ("name", "Nom du flux", "entry", None),
+        ("protocol", "Protocole", "combo", ["Icecast", "Shoutcast"]),
+        ("host", "Serveur", "entry", None),
+        ("port", "Port", "entry", None),
+        ("sc_port", "Port source Shoutcast (vide = port + 1)", "entry", None),
+        ("mount", "Mountpoint (Icecast)", "entry", None),
+        ("user", "Utilisateur (Icecast)", "entry", None),
+        ("password", "Mot de passe source", "password", None),
+        ("genre", "Genre", "entry", None),
+        ("desc", "Description", "entry", None),
+        ("format", "Format", "combo", list(FORMATS)),
+        ("bitrate", "Débit (kbps)", "combo", BITRATES),
+        ("channels", "Canaux", "combo", ["2", "1"]),
+        ("processing", "Traitement audio", "combo", list(PROCESSING)),
+        ("reconnect", "Reconnexion automatique", "check", None),
+    ],
+    "fm": [
+        ("name", "Nom du flux", "entry", None),
+        ("device", "Carte son de sortie (vers l'émetteur)", "devices", None),
+        ("processing", "Traitement audio", "combo", list(PROCESSING)),
+        ("rds", "Envoyer le texte RDS", "check", None),
+        ("ps", "PS - nom de station (8 caractères max)", "entry", None),
+        ("rds_mode", "Transport RDS", "combo", ["Fichier / pipe", "UDP", "TCP"]),
+        ("rds_target", "Cible RDS (fichier, ou hôte:port)", "file", None),
+        ("rds_template", "Modèle du message ({PS} {RT}, \\n = ligne)", "entry", None),
+        ("reconnect", "Reconnexion automatique", "check", None),
+    ],
+    "dab": [
+        ("name", "Nom du flux", "entry", None),
+        ("mode", "Mode", "combo", ["ODR-AudioEnc", "AAC réseau (UDP/RTP/TCP)"]),
+        ("profile", "Codec DAB+", "combo", ["HE-AAC (SBR)", "HE-AAC v2 (SBR+PS)", "AAC-LC"]),
+        ("bitrate", "Débit (kbps)", "combo", DAB_BITRATES),
+        ("processing", "Traitement audio", "combo", list(PROCESSING)),
+        ("odr_path", "Programme odr-audioenc", "file", None),
+        ("dest", "Destination ODR (ex. tcp://127.0.0.1:9000)", "entry", None),
+        ("extra", "Options ODR supplémentaires", "entry", None),
+        ("net_url", "URL réseau (ex. udp://192.168.1.20:5004)", "entry", None),
+        ("net_format", "Conteneur réseau", "combo", ["mpegts", "adts", "rtp"]),
+        ("dls_file", "Fichier texte DLS (pour odr-padenc -t)", "file", None),
+        ("reconnect", "Reconnexion automatique", "check", None),
+    ],
+    "record": [
+        ("name", "Nom du flux", "entry", None),
+        ("folder", "Dossier d'enregistrement", "folder", None),
+        ("format", "Format", "combo", REC_FORMATS),
+        ("bitrate", "Débit (kbps)", "combo", BITRATES),
+        ("rotate", "Nouveau fichier toutes les (minutes)", "entry", None),
+        ("keep_days", "Conserver (jours, 0 = illimité)", "entry", None),
+        ("processing", "Traitement audio", "combo", list(PROCESSING)),
+        ("reconnect", "Relancer automatiquement", "check", None),
+    ],
+}
+ADV = {"internet": ("sc_port", "user", "genre", "desc", "channels", "processing", "reconnect"),
+       "fm": ("processing", "rds", "ps", "rds_mode", "rds_target", "rds_template", "reconnect"),
+       "dab": ("profile", "processing", "odr_path", "extra", "net_format", "dls_file", "reconnect"),
+       "record": ("bitrate", "keep_days", "processing", "reconnect")}
+HINTS = {
+    "internet": "Les infos du serveur de streaming : adresse, port, point de montage et mot de passe source.",
+    "fm": "Choisis la carte son reliée à l'entrée de ton émetteur ou processeur FM. Le RDS se règle dans les réglages avancés.",
+    "dab": "Envoie l'audio à ton multiplex DAB+ (ODR-AudioEnc) ou en AAC sur le réseau. Les autres options sont dans les réglages avancés.",
+    "record": "Garde une trace de tout ce qui part à l'antenne, découpée en fichiers. Pour la pige ARCOM, utilise l'onglet Enregistrement.",
+}
+
+def key_token(e):
+    """Nom court de la touche pressée (F5, q, 7, KP_1…) pour les raccourcis du cartoucheur ; '' si inutilisable."""
+    if e.state & 0x4 or e.state & (0x20000 if SYS == "Windows" else 0x8):  # Ctrl ou Alt : réservé aux raccourcis du système
+        return ""
+    ks = e.keysym
+    if re.fullmatch(r"F\d{1,2}", ks):
+        return ks
+    if ks.startswith("KP_") and len(ks) > 3 and ks[3:].isalnum():
+        return ks
+    ch = e.char
+    if len(ch) == 1 and ch.isprintable() and not ch.isspace():
+        return ch.lower()
+    return ""
+
+
+def key_label(t):
+    return {"": "", "KP_Add": "Pavé +"}.get(t, t.upper() if len(t) == 1 else t.replace("KP_", "Pavé "))
+
+
+def midi_token(msg):
+    t = getattr(msg, "type", "")
+    if t == "note_on" and msg.velocity > 0:
+        return f"n{msg.note}"
+    if t == "control_change" and msg.value >= 64:
+        return f"c{msg.control}"
+    if t == "program_change":
+        return f"p{msg.program}"
+    return ""
+
+
+def midi_label(t):
+    return "" if not t else {"n": "note ", "c": "contrôleur ", "p": "programme "}.get(t[0], "") + t[1:]
+
+
+class MidiListener:
+    """Écoute toutes les entrées MIDI (pads, consoles) si le module « mido » est présent."""
+
+    def __init__(self, cb):
+        self.cb, self.ports, self.err = cb, [], ""
+
+    def start(self):
+        self.stop()
+        self.err = ""
+        try:
+            import mido
+            for name in mido.get_input_names():
+                try:
+                    self.ports.append(mido.open_input(name, callback=self._msg))
+                except Exception as ex:
+                    self.err = str(ex)[:100]
+        except Exception as ex:
+            self.err = str(ex)[:100] or "module absent"
+        return len(self.ports)
+
+    def _msg(self, msg):
+        t = midi_token(msg)
+        if t:
+            self.cb(t)
+
+    def stop(self):
+        for p in self.ports:
+            try:
+                p.close()
+            except Exception:
+                pass
+        self.ports = []
+
+# ---------------------------------------------------------------- application
+ADVICE = [
+    (r"401|Unauthorized|Mot de passe refusé", "Mot de passe, utilisateur ou mountpoint refusé par le serveur : vérifie-les dans le flux."),
+    (r"Connection refused|refusée", "Serveur injoignable : vérifie l'adresse, le port et le pare-feu du serveur."),
+    (r"timed out|Délai|délai", "Pas de réponse à temps : serveur éteint, mauvais port ou connexion réseau coupée."),
+    (r"404|Not Found", "Adresse ou mountpoint inexistant sur le serveur."),
+    (r"Permission denied|Access is denied|Accès", "Accès refusé : autorise le micro pour les applications de bureau (Windows > Confidentialité) ou les droits du dossier."),
+    (r"Unknown encoder|Encoder .* not found", "Ton ffmpeg n'a pas cet encodeur : installe une version « full » (gyan.dev)."),
+    (r"sounddevice manquant", "Installe le module de sortie son depuis l'onglet SOS (bouton « Installer sounddevice »)."),
+    (r"odr-audioenc introuvable", "Indique le chemin complet de odr-audioenc dans le flux DAB+."),
+    (r"Could not find|introuvable|No such file|Lecture impossible", "Fichier ou périphérique introuvable : revérifie le nom ou le chemin."),
+    (r"Address already in use|already in use", "Ce port ou cette adresse est déjà utilisé par un autre programme."),
+    (r"Entrée audio indisponible|Capture impossible", "L'entrée audio ne répond pas : rebranche-la ou choisis-en une autre dans la liste."),
+    (r"Aucun signal", "Pas de signal en entrée : vérifie le niveau, le câble, ou le seuil de silence."),
+]
+FAQ = """Démarrage rapide
+ 1. Onglet Diffusion : choisis ton entrée audio, ajoute une ou plusieurs sorties (Internet, FM, DAB+, Enregistrement), puis ▶ DÉMARRER.
+ 2. Playlist de secours : coche l'option et ajoute des fichiers ; l'app bascule seule si le signal disparaît, avec un fondu enchaîné.
+ 3. Monitoring : ajoute des adresses de flux ; rond vert = audio présent, rond rouge = inactif ou silence.
+
+Problèmes fréquents
+ • Liste d'entrées vide : ffmpeg est absent ou ne voit pas le micro (autorisations Windows, bouton ↻).
+ • 401 / mot de passe refusé : vérifie le mot de passe source et le mountpoint.
+ • Rien en entrée sous Windows : choisis « Son de l'ordinateur » (bouton d'activation sous la liste).
+ • Ça saccade : baisse le débit, ferme les programmes lourds, vérifie la sortie en erreur dans la liste.
+"""
+
+# ------------------------------------------------------------ mise à jour + mini Radiobot
+VERSION = "1.0.0"
+UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
+
+
+def parse_ver(s):
+    """'v1.2.3-beta' -> (1, 2, 3) ; comparaison de versions."""
+    nums = re.findall(r"\d+", str(s).split("-")[0])[:4]
+    return tuple(int(n) for n in nums) or (0,)
+
+
+def check_update(repo, timeout=10):
+    """Dernière Release GitHub : {'tag','url','notes','asset'} ; en cas d'échec {'error': message clair}."""
+    import urllib.request
+    import urllib.error
+
+    def get(url):
+        rq = urllib.request.Request(url, headers={"User-Agent": "Bev-update-check", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(rq, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    repo = str(repo).strip().replace("https://github.com/", "").strip("/")
+    if repo.count("/") != 1:
+        return {"error": "Le dépôt doit s'écrire « compte/depot » (par exemple monpseudo/bev)."}
+    try:
+        try:
+            js = get(f"https://api.github.com/repos/{repo}/releases/latest")
+        except urllib.error.HTTPError as ex:
+            if ex.code != 404:
+                raise
+            lst = [x for x in get(f"https://api.github.com/repos/{repo}/releases?per_page=10") if not x.get("draft")]
+            if not lst:
+                return {"error": "Aucune version n'est publiée sur ce dépôt (ou le dépôt est privé : il doit être public). Crée une Release GitHub pour que les mises à jour soient détectées."}
+            js = lst[0]
+        exts = (".exe",) if SYS == "Windows" else ((".dmg", ".zip") if SYS == "Darwin" else ())
+        asset = next((a.get("browser_download_url") for a in js.get("assets", []) if str(a.get("name", "")).lower().endswith(exts)), "") if exts else ""
+        return {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(), "asset": asset}
+    except urllib.error.HTTPError as ex:
+        if ex.code == 404:
+            return {"error": f"Dépôt « {repo} » introuvable. Vérifie son nom, et qu'il est public."}
+        if ex.code in (403, 429):
+            return {"error": "GitHub limite temporairement les demandes (trop d'essais). Réessaie dans quelques minutes."}
+        return {"error": f"GitHub a répondu avec l'erreur {ex.code}."}
+    except Exception as ex:
+        return {"error": "Impossible de joindre GitHub (pas d'accès à Internet, pare-feu ?). Détail : " + str(ex)[:120]}
+
+class AssistantKB:
+    # --- connaissances
+    def state(self):
+        a = self.app
+        e = a.engine
+        if not a.on_air:
+            if a.preview:
+                return "Tu es hors antenne (contrôle de l'entrée ou cartoucheur seul). Clique sur Démarrer pour émettre."
+            return "Tu es hors antenne. Choisis l'entrée, ajoute au moins un flux, puis clique sur Démarrer."
+        if e.mute:
+            mode = "l'antenne est COUPÉE (mute)"
+        elif e.tone:
+            mode = "la tonalité 1 kHz est à l'antenne"
+        elif e.backup:
+            mode = "la playlist de secours passe" + (f" ({e.track})" if e.track else "")
+        elif e.silent_ms >= 1000:
+            mode = f"aucun signal d'entrée depuis {e.silent_ms // 1000} s et rien pour le remplacer"
+        else:
+            mode = "le direct passe normalement"
+        outs = [f"{o.cfg['name']} : {o.status_text()}" for o in e.outputs if o.cfg.get("enabled", True)]
+        return f"En antenne depuis {fmt_dur(time.time() - e.started)} ; {mode}.\nFlux :\n • " + "\n • ".join(outs or ["aucune"])
+
+    def internet(self):
+        a = self.app
+        act = getattr(a, "net_active", None)
+        if not act:
+            return "Je ne sais pas encore quel lien Internet est utilisé (détection en cours, ou module psutil absent)."
+        st = a.net_stats.get(act) or {}
+        q = quality(st)[0] if st else "inconnue"
+        return f"Internet passe par « {a.net_label(act)} » ({a.net_kind(act)}), qualité {q.lower()}."
+
+    def alerts(self):
+        ch = self.app.alerts.channels()
+        base = "Une panne de plus d'1 minute (flux en erreur, plus de signal sans secours) déclenche un message."
+        return base + ("\nActuellement actif : " + ", ".join(ch) + "." if ch else "\nRien n'est configuré pour l'instant.")
+
+    def diagnose(self):
+        a, e = self.app, self.app.engine
+        L = []
+        L.append(("OK" if shutil.which("ffmpeg") else "Problème") + " : ffmpeg " + ("trouvé" if shutil.which("ffmpeg") else "introuvable"))
+        L.append("OK : entrée audio « %s »" % (a.device_name() or "?") if a.device_name() else "Problème : aucune entrée choisie")
+        if e:
+            bad = [o for o in e.outputs if o.cfg.get("enabled", True) and o.state == "error"]
+            L.append(("Problème : %d flux en erreur (%s)" % (len(bad), ", ".join(o.cfg["name"] for o in bad))) if bad
+                     else "OK : flux actifs sans erreur")
+            L.append(("Problème : " if e.silent_ms >= 3000 else "OK : ") + ("pas de signal depuis %d s" % (e.silent_ms // 1000) if e.silent_ms >= 3000 else "signal d'entrée présent"))
+            L.append(("Problème : %d blocs en retard" % e.late) if e.late > 20 else "OK : calcul audio fluide")
+        else:
+            L.append("Info : hors antenne, flux non testés")
+        act = getattr(a, "net_active", None)
+        L.append(("OK : Internet via " + a.net_label(act)) if act else "Info : lien Internet non détecté")
+        L.append("OK : alertes " + ", ".join(a.alerts.channels()) if a.alerts.channels() else "Info : aucune alerte mail / SMS configurée")
+        acts = [("Diagnostic complet", a.run_diag)]
+        if e and any(o.state == "error" for o in e.outputs):
+            acts.insert(0, ("Redémarrer les flux", a.sos_restart))
+        return "\n".join(L), acts
+
+    def journal(self):
+        a = self.app
+        text = "\n".join(a.log_lines[-400:])
+        found = [adv for pat, adv in ADVICE if re.search(pat, text)]
+        if not found:
+            return "Rien d'anormal dans le journal récent."
+        return "Voici ce que je vois dans le journal :\n • " + "\n • ".join(found)
+
+    # --- base de connaissances (dépannage)
+    @staticmethod
+    def explain_error(detail):
+        d = (detail or "").lower()
+        for pat, adv in (("401", "mot de passe source refusé : vérifie le mot de passe du flux (celui de la SOURCE, pas de l'admin)"),
+                         ("403", "le serveur refuse : mountpoint déjà utilisé par une autre source, ou limite de sources atteinte"),
+                         ("404", "adresse introuvable : un Icecast répond 404 tant que rien n'est envoyé vers cette adresse. Vérifie que l'antenne tourne, que le flux est démarré (« Marche / arrêt ») et que le nom de l'adresse est le bon"),
+                         ("refused", "connexion refusée : le serveur ne tourne pas, ou le port est faux"),
+                         ("timed out", "délai dépassé : pare-feu, mauvais port ou serveur surchargé"),
+                         ("timeout", "délai dépassé : pare-feu, mauvais port ou serveur surchargé"),
+                         ("getaddrinfo", "nom d'hôte introuvable : vérifie l'adresse du serveur et ta connexion Internet"),
+                         ("name or service", "nom d'hôte introuvable : vérifie l'adresse du serveur et ta connexion Internet"),
+                         ("ssl", "problème de certificat / chiffrement : essaie le port sans SSL ou vérifie l'option SSL"),
+                         ("broken pipe", "le serveur a coupé la connexion : il va se reconnecter seul"),
+                         ("no such file", "fichier ou programme introuvable : vérifie le chemin indiqué")):
+            if pat in d:
+                return adv
+        return ""
+
+    def output_help(self):
+        e, a = self.app.engine, self.app
+        if not e:
+            return ("Erreurs de flux les plus fréquentes :\n • 401 : mauvais mot de passe SOURCE\n • 403 : mountpoint déjà pris ou trop de sources\n"
+                    " • 404 : adresse sans flux (flux arrêté, ou nom différent côté serveur)\n • connexion refusée : serveur éteint ou mauvais port\n • délai dépassé : pare-feu ou serveur injoignable\n"
+                    " • hôte introuvable : adresse fausse ou pas d'Internet\nDémarre la diffusion et je te dirai laquelle s'applique.")
+        L = []
+        for o in e.outputs:
+            if o.cfg.get("enabled", True) and o.state == "error":
+                adv = self.explain_error(getattr(o, "detail", ""))
+                L.append(f"• {o.cfg['name']} : {o.status_text()}" + (f"\n   → {adv}" if adv else ""))
+        if not L:
+            return "Tous les flux actifs sont en ligne ou en cours de connexion."
+        return "Flux en erreur :\n" + "\n".join(L) + "\nUne fois corrigé, redémarre les flux."
+
+    def kb(self):
+        a = self.app
+        e = lambda: a.engine
+        go = lambda k, lab: [(lab, lambda: a.go_tab(k))]
+        rs = [("Redémarrer les flux", a.sos_restart)]
+        T = []
+
+        def add(title, keys, fn):
+            T.append((title, keys, fn))
+        add("État de l'antenne", ["etat", "statut", "situation", "ca va", "tout va", "en ce moment", "antenne"],
+            lambda: (self.state(), rs if (e() and any(o.state == "error" for o in e().outputs)) else None))
+        add("Diagnostic", ["diagnostic", "verifie", "teste tout", "controle", "bilan", "check"], self.diagnose)
+        add("Analyse du journal", ["journal", "historique des erreurs", "analyse", "logs"], lambda: (self.journal(), None))
+        add("Flux en erreur", ["flux en erreur", "sortie en erreur", "flux", "erreur", "ne se connecte pas", "deconnecte", "serveur", "icecast", "shoutcast", "mot de passe", "401", "403", "refuse", "mountpoint", "connexion refusee", "timeout"],
+            lambda: (self.output_help(), rs))
+        add("Pas de son", ["pas de son", "silence", "plus de son", "rien ne sort", "muet", "inaudible", "ne s'entend pas", "on n'entend rien"],
+            lambda: ("Pas de son ? Je vérifie dans l'ordre :\n 1. Entrée : le vumètre « L / R » de la source bouge-t-il ? Sinon, change d'entrée.\n"
+                     " 2. Windows : Paramètres > Confidentialité > Microphone, autoriser les applications.\n 3. Le gain d'entrée n'est pas à -12 dB.\n"
+                     " 4. L'antenne n'est pas en mute (SOS).\n 5. Le seuil de silence du secours n'est pas trop haut.\n"
+                     + ("\nLà, tout de suite : " + self.state().splitlines()[0] if a.on_air else ""),
+                     [("Voir l'entrée", lambda: (a.go_tab("diff"), a.toggle_preview() if not (a.on_air or a.preview) else None)),
+                      ("Rétablir le son", a.sos_mute) if (e() and e().mute) else ("Aller à Diffusion", lambda: a.go_tab("diff"))]))
+        add("Aucune entrée détectée", ["aucune entree", "entree introuvable", "micro introuvable", "carte son introuvable", "peripherique", "detecte", "liste des entrees", "microphone"],
+            lambda: ("Aucune entrée détectée : branche le micro/la table de mixage puis clique sur ↻ à côté de la liste. Sous Windows, vérifie que l'appareil est "
+                     "activé (Son > Enregistrement) et autorisé. Tu peux aussi taper le nom exact de l'appareil dans la liste.", go("diff", "Aller à Diffusion")))
+        add("Son de l'ordinateur", ["son de l'ordinateur", "loopback", "capturer le son", "stereo mix", "mixage stereo", "audio systeme", "spotify", "navigateur"],
+            lambda: "Pour diffuser le son de l'ordinateur sous Windows, installe PyAudioWPatch (bouton « Activer la capture du son de l'ordinateur » dans Diffusion), "
+                    "puis choisis « Son de l'ordinateur » dans la liste des entrées.")
+        add("Son saturé", ["sature", "clip", "distorsion", "trop fort", "grésille", "gresille", "craque", "ecrete", "rouge"],
+            lambda: "Son saturé (CLIP) : baisse le gain d'entrée de quelques dB et vérifie que la table de mixage ne sature pas déjà. Vise des crêtes autour de -6 dB. "
+                    "Un limiteur doux est disponible dans le traitement du son (page « Traitement son »).")
+        add("Son trop faible", ["trop faible", "trop bas", "volume bas", "pas assez fort", "niveau bas", "gain"],
+            lambda: "Son trop faible : monte le gain d'entrée (+6 dB max), ou active le traitement du son (page « Traitement son » : normalisation / limiteur) pour une écoute plus homogène.")
+        add("Écho / larsen", ["echo", "larsen", "retour", "eco", "double son", "on s'entend"],
+            lambda: "Écho ou larsen : coupe le haut-parleur d'écoute pendant les prises de parole, ou écoute au casque. Si l'écho vient des auditeurs, ils entendent leur radio avec le retard "
+                    "du flux (10 à 30 s) : demande-leur de couper leur poste.")
+        add("Saccades", ["saccade", "coupure", "hache", "lag", "bug audio", "fluide", "ralenti", "lent", "freeze", "blocs en retard"],
+            lambda: ("Ça saccade : ferme les programmes lourds, installe numpy (calcul bien plus rapide), baisse le débit des flux Internet, vérifie la connexion."
+                     + (f"\nMesure actuelle : {e().proc_ms:.1f} ms de calcul par bloc de 20 ms, {e().late} blocs en retard." if e() else ""), go("net", "Ouvrir Réseau")))
+        add("Retard / latence", ["retard", "latence", "decalage", "delai", "delay", "dump", "en differe"],
+            lambda: "Les auditeurs entendent le son avec 5 à 30 s de décalage : c'est normal pour le streaming. Le « Retard de sécurité » (SOS) garde quelques secondes avant "
+                    "l'antenne ; « Supprimer l'audio retenu » efface ce tampon en cas de propos à ne pas diffuser.")
+        add("Internet", ["internet", "reseau", "wifi", "4g", "5g", "rj45", "ethernet", "bascule", "connexion", "lien", "debit", "ping"],
+            lambda: (self.internet(), go("net", "Ouvrir Réseau")))
+        add("Bascule réseau", ["bascule impossible", "administrateur", "droits", "changer de connexion", "basculer"],
+            lambda: ("La bascule automatique de connexion demande de lancer l'application en administrateur (Windows/Linux). Sans cela, elle te prévient et propose le lien à utiliser. "
+                     "Active-la dans Réseau avec « Bascule automatique ».", go("net", "Ouvrir Réseau")))
+        add("Titre affiché", ["titre affiche", "metadonnee", "metadata", "now playing", "titre en cours", "auditeurs voient", "nom du morceau", "pochette", "image"],
+            lambda: "Le titre affiché est envoyé aux flux Internet. Tape-le dans « Titre affiché » puis Envoyer, ou active « En secours, afficher le titre de la piste jouée ». "
+                    "L'image est envoyée par Image… (selon le serveur).")
+        add("FM / RDS", ["fm", "emetteur", "rds", "pifm", "carte son fm", "ps rt"],
+            lambda: "FM : dans le flux FM, choisis la carte son qui alimente l'émetteur. Le RDS (nom de station PS et texte RT) suit le titre en cours. "
+                    "Si la liste des cartes est vide, installe sounddevice (SOS > Plus).")
+        add("DAB+", ["dab", "mux", "odr", "multiplex", "audioenc", "padenc", "dls"],
+            lambda: "DAB+ : le flux envoie l'audio vers ODR-AudioEnc ou ton multiplexeur (TCP ou pipe). Vérifie le chemin d'odr-audioenc et l'adresse (ex. tcp://127.0.0.1:9000) dans Modifier.")
+        add("Le secours ne démarre pas", ["secours ne demarre", "secours ne se lance", "pas de secours", "secours ne marche", "playlist ne demarre", "bascule secours", "seuil"],
+            lambda: ("Le secours ne démarre pas : l'option « Passer en secours si le signal disparaît » doit être active, la liste non vide, et le silence doit durer plus que le délai "
+                     "(Options). Le seuil se règle sous le niveau normal de ton direct (ex. -50 dB).", go("diff", "Aller à Diffusion")))
+        add("Le secours ne s'arrête pas", ["secours ne s'arrete", "revenir au direct", "retour direct", "secours reste", "forcer"],
+            lambda: ("Retour au direct : le signal doit revenir au-dessus du seuil pendant le délai « Retour ». Si tu as lancé le secours à la main, clique « Revenir au direct ».",
+                     [("Revenir au direct", a.toggle_manual)]))
+        add("Secours : musique", ["secours", "playlist", "musique", "titre", "compteur", "moins lu", "jingle", "ajouter des morceaux"],
+            lambda: ("Secours : les titres et jingles les moins lus passent en premier (compteur « lectures »). Ajoute des fichiers avec ＋ Ajouter ou en les glissant sur la liste ; "
+                     "clic sur la pastille verte pour exclure un titre.", [("Lancer le secours", a.toggle_manual)]))
+        add("Fichiers illisibles", ["illisible", "format", "mp3 ne joue", "fichier ne joue", "codec", "m4a", "wma"],
+            lambda: "Fichier illisible : ffmpeg doit être installé et reconnaître le format. Essaie de convertir le fichier en MP3 ou WAV. Vérifie qu'il n'est pas déplacé ou protégé (DRM).")
+        add("Cartoucheur", ["cartouche", "cartoucheur", "touche", "pad", "sound board", "jingle", "pub", "f1"],
+            lambda: ("Cartoucheur : clic = jouer ou arrêter, clic droit = régler la touche (nom, couleur, volume, fondu). F1 à F12 au clavier, Échap = tout arrêter. "
+                     "Glisse des sons sur une touche pour les affecter.", go("cart", "Ouvrir le cartoucheur")))
+        add("Sortie audio du cartoucheur", ["sortie audio", "pre-ecoute", "preecoute", "casque", "ecouter avant", "sortie casque", "maj clic"],
+            lambda: ("Sortie audio : choisis-la dans le cartoucheur, puis Maj + clic sur une touche (ou joue hors antenne). Il faut le module sounddevice.", go("cart", "Ouvrir le cartoucheur")))
+        add("Glisser-déposer", ["glisser", "deposer", "drag", "drop"],
+            lambda: ("Glisser-déposer : fonctionne directement. Dépose des sons sur une touche ou des fichiers sur la liste de secours.", go("cart", "Ouvrir le cartoucheur")))
+        add("Enregistrement", ["enregistr", "record", "archive", "fichier de l'emission", "reecouter", "disque plein", "espace disque"],
+            lambda: ("Enregistrement : onglet Enregistrement. L'antenne est enregistrée en fichiers découpés (par défaut toutes les 60 min) dans le dossier choisi. "
+                     "Tu peux y écouter, renommer, supprimer, et régler le format et la durée de conservation.", go("rec", "Ouvrir Enregistrement")))
+        add("Alertes mail / SMS", ["alerte", "mail", "sms", "panne", "notification", "prevenir", "prevenu", "email", "webhook", "discord", "slack", "ntfy"],
+            lambda: (self.alerts(), [("Configurer les alertes", lambda: a.alert_dialog())]))
+        add("Mail : configuration", ["gmail", "smtp", "mot de passe d'application", "mail ne part pas", "587", "465", "authentification"],
+            lambda: ("Mail : pour Gmail, active la validation en 2 étapes puis crée un « mot de passe d'application » (pas ton mot de passe habituel). Serveur smtp.gmail.com, port 587 (STARTTLS) "
+                     "ou 465 (SSL). Teste avec le bouton Tester de la fenêtre d'alertes.", [("Configurer les alertes", lambda: a.alert_dialog())]))
+        add("SMS : configuration", ["free mobile", "twilio", "sms ne part pas", "sms free"],
+            lambda: ("SMS Free Mobile : active l'option « Notifications par SMS » dans ton espace abonné, puis copie l'identifiant et la clé dans la fenêtre d'alertes. "
+                     "Twilio : SID, jeton, numéro d'envoi et destinataire.", [("Configurer les alertes", lambda: a.alert_dialog())]))
+        add("ffmpeg", ["ffmpeg", "introuvable", "pas installe", "winget", "ffprobe"],
+            lambda: "ffmpeg est indispensable. Windows : winget install Gyan.FFmpeg puis rouvre l'application. Mac : brew install ffmpeg. Linux : sudo apt install ffmpeg.")
+        add("Performances", ["cpu", "processeur", "lourd", "numpy", "performance", "ventilateur", "chauffe", "memoire", "ram"],
+            lambda: ("Performances : installe numpy (calcul audio ~30× plus rapide), active « Réduire les animations » dans Réglages et ferme les autres logiciels lourds."
+                     + (f"\nMesure : {e().proc_ms:.1f} ms par bloc de 20 ms." if e() else ""), go("set", "Ouvrir Réglages")))
+        add("Veille de l'ordinateur", ["veille", "mise en veille", "ecran s'eteint", "se coupe la nuit", "nuit", "windows update"],
+            lambda: ("Pour une antenne de nuit : active « Empêcher la mise en veille » dans Réglages, branche l'ordinateur sur secteur et mets les mises à jour automatiques en dehors des heures d'antenne.", go("set", "Ouvrir Réglages")))
+        add("Apparence", ["theme", "mode clair", "mode sombre", "couleur", "accent", "apparence", "plein ecran", "f11", "taille"],
+            lambda: ("Apparence : Réglages > Apparence pour le mode clair / sombre et la couleur d'accent (redémarrage nécessaire). Plein écran : touche F11.", go("set", "Ouvrir Réglages")))
+        add("Démarrage automatique", ["auto-demarrage", "demarrage auto", "demarrer tout seul", "au lancement", "reboot", "redemarrage de l'ordinateur"],
+            lambda: "Auto-démarrage : coche « Auto-démarrage » en haut ; l'antenne se lance 2 s après l'ouverture. Place un raccourci de l'application dans le dossier Démarrage de Windows pour qu'elle s'ouvre avec l'ordinateur.")
+        add("Profils / réglages", ["profil", "reglage", "sauvegarde", "config", "perdu mes reglages", "reinitialiser", "reset", "exporter"],
+            lambda: "Les réglages vivent dans le profil choisi en haut ; Enregistrer les sauvegarde. Le dossier des réglages s'ouvre depuis SOS > Plus. Réinitialiser garde une copie « .sauvegarde ».")
+        add("Premiers pas", ["commencer", "debuter", "premiere fois", "premiere emission", "lancer ma premiere", "comment ca marche", "comment faire", "par ou", "tutoriel", "mode d'emploi", "demarrer une emission", "installer", "installation"],
+            lambda: "Premiers pas : 1) choisis l'entrée (Source audio) ; 2) ajoute au moins un flux (Internet, FM, DAB+ ou enregistrement) ; 3) ajoute quelques morceaux au Secours ; "
+                    "4) clique Démarrer. Le cartoucheur et le monitoring se règlent ensuite.")
+        add("Monitoring", ["monitoring", "surveiller", "flux inactif", "ecouter le flux", "audience", "auditeurs", "verifier mon flux"],
+            lambda: ("Monitoring : colle l'adresse d'un flux (bouton Coller) ; l'application vérifie régulièrement qu'il répond et qu'il y a de l'audio, et t'alerte en cas de panne.", go("mon", "Ouvrir le monitoring")))
+        add("Pige ARCOM", ["pige", "arcom", "csa", "un fichier par heure", "conserver l'antenne", "obligation", "nom du fichier", "nom de fichier", "prefixe"],
+            lambda: ("Pige ARCOM : dans l'onglet Enregistrement, active « Pige ARCOM » : l'antenne est enregistrée en continu, un fichier par heure pile "
+                     "(par exemple Pige_2026-10-23_16h.mp3). Règle aussi le nom du fichier, le format de la date et la durée de conservation "
+                     "(0 = toujours). Vérifie l'espace disque restant affiché à côté.", go("rec", "Ouvrir Enregistrement")))
+        add("Dossiers de la playlist", ["dossier", "ranger", "classer", "trier la playlist", "categorie", "plusieurs playlists", "chercher un titre", "recherche", "pochette titre"],
+            lambda: ("Dossiers : dans le Secours, « + Dossier » crée un dossier ; clic droit sur un titre > Ranger dans… ; clic droit sur un dossier pour le renommer, "
+                     "le supprimer ou l'exclure de la rotation. Glisser un dossier du disque sur la liste le crée tout seul. La recherche filtre les titres ; "
+                     "flèches, Entrée, Espace et Suppr fonctionnent au clavier.", go("diff", "Aller à Diffusion")))
+        add("Tête de lecture", ["tete de lecture", "se balader", "point de depart", "demarrer au milieu", "debut du son", "forme d'onde", "onde", "ecouter un passage"],
+            lambda: ("Tête de lecture : clic droit sur une touche du cartoucheur, puis fais glisser la tête sur l'onde. « Écouter ici » lit depuis ce point, "
+                     "« Démarrer ici » en fait le départ de la touche.", go("cart", "Ouvrir le cartoucheur")))
+        add("À propos / horloge", ["propos", "version", "heure", "horloge", "bretagne", "projet", "credit", "qui a fait", "createur", "auteur", "logiciel", "licence", "qui a cree"],
+            lambda: "L'horloge avec secondes est en haut à droite. Projet porté par des radios associatives de Bretagne : voir l'onglet À propos.")
+        add("Qui es-tu ?", ["gael", "bonjour", "salut", "coucou", "hello", "demat", "qui es", "tu es", "aide", "que sais-tu", "que peux-tu"],
+            lambda: ("Demat ! Je suis Gaël. Je sais lire l'état de l'antenne, expliquer une erreur de flux, dépanner le son, le réseau, le secours, le cartoucheur, "
+                     "les alertes ou l'enregistrement, faire un diagnostic, et régler pour toi : créer un flux, activer le secours, configurer les alertes, ajuster le gain…", [("Diagnostic", lambda: self.ask("Diagnostic")), ("État", lambda: self.ask("État"))]))
+        add("Merci", ["merci", "super", "bravo", "genial", "parfait"], lambda: "Avec plaisir. Bonne émission !")
+        return T
+
+    STOP = set("le la les un une des de du d l a au aux et ou en que qui quoi quel quelle quels ce cet cette ces mon ma mes ton ta tes son sa ses "
+               "je tu il on nous vous ils elles me te se y ne pas plus pour par sur sous dans avec sans est es suis sont fait faire peut peux veux "
+               "veut dois comment pourquoi quand combien ca cela ceci moi toi lui leur tres bien aussi alors donc mais si c j n m s t qu quelque "
+               "chose truc souci probleme aide besoin voudrais voudrait savoir svp stp radio".split())
+    SYN = {"plant": "erreur", "bug": "erreur", "marche pas": "erreur", "fonctionne pas": "erreur", "ne repond": "erreur", "bloqu": "freeze saccade",
+           "saute": "saccade", "hache": "saccade", "coupe": "coupure", "coupent": "coupure", "souffle": "sature", "bruit": "sature", "parasite": "sature",
+           "entend pas": "pas de son", "entend rien": "pas de son", "ecoute pas": "pas de son", "plus rien": "pas de son", "sans son": "pas de son",
+           "lance pas": "ne demarre pas", "demarre pas": "ne demarre pas", "part pas": "erreur", "fonctionne plus": "erreur",
+           "wifi": "internet reseau", "box": "internet", "freebox": "internet", "orange": "internet", "4g": "internet", "connexion": "internet",
+           "pige": "pige enregistrement", "arcom": "pige enregistrement", "csa": "pige enregistrement", "archiv": "enregistrement",
+           "dossier": "dossier playlist", "ranger": "dossier playlist", "pochette": "pochette titre affiche", "tete de lecture": "forme d onde",
+           "balader": "tete de lecture point de depart", "aller dans le son": "tete de lecture", "point de depart": "tete lecture cartouche", "horloge": "heure", "heure": "heure",
+           "bretagne": "propos", "a propos": "propos", "version": "propos", "mot de passe": "mot de passe erreur", "crash": "erreur", "freeze": "saccade",
+           "trop de bruit": "sature", "voix": "niveau son", "volume": "niveau son", "niveau": "niveau son", "micro": "microphone entree"}
+
+    def answer(self, q):
+        import difflib
+        n = norm_txt(q)
+        m = re.match(r"^(?:cherche|trouve|recherche|grep)\s+(.+)$", n)
+        if m or n.startswith("journal "):
+            term = (m.group(1) if m else n[8:]).strip()
+            hits = [l for l in self.app.log_lines[-600:] if term in norm_txt(l)]
+            if hits:
+                return "Dans le journal, « %s » apparaît ici :\n%s" % (term, "\n".join(hits[-6:]))
+            return f"Je ne trouve pas « {term} » dans le journal récent."
+        kb = self.kb()
+        n2 = n
+        extra = []
+        for k, v in self.SYN.items():
+            if k in n:
+                extra.append(v)
+        if extra:
+            n2 = n + " " + " ".join(extra)
+        toks = re.findall(r"[a-z0-9']+", n2)
+        padded = " " + n2 + " "
+        # suites de conversation : « et alors ? », « comment ? », « explique »
+        if self.last and len(toks) <= 3 and re.match(r"^(et |alors|ok|oui|plus|detail|explique|comment|pourquoi|et ca|d'accord|encore|continue)", n):
+            tt, fn = self.last
+            r = fn()
+            r = r if isinstance(r, tuple) else (r, None)
+            return ("À propos de « %s » : \n" % tt + r[0], r[1])
+        stem = lambda t: t[:5] if len(t) > 5 else t
+        qs = {stem(t) for t in re.findall(r"[a-z0-9]+", n2) if len(t) >= 3 and t not in self.STOP}
+        if not hasattr(self, "_tstems"):
+            self._tstems = [{stem(t) for t in re.findall(r"[a-z0-9]+", norm_txt(ti + " " + " ".join(ks))) if len(t) >= 3 and t not in self.STOP}
+                            for ti, ks, _ in kb]
+            df = {}
+            for st in self._tstems:
+                for t in st:
+                    df[t] = df.get(t, 0) + 1
+            self._idf = {t: math.log(1 + len(kb) / c) for t, c in df.items()}
+        scored = []
+        for (title, keys, fn), tst in zip(kb, self._tstems):
+            s = 0.0
+            for k in list(keys) + [title]:
+                k = norm_txt(k)
+                if " " in k or len(k) <= 3:
+                    if (" " + k + " ") in padded or (" " in k and k in n2):
+                        s += len(k) * 1.3
+                elif k in n2:
+                    s += len(k)
+                else:
+                    c = [t for t in difflib.get_close_matches(k, toks, n=3, cutoff=0.86) if t[0] == k[0] and len(k) >= 6]
+                    if c:
+                        s += len(k) * .7
+            hit = qs & tst
+            if hit:
+                s += 2.4 * sum(self._idf.get(t, 1) for t in hit) * (0.6 + 0.4 * len(hit) / max(1, len(qs)))
+            if s:
+                scored.append((s, title, fn))
+        scored.sort(key=lambda x: -x[0])
+        if scored and scored[0][0] >= 4.5:
+            best = scored[0]
+            self.last = (best[1], best[2])
+            r = best[2]()
+            text, acts = r if isinstance(r, tuple) else (r, None)
+            alts = [x for x in scored[1:3] if x[0] >= max(4.5, best[0] * .6)]
+            if alts:
+                acts = list(acts or []) + [("Plutôt : " + t, (lambda tt=t: self.ask(tt))) for _, t, _ in alts]
+            return (text, acts)
+        if scored:
+            sugg = [(t, (lambda tt=t: self.ask(tt))) for _, t, _ in scored[:3]]
+            return ("Je ne suis pas sûr d'avoir compris. Tu parlais de l'un de ces sujets ?", sugg)
+        tops = [("État de l'antenne", None), ("Pas de son", None), ("Flux en erreur", None), ("Internet", None), ("Premiers pas", None)]
+        return ("Je n'ai pas trouvé de réponse. Essaie avec d'autres mots (par exemple « pas de son », « le flux coupe », « mail ne part pas »), "
+                "demande un diagnostic, ou choisis un sujet :", [(t, (lambda tt=t: self.ask(tt))) for t, _ in tops])
+
+# ------------------------------------------------------------------ Gaël : la mascotte articulée et ses animations
+# Gaël est dessiné en vectoriel à chaque image (aucune image chargée). Les animations sont pilotées par le temps réel
+# (QElapsedTimer) : elles restent fluides même si une image saute. Le minuteur s'arrête dès que Gaël n'est pas visible.
+from PySide6.QtCore import QElapsedTimer, QThread
+from PySide6.QtGui import QTransform, QPolygonF
+
+G_COIF, G_LACE, G_VELVET = "#f7f4ec", "#cfc8b6", "#1b1b22"
+G_HEAD, G_SCREEN = "#eef1f7", "#10131b"
+G_BODY_D, G_BODY_L, G_GRILLE = "#c9742e", "#e8a45a", "#7a4a1e"
+G_LIMB = "#5d6678" if LIGHT else "#c5ccd8"
+G_HAND, G_HAND_LINE = "#ffffff", "#9aa3b5"
+G_SHOE = "#1b1b22"
+ARM_A, ARM_B = 19.0, 18.0          # bras, avant-bras
+LEG_A, LEG_B = 9.5, 9.0            # cuisse, tibia
+HIP_Y = -24.0                      # hanches (le sol est en y = 0)
+SHOULDER = (28.0, -33.0)           # épaule droite, repère du corps (origine aux hanches)
+
+
+def _cl(x, a=0.0, b=1.0):
+    return a if x < a else b if x > b else x
+
+
+def ss(x):
+    """Lissage doux (smoothstep)."""
+    x = _cl(x)
+    return x * x * (3 - 2 * x)
+
+
+def win(t, a, b):
+    """Avancement 0 → 1 de t entre a et b, lissé."""
+    return ss((t - a) / (b - a)) if b > a else float(t >= b)
+
+
+def back_out(x):
+    x = _cl(x)
+    c = 1.70158
+    return 1 + (c + 1) * (x - 1) ** 3 + c * (x - 1) ** 2
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+POSE0 = dict(x=0.0, y=0.0, rot=0.0, sq=0.0, flip=1.0, head=0.0, coif=0.0,
+             la1=10.0, la2=8.0, ra1=10.0, ra2=8.0, ll1=4.0, ll2=0.0, rl1=4.0, rl2=0.0,
+             look=0.0, lookv=0.0, eye=0.0, mouth=0.0, blink=0.0, eyec=None)
+DISCRETE = ("eye", "mouth", "eyec")
+
+
+def blend(a, b, t):
+    out = {}
+    for k, v in a.items():
+        w = b.get(k, v)
+        out[k] = (w if t >= .5 else v) if k in DISCRETE else v + (w - v) * t
+    return out
+
+
+def dir_r(a):
+    r = math.radians(a)
+    return math.sin(r), math.cos(r)
+
+
+def ik(side, tx, ty):
+    """Bras à deux segments : angles (épaule, coude) pour amener la main en (tx, ty) dans le repère du corps."""
+    sx = SHOULDER[0] * side
+    sy = SHOULDER[1]
+    dx, dy = (tx - sx) * side, ty - sy
+    d = max(abs(ARM_A - ARM_B) + .5, min(ARM_A + ARM_B - .3, math.hypot(dx, dy)))
+    th = math.degrees(math.atan2(dx, dy))
+    al = math.degrees(math.acos(_cl((ARM_A ** 2 + d * d - ARM_B ** 2) / (2 * ARM_A * d), -1, 1)))
+    best = None
+    for a1 in (th + al, th - al):
+        ex, ey = dir_r(a1)
+        ex, ey = ex * ARM_A, ey * ARM_A
+        fa = math.degrees(math.atan2(dx - ex, dy - ey))
+        score = ey + abs(ex) * .35
+        if best is None or score > best[0]:
+            best = (score, a1, fa - a1)
+    return best[1], best[2]
+
+
+class GaelPainter:
+    """Dessine Gaël dans une pose donnée. Les rappels hand_r / hand_l dessinent un objet tenu en main.
+    Les parties fixes (corps, tête, coiffe) sont pré-rendues en images à la bonne résolution et seulement recopiées."""
+
+    def __init__(self):
+        self.hands = {}
+        self.cache = {}
+
+    def cached(self, p, key, rect, fn):
+        """Dessine `fn` via une image mise en cache à l'échelle réelle de l'écran (nette, et ~5× plus rapide)."""
+        tr = p.worldTransform()
+        sc = max(abs(tr.m11()) + abs(tr.m21()), abs(tr.m22()) + abs(tr.m12())) * p.device().devicePixelRatioF()
+        sc = max(.5, round(sc * 4) / 4)
+        k = (key, sc)
+        pm = self.cache.get(k)
+        if pm is None:
+            if len(self.cache) > 24:
+                self.cache.clear()
+            pm = QPixmap(max(1, int(rect.width() * sc + 2)), max(1, int(rect.height() * sc + 2)))
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHints(QPainter.RenderHint.Antialiasing)
+            q.scale(sc, sc)
+            q.translate(-rect.left() + 1 / sc, -rect.top() + 1 / sc)
+            q.setPen(Qt.PenStyle.NoPen)
+            fn(q)
+            q.end()
+            self.cache[k] = pm
+        p.drawPixmap(QRectF(rect.left() - 1 / sc, rect.top() - 1 / sc, pm.width() / sc, pm.height() / sc), pm, QRectF(pm.rect()))
+
+    def body_transform(self, P):
+        T = QTransform()
+        T.translate(P["x"], P["y"])
+        sq = P["sq"]
+        T.scale((1 - sq * .6) * P["flip"], 1 + sq)
+        T.translate(0, HIP_Y)
+        T.rotate(P["rot"])
+        return T
+
+    def hand_pos(self, P, side):
+        """Position de la main (repère racine) pour poser des objets."""
+        a1, a2 = (P["ra1"], P["ra2"]) if side > 0 else (P["la1"], P["la2"])
+        ex, ey = dir_r(a1)
+        fx, fy = dir_r(a1 + a2)
+        x = SHOULDER[0] * side + side * (ex * ARM_A + fx * ARM_B)
+        y = SHOULDER[1] + ey * ARM_A + fy * ARM_B
+        return self.body_transform(P).map(QPointF(x, y))
+
+    def draw(self, p, P, talk=0.0, on_air=False, t=0.0, hand_r=None, hand_l=None, dial=0.0):
+        p.save()
+        sq = P["sq"]
+        # ombre au sol (rétrécit pendant les sauts)
+        h = _cl(-P["y"] / 30.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, int(70 * (1 - .6 * h))))
+        p.drawEllipse(QPointF(P["x"], 1.5), 30 * (1 - .35 * h), 4.2 * (1 - .35 * h))
+        p.translate(P["x"], P["y"])
+        p.scale((1 - sq * .6) * P["flip"], 1 + sq)
+        # jambes (depuis les hanches, dans le repère racine pour garder les pieds au sol)
+        for side, a1, a2 in ((-1, P["ll1"], P["ll2"]), (1, P["rl1"], P["rl2"])):
+            hx, hy = 12 * side, HIP_Y + 2
+            kx, ky = dir_r(a1)
+            kx, ky = hx + side * kx * LEG_A, hy + ky * LEG_A
+            fx, fy = dir_r(a1 - a2)
+            fx, fy = kx + side * fx * LEG_B, ky + fy * LEG_B
+            p.setPen(ppen(G_LIMB, 6))
+            p.drawPolyline([QPointF(hx, hy), QPointF(kx, ky), QPointF(fx, fy)])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(G_SHOE))
+            p.drawRoundedRect(QRectF(fx - 7 + side * 2.5, fy - 2.5, 14, 6.5), 3.2, 3.2)
+            p.setBrush(QColor("#c9ced8"))
+            p.drawRect(QRectF(fx - 1.5 + side * 2.5, fy - 1.5, 3, 2.4))
+        p.translate(0, HIP_Y)
+        p.rotate(P["rot"])
+        self._torso(p, on_air, dial)
+        # tête + coiffe
+        p.save()
+        p.translate(0, -40)
+        p.rotate(P["head"])
+        self._head(p, P, talk, t)
+        p.restore()
+        # bras par-dessus le corps
+        for side, a1, a2, cb in ((-1, P["la1"], P["la2"], hand_l), (1, P["ra1"], P["ra2"], hand_r)):
+            sx, sy = SHOULDER[0] * side, SHOULDER[1]
+            ex, ey = dir_r(a1)
+            ex, ey = sx + side * ex * ARM_A, sy + ey * ARM_A
+            hx, hy = dir_r(a1 + a2)
+            hx, hy = ex + side * hx * ARM_B, ey + hy * ARM_B
+            p.setPen(ppen(G_LIMB, 6))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline([QPointF(sx, sy), QPointF(ex, ey), QPointF(hx, hy)])
+            if cb:
+                p.save()
+                p.translate(hx, hy)
+                ang = a1 + a2
+                cb(p, -ang if side > 0 else ang)
+                p.restore()
+            p.setPen(QPen(QColor(G_HAND_LINE), 1))
+            p.setBrush(QColor(G_HAND))
+            p.drawEllipse(QPointF(hx, hy), 4.6, 4.6)
+        p.restore()
+
+    @staticmethod
+    def _rr(p, x0, y0, x1, y1, r, fill):
+        p.setBrush(QColor(fill) if not isinstance(fill, QBrush) else fill)
+        p.drawRoundedRect(QRectF(x0, y0, x1 - x0, y1 - y0), r, r)
+
+    def _torso_static(self, p):
+        rr = self._rr
+        rr(p, -30, -40, 30, 0, 12, G_BODY_D)
+        rr(p, -26, -36, 26, -4, 9, G_BODY_L)
+        p.setPen(ppen(G_GRILLE, 2, Qt.PenCapStyle.FlatCap))
+        for k in range(5):
+            p.drawLine(QPointF(-22 + k * 5, -30), QPointF(-22 + k * 5, -10))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#10131b"))
+        p.drawEllipse(QRectF(2, -31, 20, 20))
+        self._rr(p, -14, -44, 14, -38, 3, G_VELVET)
+
+    def _torso(self, p, on_air, dial):
+        """Corps : poste de radio d'autrefois (origine = hanches, haut du corps en y = -40)."""
+        p.setPen(Qt.PenStyle.NoPen)
+        self.cached(p, "torso", QRectF(-31, -45, 62, 46), self._torso_static)
+        c = QColor(OKC if on_air else ACC)
+        p.setPen(ppen(c, 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(12, -21), 6.2, 6.2)
+        p.save()
+        p.translate(12, -21)
+        p.rotate(math.degrees(dial))
+        p.drawLine(QPointF(0, -1.5), QPointF(0, -5.2))
+        p.restore()
+        p.setBrush(QColor(OKC if on_air else "#8a93a6"))
+        p.drawEllipse(QRectF(24, -34, 4, 4))
+
+    def _head(self, p, P, talk, t):
+        """Tête (origine = base du cou), écran-visage, casque, et la haute coiffe pourlet."""
+        rr = self._rr
+        p.setPen(Qt.PenStyle.NoPen)
+        # coiffe (oscille autour de sa base) ; en version mini, juste le bas de la coiffe
+        if P.get("mini"):
+            rr(p, -11, -58, 11, -40, 6, G_COIF)
+            rr(p, -14, -46, 14, -39, 3, G_VELVET)
+        else:
+            p.save()
+            p.translate(0, -42)
+            p.rotate(P["coif"])
+            self.cached(p, "coif", QRectF(-15, -47, 30, 51), self._coif_static)
+            p.restore()
+        self.cached(p, "head", QRectF(-31, -47, 62, 46), self._head_static)
+        # yeux
+        lx, ly = P["look"] * 2.6, P["lookv"] * 2.2
+        e, bl = int(P["eye"]), P["blink"]
+        col = QColor(P.get("eyec") or ("#ffffff" if talk else ACC2))
+        for xx in (-9, 9):
+            cx, cy = xx + lx, -26 + ly
+            if e == 1:                          # heureux : ^ ^
+                p.setPen(ppen(col, 2.4))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolyline([QPointF(cx - 4, cy + 1.5), QPointF(cx, cy - 2.5), QPointF(cx + 4, cy + 1.5)])
+                p.setPen(Qt.PenStyle.NoPen)
+                continue
+            if e == 5:                          # fâché : yeux plissés + sourcils froncés
+                p.setBrush(col)
+                p.drawRoundedRect(QRectF(cx - 4, cy - 1.5, 8, 4.5), 2, 2)
+                p.setPen(ppen(col, 2.2))
+                s_ = 1 if xx < 0 else -1
+                p.drawLine(QPointF(cx - 5 * s_, cy - 8), QPointF(cx + 4 * s_, cy - 4.5))
+                p.setPen(Qt.PenStyle.NoPen)
+                continue
+            if e == 2:                          # paupières mi-closes (bof)
+                p.setBrush(col)
+                p.drawRoundedRect(QRectF(cx - 4, cy - .5, 8, 3), 1.5, 1.5)
+                continue
+            hgt = 5.0 if e != 3 else 6.5
+            if e == 4:
+                hgt = 3.0
+            hgt = max(.8, hgt * (1 - bl))
+            wd = 4.0 if e != 3 else 4.8
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(cx - wd, cy - hgt, wd * 2, hgt * 2), 4, 4)
+            if e == 3 and bl < .5:
+                p.setBrush(QColor(G_SCREEN))
+                p.drawEllipse(QPointF(cx + .8, cy - 1.2), 1.4, 1.4)
+        # bouche
+        m = int(P["mouth"])
+        if talk:
+            for i in range(5):
+                hh = 2 + abs(math.sin(t * 13 + i * 1.3)) * 4.2 * min(1.0, talk)
+                rr(p, -13 + i * 6, -14 - hh / 2, -10 + i * 6, -14 + hh / 2, 1, ACC)
+        elif m == 1:
+            p.setBrush(QColor(ACC))
+            p.drawEllipse(QPointF(0, -14), 3.2, 3.6)
+        elif m == 2:
+            path = QPainterPath(QPointF(-8, -17))
+            path.cubicTo(QPointF(-6, -8), QPointF(6, -8), QPointF(8, -17))
+            path.closeSubpath()
+            p.setBrush(QColor(ACC))
+            p.drawPath(path)
+        elif m == 4:                            # grimace (pas content)
+            p.setPen(ppen(P.get("eyec") or ACC, 2.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            path = QPainterPath(QPointF(-8, -12))
+            for k in range(1, 5):
+                path.lineTo(QPointF(-8 + k * 4, -12 - (3 if k % 2 else 0)))
+            p.drawPath(path)
+            p.setPen(Qt.PenStyle.NoPen)
+        elif m == 3:                            # moue
+            p.setPen(ppen(ACC, 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(QRectF(-6, -15, 12, 8), 20 * 16, 140 * 16)
+            p.setPen(Qt.PenStyle.NoPen)
+        else:
+            p.setPen(ppen(ACC, 2, Qt.PenCapStyle.FlatCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(QRectF(-8, -20, 16, 10), -160 * 16, 140 * 16)
+            p.setPen(Qt.PenStyle.NoPen)
+
+    def _coif_static(self, p):
+        rr = self._rr
+        rr(p, -12, -46, 12, 2, 8, G_COIF)
+        p.setPen(QPen(QColor(G_LACE), 1, Qt.PenStyle.DashLine))
+        for k in range(5):
+            p.drawLine(QPointF(-9, -40 + k * 8), QPointF(9, -40 + k * 8))
+        p.setPen(QPen(QColor(G_LACE), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for k in (-1, 0, 1):
+            p.drawEllipse(QPointF(k * 6, -42), 2, 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        rr(p, -14, -4, 14, 3, 3, G_VELVET)
+
+    def _head_static(self, p):
+        rr = self._rr
+        rr(p, -24, -44, 24, -2, 14, G_HEAD)
+        rr(p, -19, -39, 19, -7, 10, G_SCREEN)
+        # casque
+        rr(p, -30, -34, -22, -12, 5, ACC)
+        rr(p, 22, -34, 30, -12, 5, ACC)
+        p.setPen(ppen(ACC, 3, Qt.PenCapStyle.FlatCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(-29, -46, 58, 38), -340 * 16, 140 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+
+
+# ------------------------------------------------------------------ petits dessins (accessoires)
+def draw_note(p, x, y, col, s=1.0, double=False):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.save()
+    p.translate(x, y)
+    p.rotate(-18)
+    p.drawEllipse(QPointF(0, 0), 3.4 * s, 2.5 * s)
+    p.restore()
+    p.setPen(QPen(col, 1.4 * s))
+    p.drawLine(QPointF(x + 3 * s, y - .5 * s), QPointF(x + 3 * s, y - 12 * s))
+    if double:
+        p.drawLine(QPointF(x + 3 * s, y - 12 * s), QPointF(x + 11 * s, y - 14 * s))
+        p.drawLine(QPointF(x + 11 * s, y - 14 * s), QPointF(x + 11 * s, y - 3 * s))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.save()
+        p.translate(x + 8 * s, y - 2.5 * s)
+        p.rotate(-18)
+        p.drawEllipse(QPointF(0, 0), 3.4 * s, 2.5 * s)
+        p.restore()
+    else:
+        path = QPainterPath(QPointF(x + 3 * s, y - 12 * s))
+        path.cubicTo(QPointF(x + 8 * s, y - 10 * s), QPointF(x + 9 * s, y - 7 * s), QPointF(x + 7 * s, y - 4 * s))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
+def draw_sparkle(p, x, y, r, col):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    path = QPainterPath(QPointF(x, y - r))
+    for a, b in ((x + r * .22, y - r * .22), (x + r, y), (x + r * .22, y + r * .22), (x, y + r), (x - r * .22, y + r * .22),
+                 (x - r, y), (x - r * .22, y - r * .22)):
+        path.lineTo(a, b)
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def draw_heart(p, x, y, s, col):
+    path = QPainterPath(QPointF(x, y + 4 * s))
+    path.cubicTo(QPointF(x - 7 * s, y - 1 * s), QPointF(x - 4 * s, y - 7 * s), QPointF(x, y - 3 * s))
+    path.cubicTo(QPointF(x + 4 * s, y - 7 * s), QPointF(x + 7 * s, y - 1 * s), QPointF(x, y + 4 * s))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.drawPath(path)
+
+
+def draw_gull(p, x, y, flap, s=1.0, facing=-1, perched=False):
+    """Goéland : corps blanc, ailes grises à bout noir, bec jaune à tache rouge."""
+    p.save()
+    p.translate(x, y)
+    p.scale(s * facing, s)
+    p.setPen(Qt.PenStyle.NoPen)
+    wing = QColor("#b9c3d1")
+    if perched:
+        p.setPen(ppen("#f0a030", 1.6))
+        p.drawLine(QPointF(-2, 5), QPointF(-3, 10))
+        p.drawLine(QPointF(3, 5), QPointF(4, 10))
+        p.setPen(Qt.PenStyle.NoPen)
+    # aile arrière
+    a = math.radians(flap)
+    for k, (sh, col) in enumerate(((-1.5, mixc(wing, "#000000", .15)), (0, wing))):
+        p.save()
+        p.translate(1 + sh, -2)
+        p.rotate(-math.degrees(a) * (1 if k else .7))
+        path = QPainterPath(QPointF(0, 0))
+        path.cubicTo(QPointF(4, -6), QPointF(12, -7), QPointF(19, -5))
+        path.lineTo(QPointF(14, -1.5))
+        path.cubicTo(QPointF(9, 0), QPointF(4, 1), QPointF(0, 1.5))
+        p.setBrush(col)
+        p.drawPath(path)
+        p.setBrush(QColor("#1d2230"))
+        tip = QPainterPath(QPointF(15, -5.6))
+        tip.lineTo(QPointF(19, -5))
+        tip.lineTo(QPointF(15.5, -2.2))
+        tip.closeSubpath()
+        p.drawPath(tip)
+        p.restore()
+    p.setBrush(QColor("#ffffff"))
+    p.drawEllipse(QPointF(0, 1), 9, 4.6)
+    tail = QPainterPath(QPointF(7, 0))
+    tail.lineTo(QPointF(13, -1.5))
+    tail.lineTo(QPointF(12, 3))
+    tail.closeSubpath()
+    p.setBrush(QColor("#e7ebf2"))
+    p.drawPath(tail)
+    p.setBrush(QColor("#ffffff"))
+    p.drawEllipse(QPointF(-8, -2.5), 4, 3.8)
+    p.setBrush(QColor("#f6c443"))
+    beak = QPainterPath(QPointF(-11.5, -3))
+    beak.lineTo(QPointF(-17, -1.6))
+    beak.lineTo(QPointF(-11.5, -.8))
+    beak.closeSubpath()
+    p.drawPath(beak)
+    p.setBrush(QColor("#e0393e"))
+    p.drawEllipse(QPointF(-14.6, -1.3), .8, .8)
+    p.setBrush(QColor("#10131b"))
+    p.drawEllipse(QPointF(-9, -3.4), 1, 1)
+    p.restore()
+
+
+# ------------------------------------------------------------------ les animations
+class GAnim:
+    """Une animation = une durée, une pose en fonction du temps, des accessoires dessinés derrière / devant."""
+    name, label, dur = "", "", 6.0
+
+    def __init__(self):
+        rnd = random.Random(hash(self.name) & 0xffff)
+        self.rnd = [rnd.random() for _ in range(64)]
+
+    def pose(self, t, P):
+        return P
+
+    def back(self, p, t, gp, P):
+        pass
+
+    def front(self, p, t, gp, P):
+        pass
+
+    def hand_r(self, t):
+        return None
+
+    def hand_l(self, t):
+        return None
+
+
+class AGavotte(GAnim):
+    name, label, dur = "gavotte", "La gavotte", 8.4
+    BEAT = .42
+
+    def pose(self, t, P):
+        b = t / self.BEAT
+        ph = b % 1.0
+        hop = abs(math.sin(math.pi * b))
+        even = int(b) % 2 == 0
+        lift = math.sin(math.pi * ph)
+        P.update(y=-hop * 6.5, sq=-.05 * math.cos(2 * math.pi * b) * .8, x=11 * math.sin(2 * math.pi * t / (self.BEAT * 8)),
+                 rot=(4.5 if even else -4.5) * lift, head=(-3 if even else 3) * lift, eye=1, mouth=2,
+                 la1=44 + 18 * math.sin(math.pi * b), la2=100 + 16 * math.sin(math.pi * b + .6),
+                 ra1=44 + 18 * math.sin(math.pi * b), ra2=100 + 16 * math.sin(math.pi * b + .6))
+        if even:
+            P.update(ll1=4 + 26 * lift, ll2=48 * lift, rl1=4, rl2=0)
+        else:
+            P.update(rl1=4 + 26 * lift, rl2=48 * lift, ll1=4, ll2=0)
+        sp = win(t, self.dur - 1.7, self.dur - .5)       # pirouette finale
+        if 0 < sp < 1:
+            c = math.cos(sp * 2 * math.pi)
+            P["flip"] = math.copysign(max(.2, abs(c)), c)
+            P["y"] -= math.sin(sp * math.pi) * 9
+        return P
+
+    def back(self, p, t, gp, P):
+        for k in range(int(t / (self.BEAT * 2)) + 1):
+            t0 = k * self.BEAT * 2
+            u = (t - t0) / 1.9
+            if not 0 <= u <= 1 or t0 > self.dur - 1.2:
+                continue
+            side = -1 if k % 2 else 1
+            x = side * (36 + 10 * u) + math.sin(u * 7 + k) * 5
+            y = -110 - u * 70
+            c = QColor(grad((k * .23) % 1))
+            c.setAlphaF(_cl(min(u * 5, (1 - u) * 2.2)))
+            draw_note(p, x, y, c, 1.15, double=k % 3 == 1)
+
+
+class ACrepes(GAnim):
+    name, label, dur = "crepes", "Les crêpes", 9.0
+    BX, BY = 47.0, -38.0     # centre du bilig (repère racine)
+    RX = 25.0
+
+    def stage(self, t):
+        return back_out((t - .1) / .55) * (1 - win(t, self.dur - .7, self.dur - .15))
+
+    def pose(self, t, P):
+        P.update(x=-9.0, look=1, eye=4, mouth=0)
+        hx, hy = self.BX - 9 + 0, self.BY + HIP_Y * -1 - 18   # repère corps
+        # étaler la pâte
+        if 1.0 <= t < 3.4:
+            u = (t - 1.0) / 2.4
+            a = u * 4.6 * math.pi
+            r = 2 + 8 * u
+            tx, ty = 38 + math.cos(a) * r, -21 + math.sin(a) * r * .32
+            P["ra1"], P["ra2"] = ik(1, tx, ty)
+            P["rot"], P["head"] = 4, 5
+        elif t < 1.0:
+            k = win(t, .3, 1.0)
+            a1, a2 = ik(1, 30, -22)
+            P["ra1"], P["ra2"] = lerp(P["ra1"], a1, k), lerp(P["ra2"], a2, k)
+        elif t < 4.2:                       # cuisson : il surveille, main sur la hanche
+            P.update(ra1=38, ra2=-70, eye=4, rot=3, head=6)
+        elif t < 6.2:                       # le saut de la crêpe
+            u = win(t, 4.2, 4.55)
+            v = win(t, 4.55, 4.75)
+            a1, a2 = ik(1, 34, -16)
+            b1, b2 = ik(1, 24, -40)
+            P["ra1"], P["ra2"] = lerp(lerp(38, a1, u), b1, v), lerp(lerp(-70, a2, u), b2, v)
+            P["sq"] = .06 * u * (1 - v) - .05 * v * (1 - win(t, 4.8, 5.2))
+            f = self.flight(t)
+            if f is not None:
+                P.update(eye=3, mouth=1, lookv=-1 + f[2], look=.6, head=-6)
+            if t > 5.35:
+                P.update(eye=1, mouth=2, lookv=0)
+        else:                               # pliage et dégustation
+            P.update(eye=1, mouth=2, ra1=30, ra2=60, la1=30, la2=60, head=-4 * math.sin((t - 6.2) * 5))
+        return P
+
+    def flight(self, t):
+        if 4.6 <= t <= 5.35:
+            u = (t - 4.6) / .75
+            return (self.BX + 2 * math.sin(u * math.pi), self.BY - 2 - 66 * math.sin(u * math.pi), u)
+        return None
+
+    def crepe_color(self, t):
+        k = win(t, 3.2, 4.2)
+        return mixc("#f6e7bd", "#e2a14c", k)
+
+    def back(self, p, t, gp, P):
+        s = self.stage(t)
+        if s <= 0.01:
+            return
+        p.save()
+        p.translate(self.BX, 0)
+        p.scale(s, s)
+        # pied et bilig (galettière en fonte)
+        p.setPen(ppen("#6b7488", 2.4))
+        p.drawLine(QPointF(-14, 0), QPointF(-8, self.BY + 6))
+        p.drawLine(QPointF(14, 0), QPointF(8, self.BY + 6))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#2a2f3c"))
+        p.drawEllipse(QPointF(0, self.BY + 2.5), self.RX + 1, 8)
+        p.setBrush(QColor("#3c4252"))
+        p.drawEllipse(QPointF(0, self.BY), self.RX, 7)
+        p.setBrush(QColor("#ff8a3d"))
+        p.drawEllipse(QPointF(0, self.BY + 5), 2.2, 1.2)
+        p.restore()
+        x0 = self.BX
+        # pâte étalée
+        if 1.0 <= t < 4.6 or t >= 5.35:
+            if t < 3.4:
+                u = (t - 1.0) / 2.4
+                r = 3 + (self.RX - 5) * ss(u)
+            else:
+                r = self.RX - 2
+            c = self.crepe_color(t)
+            if t >= 5.35:
+                c = mixc("#e2a14c", "#c98436", .4)
+            fold = win(t, 6.3, 6.9) * .5 + win(t, 7.0, 7.5) * .25
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            rect = QRectF(x0 - r * s, self.BY - r * .28 * s, 2 * r * s, 2 * r * .28 * s)
+            if t >= 6.3:
+                p.drawPie(rect, int(90 * 16), int(360 * (1 - fold) * 16))
+            else:
+                p.drawEllipse(rect)
+            if 3.0 < t < 4.6:
+                p.setBrush(qc("#8a5220", int(160 * win(t, 3.4, 4.2))))
+                for i in range(7):
+                    a = self.rnd[i] * 6.28
+                    rr = self.rnd[i + 8] * (r - 4)
+                    p.drawEllipse(QPointF(x0 + math.cos(a) * rr, self.BY + math.sin(a) * rr * .28), 1.3, .55)
+            if t >= 6.9:                     # noisette de beurre salé
+                k = win(t, 6.9, 7.2) * (1 - win(t, 7.8, 8.4) * .5)
+                p.setBrush(QColor("#ffe58a"))
+                p.drawRoundedRect(QRectF(x0 + 3, self.BY - 5 * k, 6 * k, 3.6 * k), 1, 1)
+        # vapeur
+        if 2.8 < t < 4.6:
+            for i in range(3):
+                u = ((t * .9 + i / 3) % 1.0)
+                c = QColor(TXT)
+                c.setAlphaF(.22 * math.sin(u * math.pi) * win(t, 2.8, 3.3))
+                path = QPainterPath(QPointF(x0 - 10 + i * 10, self.BY - 6))
+                for k in range(1, 7):
+                    path.lineTo(x0 - 10 + i * 10 + math.sin(k * 1.4 + t * 4 + i) * 3, self.BY - 6 - k * 4 - u * 12)
+                p.setPen(QPen(c, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
+
+    def front(self, p, t, gp, P):
+        f = self.flight(t)
+        if f is not None:
+            x, y, u = f
+            phi = .284 + u * 2 * math.pi
+            ry = abs(math.sin(phi)) * (self.RX - 2)
+            c = self.crepe_color(t) if math.cos(phi) > 0 else mixc("#e2a14c", "#b8732c", .35)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawEllipse(QPointF(x, y), self.RX - 2, max(1.2, ry))
+        if t >= 7.3:
+            k = (t - 7.3) / 1.4
+            if k <= 1:
+                c = QColor("#ff6b8a")
+                c.setAlphaF(_cl(min(k * 4, (1 - k) * 2)))
+                draw_heart(p, self.BX - 20 + math.sin(k * 6) * 3, -100 - k * 34, 1.3, c)
+        if 7.2 < t < 8.4:
+            k = win(t, 7.2, 7.6) * (1 - win(t, 8.0, 8.4))
+            for i, (dx, dy) in enumerate(((-12, -48), (14, -52), (2, -60))):
+                draw_sparkle(p, self.BX + dx, dy, (2.4 + 1.4 * math.sin(t * 9 + i)) * k, qc("#ffe58a", 230))
+
+    def hand_r(self, t):
+        if .6 < t < 3.6:                    # le rozell (râteau en bois)
+            u = _cl((t - 1.0) / 2.4)
+
+            def f(p, ang):
+                p.rotate(-12 + 10 * math.sin(t * 9))
+                p.setPen(ppen("#c08a4e", 2.2))
+                p.drawLine(QPointF(0, 0), QPointF(0, 13))
+                p.setPen(ppen("#d9a56a", 3.2))
+                p.drawLine(QPointF(-7, 13), QPointF(7, 13))
+            return f
+        if 4.15 < t < 4.9:                  # la spatule
+            def g(p, ang):
+                p.rotate(-30)
+                p.setPen(ppen("#c08a4e", 2))
+                p.drawLine(QPointF(0, 0), QPointF(0, 12))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#d9a56a"))
+                p.drawRoundedRect(QRectF(-2.5, 11, 5, 14), 2, 2)
+            return g
+        return None
+
+
+class ACrachin(GAnim):
+    name, label, dur = "crachin", "Le crachin breton", 8.6
+    CY = -176.0
+
+    def cloud_x(self, t):
+        return lerp(-120, -6, back_out(_cl(t / 1.3) * .999) if t < 1.3 else 1) + 150 * ss((t - 5.0) / 1.2)
+
+    def umb(self, t):
+        return win(t, 2.1, 2.7) * (1 - win(t, 5.9, 6.5))
+
+    def pose(self, t, P):
+        if t < 2.1:
+            P.update(lookv=-1 * win(t, .6, 1.2), look=-.3, eye=2 if t > 1.5 else 0, mouth=3 if t > 1.5 else 0)
+            if t > 1.6:
+                P["head"] = math.sin(t * 14) * 3 * (1 - win(t, 1.9, 2.1))
+        u = self.umb(t)
+        if 2.0 <= t < 6.6:
+            P.update(ra1=lerp(10, 158, win(t, 2.0, 2.5)), ra2=lerp(8, 4, win(t, 2.0, 2.5)), eye=0, mouth=0, lookv=-.4)
+        if 5.2 <= t < 6.6:
+            P.update(eye=3, mouth=1, lookv=-1, look=-.8)
+        if 6.6 <= t:
+            k = win(t, 6.6, 7.0) * (1 - win(t, self.dur - .5, self.dur))
+            P.update(ra1=lerp(10, 60, k), ra2=lerp(8, 40 + math.sin(t * 30) * 25 * k, k), eye=1, mouth=2, sq=.03 * math.sin(t * 30) * k)
+        return P
+
+    def back(self, p, t, gp, P):
+        sun = win(t, 5.3, 6.0) * (1 - win(t, self.dur - .7, self.dur))
+        if sun > 0:
+            c = QColor("#ffcf4a")
+            c.setAlphaF(sun)
+            rb = ("#ff5f6d", "#ffb347", "#ffe066", "#5fd38d", "#4cc9f0", "#a76bff")
+            for i, col in enumerate(rb):
+                cc = QColor(col)
+                cc.setAlphaF(.55 * sun)
+                p.setPen(QPen(cc, 2.6))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                r = 74 - i * 3
+                p.drawArc(QRectF(-r + 6, -120 - r, 2 * r, 2 * r), 20 * 16, 140 * 16)
+            p.save()
+            p.translate(-46, -168)
+            p.rotate(t * 40)
+            p.setPen(QPen(c, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for i in range(8):
+                p.rotate(45)
+                p.drawLine(QPointF(0, 11 * sun), QPointF(0, 16 * sun))
+            p.restore()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawEllipse(QPointF(-46, -168), 8 * sun, 8 * sun)
+
+    def front(self, p, t, gp, P):
+        cx = self.cloud_x(t)
+        u = self.umb(t)
+        R = gp.hand_pos(P, 1)
+        top = R.y() - 58
+        # parapluie (ciré jaune)
+        if u > 0.01:
+            shx = R.x() + 0
+            p.setPen(ppen("#3a4152" if not LIGHT else "#5d6678", 1.8))
+            p.drawLine(R, QPointF(shx, top))
+            w = 44 * u
+            path = QPainterPath(QPointF(shx - w, top + 2))
+            path.cubicTo(QPointF(shx - w * .9, top - 22 * u), QPointF(shx + w * .9, top - 22 * u), QPointF(shx + w, top + 2))
+            seg = 2 * w / 4
+            for k in range(4):
+                x1 = shx + w - (k + 1) * seg
+                path.quadTo(QPointF(x1 + seg / 2, top - 3 * u), QPointF(x1, top + 2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#ffc93c"))
+            p.drawPath(path)
+            p.setPen(QPen(QColor("#e0a81e"), 1))
+            for k in (-1, 0, 1):
+                p.drawLine(QPointF(shx, top - 20 * u), QPointF(shx + k * w * .5, top + 1))
+            p.setBrush(QColor("#e0a81e"))
+            p.drawEllipse(QPointF(shx, top - 20 * u), 1.6, 1.6)
+        # pluie
+        rain = win(t, 1.2, 1.7) * (1 - win(t, 4.8, 5.4))
+        if rain > 0:
+            c = QColor("#86b8ff")
+            c.setAlphaF(.75 * rain)
+            p.setPen(QPen(c, 1.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for i in range(18):
+                x = cx - 26 + self.rnd[i] * 52
+                y = self.CY + 10 + ((t * 150 + self.rnd[i + 20] * 200) % 190)
+                stop = 0.0
+                if u > .5 and abs(x - R.x()) < 44 * u:
+                    stop = top - 18 * u * (1 - ((x - R.x()) / (44 * u)) ** 2)
+                    if y > stop:
+                        continue
+                if y > -1:
+                    continue
+                p.drawLine(QPointF(x, y), QPointF(x - 1.2, y + 6))
+            # éclaboussures sur la toile
+            if u > .5:
+                for i in range(3):
+                    k = ((t * 3 + i * .33) % 1.0)
+                    xx = R.x() + (self.rnd[i + 40] - .5) * 60
+                    yy = top - 14
+                    c2 = QColor("#86b8ff")
+                    c2.setAlphaF((1 - k) * rain)
+                    p.setPen(QPen(c2, 1))
+                    p.drawArc(QRectF(xx - 4 * k - 2, yy - 2 * k, 8 * k + 4, 4 * k + 2), 0, 180 * 16)
+        # gouttes en secouant le parapluie
+        if t > 6.6:
+            for i in range(6):
+                k = ((t - 6.6) * 1.6 + i * .17) % 1.0
+                c = QColor("#86b8ff")
+                c.setAlphaF((1 - k) * (1 - win(t, self.dur - .6, self.dur)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(R.x() + (self.rnd[i] - .5) * 40 * k, R.y() - 4 + k * 30), 1.4, 2)
+        # nuage
+        a = win(t, 0, .6) * (1 - win(t, 5.4, 6.3))
+        if a > 0:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc("#8b95a8" if not LIGHT else "#aab3c4", int(255 * a)))
+            for dx, dy, r in ((-16, 4, 11), (0, -2, 15), (16, 3, 12), (-4, 8, 12), (8, 8, 11)):
+                p.drawEllipse(QPointF(cx + dx, self.CY + dy), r, r * .82)
+            p.setBrush(qc("#a4adbf" if not LIGHT else "#c7cedb", int(255 * a)))
+            p.drawEllipse(QPointF(cx - 2, self.CY - 5), 9, 6)
+
+
+class AGoeland(GAnim):
+    name, label, dur = "goeland", "Le goéland chapardeur", 8.6
+    LAND = 1.9
+    LEAVE = 5.2
+
+    def gull(self, t):
+        """(x, y, battement, posé ?) ; la coiffe culmine vers y = -150."""
+        if t < self.LAND:
+            u = ss(t / self.LAND)
+            x = lerp(118, 2, u)
+            y = lerp(-212, -152, u) - math.sin(u * math.pi) * 14
+            flap = 38 * math.sin(t * 17) if u < .82 else lerp(20, -50, (u - .82) / .18)
+            return x, y, flap, False
+        if t < self.LEAVE:
+            return 2, -152, -55, True
+        u = (t - self.LEAVE) / 1.6
+        x = lerp(2, -128, ss(u))
+        y = -152 - u * 70 - math.sin(u * 3) * 6
+        return x, y, 38 * math.sin(t * 18), False
+
+    def pose(self, t, P):
+        if t < self.LAND:
+            P.update(lookv=-win(t, .6, 1.4), look=lerp(1, 0, win(t, .4, 1.6)), eye=0)
+        elif t < self.LEAVE:
+            v = t - self.LAND
+            bump = math.exp(-v * 5) * math.sin(v * 22)
+            P.update(sq=-.05 * bump, coif=-9 * bump, lookv=-1, eye=3 if v < 1.6 else 4, mouth=1 if v < 1.6 else 3)
+            if 1.8 < v < 3.2:               # il chasse l'oiseau d'un revers de main
+                k = win(v, 1.8, 2.1) * (1 - win(v, 2.9, 3.2))
+                P.update(ra1=lerp(10, 165, k), ra2=lerp(8, 30 + math.sin(v * 26) * 26, k), head=4 * math.sin(v * 13) * k)
+        else:
+            v = t - self.LEAVE
+            k = win(v, .3, .7) * (1 - win(t, self.dur - .6, self.dur))
+            P.update(la1=lerp(10, 58, k), la2=lerp(8, 82, k), ra1=lerp(10, 58, k), ra2=lerp(8, 82, k), eye=2 if v < 1.6 else 1,
+                     mouth=0 if v < 1.6 else 2, lookv=-.5 * (1 - win(v, 1, 2)), look=-.6 * (1 - win(v, 1, 2)), y=-2 * math.sin(k * math.pi))
+        return P
+
+    def front(self, p, t, gp, P):
+        x, y, flap, perched = self.gull(t)
+        if perched:
+            v = t - self.LAND
+            peck = max(0.0, math.sin(v * 9)) * 3 if 0.5 < v < 1.6 else 0
+            y = -152 + P["y"] + peck * .4
+            x = 2 + math.sin(v * 2) * 2
+            if 2.1 < v < 3.0:
+                y -= 6 * math.sin((v - 2.1) / .9 * math.pi)
+                flap = 30 * math.sin(v * 20)
+            draw_gull(p, x, y, flap, 1.25, -1 if v < 2.5 else 1, perched=True)
+        else:
+            draw_gull(p, x, y, flap, 1.25, -1 if t < self.LAND else 1)
+        if self.LEAVE <= t < self.LEAVE + 1.1:     # « Kiaaa ! »
+            k = (t - self.LEAVE) / 1.1
+            c = QColor(TXT)
+            c.setAlphaF(_cl(min(k * 5, (1 - k) * 2)))
+            f = QFont()
+            f.setPointSizeF(8.5)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(c)
+            p.drawText(QPointF(x - 20, y - 12), "Kiaaa !")
+        if t >= self.LEAVE:                  # plume qui tombe en zigzag
+            u = (t - self.LEAVE) / 3.0
+            if u <= 1:
+                fx = 4 + math.sin(u * 9) * 14
+                fy = lerp(-150, -6, u)
+                c = QColor("#ffffff")
+                c.setAlphaF(_cl((1 - u) * 3))
+                p.save()
+                p.translate(fx, fy)
+                p.rotate(math.sin(u * 9) * 40)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(0, 0), 2.2, 6)
+                p.setPen(QPen(qc("#b9c3d1", c.alpha()), .8))
+                p.drawLine(QPointF(0, -6), QPointF(0, 8))
+                p.restore()
+
+
+class ACafe(GAnim):
+    name, label, dur = "cafe", "La pause café", 4.6
+
+    def pose(self, t, P):
+        up = win(t, .3, 1.0) * (1 - win(t, 3.6, 4.3))
+        sip = win(t, 1.4, 1.9) * (1 - win(t, 2.6, 3.0))
+        h = ik(1, lerp(26, 12, up), lerp(-14, -62, up))
+        P.update(ra1=h[0], ra2=h[1], eye=1 if sip > .3 else 0, mouth=0, head=-5 * sip, look=.4)
+        return P
+
+    def front(self, p, t, gp, P):
+        R = gp.hand_pos(P, 1)
+        p.save()
+        p.translate(R)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#f4efe6"))
+        p.drawRoundedRect(QRectF(-6, -12, 12, 12), 2.5, 2.5)
+        p.setBrush(QColor("#5a3a24"))
+        p.drawRect(QRectF(-5, -11, 10, 2.4))
+        p.setPen(QPen(QColor("#f4efe6"), 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(3, -10, 7, 7), -90 * 16, 180 * 16)
+        for i in range(3):
+            u = ((t * .9) + i / 3) % 1.0
+            c = QColor(MUT)
+            c.setAlphaF((1 - u) * .7)
+            p.setPen(QPen(c, 1.3))
+            p.drawLine(QPointF(-3 + i * 3 + math.sin(u * 6 + i) * 1.5, -14 - u * 12),
+                       QPointF(-3 + i * 3 + math.sin(u * 6 + i + 1) * 1.5, -17 - u * 12))
+        p.restore()
+
+
+class ACasque(GAnim):
+    name, label, dur = "casque", "Le morceau préféré", 5.0
+
+    def pose(self, t, P):
+        k = win(t, .3, .8) * (1 - win(t, 4.4, 4.9))
+        b = t * 2 * math.pi / .55
+        P.update(head=lerp(0, 7 * math.sin(b), k), y=-1.6 * k * abs(math.sin(b / 2)), eye=1 if k > .3 else 0, mouth=2 if k > .5 else 0,
+                 la1=lerp(10, 70, k), la2=lerp(8, 90, k))
+        return P
+
+    def front(self, p, t, gp, P):
+        k = win(t, .3, .8) * (1 - win(t, 4.4, 4.9))
+        if k <= .01:
+            return
+        for i in range(3):
+            u = ((t * .7) + i / 3) % 1.0
+            col = QColor(ACC)
+            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.6)) * k)
+            draw_note(p, 30 + math.sin(u * 5 + i) * 8, -110 - u * 55, col, .8, i == 1)
+
+
+class AEtire(GAnim):
+    name, label, dur = "etire", "L'étirement du matin", 4.4
+
+    def pose(self, t, P):
+        up = win(t, .4, 1.3) * (1 - win(t, 3.0, 3.8))
+        yawn = win(t, 1.2, 1.7) * (1 - win(t, 2.7, 3.1))
+        r = ik(1, 18, -120)
+        l = ik(-1, -18, -120)
+        P.update(ra1=lerp(10, r[0], up), ra2=lerp(8, r[1], up), la1=lerp(10, l[0], up), la2=lerp(8, l[1], up),
+                 y=-3 * up, sq=-.05 * up + .015 * math.sin(t * 9) * yawn, head=-6 * yawn,
+                 eye=1 if yawn > .2 else 0, mouth=1 if yawn > .3 else 0)
+        return P
+
+
+class AHoquet(GAnim):
+    name, label, dur = "hoquet", "Le hoquet", 4.4
+    HIC = (.8, 1.9, 2.7, 3.3)
+
+    def pose(self, t, P):
+        k = 0.0
+        for h in self.HIC:
+            d = t - h
+            if 0 <= d < .35:
+                k = max(k, math.sin(d / .35 * math.pi))
+        P.update(y=-9 * k, sq=.07 * k, head=3 * k, eye=3 if k > .35 else 0, mouth=1 if k > .35 else 0,
+                 ra1=lerp(10, 34, k), ra2=lerp(8, 60, k))
+        return P
+
+    def front(self, p, t, gp, P):
+        f = QFont()
+        f.setPointSizeF(9)
+        f.setBold(True)
+        p.setFont(f)
+        for h in self.HIC:
+            d = t - h
+            if 0 <= d < .9:
+                c = QColor(ACC)
+                c.setAlphaF(_cl(1 - d / .9))
+                p.setPen(c)
+                p.drawText(QPointF(26, -140 - d * 22), "hic !")
+
+
+class AHello(GAnim):
+    """Petit coucou (au survol)."""
+    name, label, dur = "hello", "Coucou", 1.8
+
+    def pose(self, t, P):
+        k = win(t, 0, .25) * (1 - win(t, self.dur - .3, self.dur))
+        P.update(ra1=lerp(P["ra1"], 150, k), ra2=lerp(P["ra2"], 18 + math.sin(t * 13) * 26 * k, k), eye=1, mouth=2, head=-4 * k)
+        return P
+
+
+G_ANIMS = [AGavotte(), ACrepes(), ACrachin(), AGoeland(), ACafe(), ACasque(), AEtire(), AHoquet()]
+G_HELLO = AHello()
+
+
+class GaelView(QWidget):
+    """Gaël animé. mode « rail » : sous le menu, joue ses animations ; mode « chat » : parle et réfléchit (onglet SOS)."""
+    clicked = Signal()
+    BOX = {"rail": QRectF(-64, -222, 150, 240), "chat": QRectF(-48, -160, 96, 170), "head": QRectF(-34, -158, 68, 104)}
+
+    def __init__(self, mode="rail", parent=None, app=None):
+        super().__init__(parent)
+        self.mode, self.app = mode, app
+        self.gp = GaelPainter()
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.t_last = 0.0
+        self.anim, self.a_t0 = None, 0.0
+        self.queue = list(range(len(G_ANIMS)))
+        random.shuffle(self.queue)
+        self.next_at = 7.0
+        self.talk, self.think, self.on_air = 0.0, False, False
+        self.blink_at, self.look_at, self.look_to, self.look_cur = 2.5, 4.0, 0.0, 0.0
+        self.coif, self.coif_v, self.prev = 0.0, 0.0, None
+        self.hover = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self._drawn = 0.0
+        Ticker.add(self, self._tick, 60, always=True)
+        if mode == "rail":
+            self.setToolTip("Gaël, ton assistant d'antenne · clic : une animation · clic droit : menu")
+
+    # --- cadence : 60 i/s pendant une animation, 30 i/s au repos, arrêt complet si invisible
+    def now(self):
+        return self.clock.elapsed() / 1000.0
+
+    def play(self, a):
+        if isinstance(a, str):
+            a = next((x for x in G_ANIMS if x.name == a), None)
+        if a is None:
+            return
+        self.anim, self.a_t0 = a, self.now()
+        self.update()
+
+    def play_next(self):
+        if not self.queue:
+            self.queue = list(range(len(G_ANIMS)))
+            random.shuffle(self.queue)
+        self.play(G_ANIMS[self.queue.pop(0)])
+
+    def say(self, n):
+        self.talk = max(self.talk, n)
+
+    def enterEvent(self, e):
+        self.hover = True
+        if self.mode == "rail" and self.anim is None:
+            self.play(G_HELLO)
+
+    def leaveEvent(self, e):
+        self.hover = False
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            if self.mode == "rail":
+                if self.anim is None or self.anim is G_HELLO:
+                    self.play_next()
+            self.clicked.emit()
+
+    def contextMenuEvent(self, e):
+        if self.mode != "rail":
+            return
+        m = QMenu(self)
+        if self.app is not None:
+            m.addAction("Parler à Gaël (SOS)", lambda: self.app.go_tab("sos"))
+            m.addSeparator()
+        for a in G_ANIMS:
+            m.addAction(a.label, lambda a=a: self.play(a))
+        m.exec(e.globalPos())
+
+    def _tick(self, tt, dt):
+        """Horloge commune : 60 i/s pendant une animation (ou s'il parle), 30 i/s au repos, rien s'il est caché."""
+        t = self.now()
+        if self.anim is None and self.mode == "rail" and ANIM and t > self.next_at:
+            self.play_next()
+        if self.anim is not None and t - self.a_t0 > self.anim.dur:
+            self.anim = None
+            self.next_at = t + random.uniform(26, 48)
+        busy = self.anim is not None or self.talk > 0 or self.hover or abs(self.coif_v) > .5
+        if not busy and (not ANIM or t - self._drawn < .030):
+            return False
+        self._drawn = t
+        return True
+
+    # --- pose courante
+    def current_pose(self, t, dt=.016):
+        P = dict(POSE0)
+        br = math.sin(t * 2.1)
+        P.update(sq=br * .012, la1=10 + br * 2.5, ra1=10 + br * 2.5, head=math.sin(t * .7) * 1.6)
+        if t > self.look_at:
+            self.look_to = random.choice((-1, -.5, 0, 0, .5, 1))
+            self.look_at = t + random.uniform(2.5, 6)
+        self.look_cur += (self.look_to - self.look_cur) * min(1.0, dt * 7)
+        P["look"] = self.look_cur
+        if t > self.blink_at:
+            d = t - self.blink_at
+            P["blink"] = math.sin(min(1, d / .16) * math.pi)
+            if d > .16:
+                self.blink_at = t + random.uniform(2.2, 5.5)
+        if self.think:
+            a1, a2 = ik(1, 8, -40)
+            P.update(ra1=a1, ra2=a2, look=-.8, lookv=-1, eye=4, head=-5)
+        if self.anim is not None:
+            at = t - self.a_t0
+            AP = self.anim.pose(at, dict(P))
+            w = min(win(at, 0, .35), 1 - win(at, self.anim.dur - .35, self.anim.dur))
+            blink = P["blink"]
+            P = blend(P, AP, w)
+            P["blink"] = blink if AP.get("eye", 0) in (0, 3, 4) else 0
+        return P
+
+    def spring(self, t, P, dt):
+        """La coiffe suit les mouvements avec un léger retard (ressort amorti)."""
+        hx = P["x"]
+        ha = P["rot"] + P["head"]
+        if self.prev is None:
+            self.prev = (hx, ha, 0.0)
+        px, pa, pvx = self.prev
+        vx = (hx - px) / dt if dt > 0 else 0.0
+        ax = (vx - pvx) / dt if dt > 0 else 0.0
+        da = (ha - pa) / dt if dt > 0 else 0.0
+        acc = -90.0 * self.coif - 9.0 * self.coif_v - _cl(ax, -900, 900) * .02 - _cl(da, -400, 400) * .05
+        self.coif_v += acc * dt
+        self.coif += self.coif_v * dt
+        self.coif = _cl(self.coif, -16, 16)
+        self.prev = (hx, ha, vx)
+
+    def paintEvent(self, e):
+        t = self.now()
+        dt = _cl(t - self.t_last, 0.0, .05)
+        self.t_last = t
+        if self.talk > 0:
+            self.talk = max(0.0, self.talk - dt)
+        P = self.current_pose(t, dt)
+        self.spring(t, P, dt)
+        P["coif"] += self.coif
+        p = new_painter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        W, H = self.width(), self.height()
+        box = self.BOX[self.mode]
+        name_h = 18 if self.mode == "rail" else 0
+        s = min(W / box.width(), (H - name_h) / box.height())
+        p.translate(W / 2 - (box.center().x()) * s, (H - name_h) - box.bottom() * s)
+        p.scale(s, s)
+        a = self.anim
+        at = t - self.a_t0 if a else 0
+        if a:
+            a.back(p, at, self.gp, P)
+        self.gp.draw(p, P, talk=min(1.0, self.talk * 2), on_air=self.on_air, t=t,
+                     hand_r=a.hand_r(at) if a else None, hand_l=a.hand_l(at) if a else None, dial=t * (1.6 if self.on_air else .5))
+        if a:
+            a.front(p, at, self.gp, P)
+        if self.think:
+            for i in range(3):
+                c = QColor(MUT)
+                c.setAlphaF(.35 + .65 * max(0.0, math.sin(t * 6 - i * .9)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(24 + i * 7, -150), 2.2, 2.2)
+        if name_h:
+            p.resetTransform()
+            f = QFont(self.font())
+            f.setPointSizeF(9.5)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor(TXT))
+            fm = QFontMetrics(f)
+            name = "Gaël, le radio-bot"
+            tw = fm.horizontalAdvance(name)
+            x0 = (W - tw - 12) / 2
+            p.drawText(QPointF(x0 + 12, H - 4), name)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(OKC if self.on_air else MUT))
+            p.drawEllipse(QPointF(x0 + 3, H - 8), 3, 3)
+
+
+class GaelHead(QWidget):
+    """Petite tête de Gaël pour les voyants d'état : contente (ok), inquiète (silence, attente) ou fâchée (panne).
+    Dessinée seulement quand l'état change (et une petite secousse en cas de panne) : coût quasi nul."""
+    MOODS = {"ok": dict(eye=1, mouth=2, eyec=None), "wait": dict(eye=0, mouth=0, eyec="#8a93a8"),
+             "warn": dict(eye=2, mouth=3, eyec="#ffb347"), "bad": dict(eye=5, mouth=4, eyec="#ff5d6c")}
+    _gp = None
+
+    def __init__(self, size=34, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self.mood, self.t, self.level, self.tt = "wait", 0, .7, 0.0
+        if GaelHead._gp is None:
+            GaelHead._gp = GaelPainter()
+        Ticker.add(self, self._step, 30)
+
+    def _step(self, t, dt):
+        self.tt = t
+        return self.mood in ("ok", "bad")
+
+    def set_level(self, db):
+        """Crête mesurée (dB) : la forme d'onde est plus ou moins haute selon le niveau réel du flux."""
+        self.level = _cl((db + 50) / 44, .25, 1.0) if db is not None else .7
+
+    def set_mood(self, m):
+        if m != self.mood:
+            self.mood = m
+            self.setToolTip({"ok": "Gaël : tout va bien, le son passe", "wait": "Gaël : vérification en attente",
+                             "warn": "Gaël : silence sur ce flux", "bad": "Gaël : ce flux ne répond pas !"}.get(m, ""))
+            self.update()
+
+    def set_color(self, c):                    # compatibilité avec l'ancien voyant
+        self.set_mood("ok" if c in ("#2ecc71", OKC) else ("bad" if c in ("#e74c3c", BADC) else "wait"))
+
+    def tick(self):
+        pass
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        W, H = self.width(), self.height()
+        s = W / 64.0
+        P = dict(POSE0)
+        P.update(self.MOODS.get(self.mood, {}))
+        P["mini"] = True
+        if self.mood == "ok":                   # tout va bien : petite forme d'onde vivante à la place de la tête
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc(OKC, 34))
+            p.drawRoundedRect(QRectF(0, 0, W, H), 10, 10)
+            n, t = 7, self.tt
+            bw = W / (n * 1.7)
+            rects = []
+            for i in range(n):
+                v = .35 + .65 * abs(math.sin(t * (2.3 + i * .37) + i * 1.3) * math.sin(t * 1.1 + i * .8))
+                hh = max(2.5, v * self.level * (H - 10))
+                x = (W - (n - 1) * bw * 1.7 - bw) / 2 + i * bw * 1.7
+                rects.append(QRectF(x, H / 2 - hh / 2, bw, hh))
+            p.setBrush(QColor(OKC))
+            for r in rects:
+                p.drawRoundedRect(r, bw / 2, bw / 2)
+            return
+        if self.mood == "bad":
+            P["head"] = math.sin(self.tt * 4.2) * 2.4
+        if self.mood == "bad":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc(BADC, 50))
+            p.drawEllipse(QPointF(W / 2, H / 2 + 2 * s), W / 2, W / 2.2)
+        p.translate(W / 2, H - .5)
+        p.scale(s, s)
+        p.rotate(P["head"])
+        GaelHead._gp._head(p, P, 0, 0.0)
+
+
+class Splash(QWidget):
+    """Écran de chargement : Gaël écoute de la musique sous une antenne FM."""
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setFixedSize(380, 400)
+        self.gp = GaelPainter()
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        try:
+            g = QApplication.primaryScreen().availableGeometry()
+            self.move(g.center() - self.rect().center())
+        except Exception:
+            pass
+
+    def spin(self, ms):
+        """Anime pendant `ms` millisecondes (la boucle d'événements reste vivante)."""
+        end = self.clock.elapsed() + ms
+        while self.clock.elapsed() < end:
+            self.update()
+            QApplication.processEvents()
+            QThread.msleep(10)
+
+    def paintEvent(self, e):
+        t = self.clock.elapsed() / 1000.0
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        p.setPen(QPen(QColor(LINE), 1))
+        p.setBrush(QColor(PAGE))
+        p.drawRoundedRect(QRectF(.5, .5, W - 1, H - 1), 16, 16)
+        # antenne FM
+        ax, ay = W / 2, 168
+        p.setPen(QPen(QColor(MUT), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(ax, ay), QPointF(ax, ay - 56))
+        for i, w in enumerate((30, 24, 18)):
+            y = ay - 54 + i * 11
+            p.drawLine(QPointF(ax - w, y), QPointF(ax + w, y))
+        p.setBrush(QColor(ACC))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(ax, ay - 58), 4, 4)
+        for k in range(3):                       # ondes qui descendent vers Gaël
+            u = ((t * .8) + k / 3) % 1.0
+            c = QColor(ACC)
+            c.setAlphaF((1 - u) * .75)
+            p.setPen(QPen(c, 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            r = 12 + u * 40
+            p.drawArc(QRectF(ax - r, ay - 58 - r, 2 * r, 2 * r), 200 * 16, 140 * 16)
+        # Gaël
+        P = dict(POSE0)
+        b = t * 2 * math.pi / .6
+        k = win(t, .15, .6)
+        P.update(head=6 * math.sin(b) * k, y=-1.8 * abs(math.sin(b / 2)) * k, eye=1, mouth=2,
+                 la1=60, la2=90, ra1=-10 + 8 * math.sin(b), ra2=8)
+        p.save()
+        s = 1.05
+        p.translate(W / 2, 352)
+        p.scale(s, s)
+        self.gp.draw(p, P, t=t, on_air=True, dial=t * 1.5)
+        for i in range(4):
+            u = ((t * .6) + i / 4) % 1.0
+            col = QColor(ACC)
+            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.6)))
+            draw_note(p, (45 if i % 2 else -52) + math.sin(u * 5 + i) * 8, -100 - u * 60, col, .85, i % 2 == 1)
+        p.restore()
+        # titre + barre
+        f = QFont(self.font())
+        f.setPointSizeF(20)
+        f.setWeight(QFont.Weight.ExtraBold)
+        p.setFont(f)
+        p.setPen(QColor(TXT))
+        draw_logo(p, W / 2 - 44, 40, 22, None, 3, 0.0)
+        p.drawText(QRectF(W / 2 - 12, 14, 120, 40), Qt.AlignmentFlag.AlignVCenter, APP)
+        f.setPointSizeF(7.5)
+        f.setWeight(QFont.Weight.Normal)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        p.setFont(f)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(0, 70, W, 16), Qt.AlignmentFlag.AlignCenter, "BROADCAST TOOL")
+        bw = 120
+        x0 = (W - bw) / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(LINE))
+        p.drawRoundedRect(QRectF(x0, H - 22, bw, 4), 2, 2)
+        p.setBrush(QColor(ACC))
+        u = (t * .9) % 1.0
+        a, bb = max(0, u * 1.5 - .5), min(1, u * 1.5)
+        p.drawRoundedRect(QRectF(x0 + a * bw, H - 22, (bb - a) * bw, 4), 2, 2)
+        p.end()
+
+# ------------------------------------------------------------------ bibliothèque du secours (façon Apple Musique)
+# Lecture des étiquettes et pochettes directement dans les fichiers (ID3, FLAC, MP4/M4A) : pas besoin de ffmpeg,
+# donc fiable sous Windows. ffmpeg / ffprobe ne servent plus que de secours (OGG, formats exotiques, durée).
+import struct as _st
+
+
+def _syncsafe(b):
+    return (b[0] & 0x7f) << 21 | (b[1] & 0x7f) << 14 | (b[2] & 0x7f) << 7 | (b[3] & 0x7f)
+
+
+def _id3_text(data):
+    if not data:
+        return ""
+    enc, raw = data[0], data[1:]
+    try:
+        if enc == 0:
+            t = raw.decode("latin-1")
+        elif enc == 1:
+            t = raw.decode("utf-16")
+        elif enc == 2:
+            t = raw.decode("utf-16-be")
+        else:
+            t = raw.decode("utf-8")
+    except Exception:
+        t = raw.decode("latin-1", "replace")
+    return t.replace("\x00", " / ").strip(" /")
+
+
+def _id3(fh):
+    h = fh.read(10)
+    if len(h) < 10 or h[:3] != b"ID3":
+        return {}
+    ver, flags, size = h[3], h[5], _syncsafe(h[6:10])
+    data = fh.read(size)
+    if flags & 0x80:                                 # désynchronisation globale
+        data = data.replace(b"\xff\x00", b"\xff")
+    pos, out = 0, {}
+    if flags & 0x40 and ver >= 3 and len(data) > 4:  # en-tête étendu
+        ext = _syncsafe(data[:4]) if ver == 4 else _st.unpack(">I", data[:4])[0] + 4
+        pos = ext
+    names = {"TIT2": "title", "TPE1": "artist", "TALB": "album", "TPE2": "albumartist", "TCON": "genre", "TYER": "year", "TDRC": "year",
+             "TT2": "title", "TP1": "artist", "TAL": "album", "TCO": "genre", "TYE": "year"}
+    while pos < len(data) - 10:
+        if ver == 2:
+            fid, fsz, hl = data[pos:pos + 3].decode("latin-1", "replace"), int.from_bytes(data[pos + 3:pos + 6], "big"), 6
+        else:
+            fid = data[pos:pos + 4].decode("latin-1", "replace")
+            fsz = _syncsafe(data[pos + 4:pos + 8]) if ver == 4 else _st.unpack(">I", data[pos + 4:pos + 8])[0]
+            hl = 10
+        if not fid.strip("\x00") or fsz <= 0:
+            break
+        body = data[pos + hl:pos + hl + fsz]
+        pos += hl + fsz
+        if fid in names and names[fid] not in out:
+            out[names[fid]] = _id3_text(body)
+        elif fid in ("APIC", "PIC") and "art" not in out and body:
+            enc = body[0]
+            if fid == "APIC":
+                e = body.index(b"\x00", 1)
+                ptype, i = body[e + 1], e + 2
+            else:
+                ptype, i = body[4], 5
+            if enc in (1, 2):
+                while i + 1 < len(body) and body[i:i + 2] != b"\x00\x00":
+                    i += 2
+                i += 2
+            else:
+                i = body.index(b"\x00", i) + 1
+            img = body[i:]
+            if img:
+                out.setdefault("_arts", []).append((ptype, img))
+    arts = out.pop("_arts", [])
+    if arts:
+        out["art"] = next((a for t, a in arts if t == 3), arts[0][1])   # 3 = recto de la pochette
+    if out.get("genre", "").startswith("(") and ")" in out.get("genre", ""):
+        out["genre"] = out["genre"].split(")", 1)[1] or out["genre"]
+    return out
+
+
+def _flac(fh):
+    if fh.read(4) != b"fLaC":
+        return {}
+    out = {}
+    while True:
+        h = fh.read(4)
+        if len(h) < 4:
+            break
+        last, typ, ln = h[0] & 0x80, h[0] & 0x7f, int.from_bytes(h[1:4], "big")
+        b = fh.read(ln)
+        if typ == 4:                                 # VORBIS_COMMENT
+            try:
+                vl = _st.unpack("<I", b[:4])[0]
+                o = 4 + vl
+                n = _st.unpack("<I", b[o:o + 4])[0]
+                o += 4
+                for _ in range(n):
+                    cl = _st.unpack("<I", b[o:o + 4])[0]
+                    k, _, v = b[o + 4:o + 4 + cl].decode("utf-8", "replace").partition("=")
+                    o += 4 + cl
+                    key = {"title": "title", "artist": "artist", "album": "album", "genre": "genre", "date": "year"}.get(k.lower())
+                    if key and key not in out:
+                        out[key] = v
+            except Exception:
+                pass
+        elif typ == 6 and "art" not in out:           # PICTURE
+            try:
+                o = 4
+                ml = _st.unpack(">I", b[o:o + 4])[0]
+                o += 4 + ml
+                dl = _st.unpack(">I", b[o:o + 4])[0]
+                o += 4 + dl + 16
+                il = _st.unpack(">I", b[o:o + 4])[0]
+                out["art"] = b[o + 4:o + 4 + il]
+            except Exception:
+                pass
+        if last:
+            break
+    return out
+
+
+def _mp4(fh):
+    out = {}
+    fh.seek(0, 2)
+    end = fh.tell()
+
+    def atoms(start, stop):
+        pos = start
+        while pos + 8 <= stop:
+            fh.seek(pos)
+            h = fh.read(8)
+            if len(h) < 8:
+                return
+            size, name = _st.unpack(">I", h[:4])[0], h[4:8]
+            hl = 8
+            if size == 1:
+                size, hl = _st.unpack(">Q", fh.read(8))[0], 16
+            elif size == 0:
+                size = stop - pos
+            if size < hl:
+                return
+            yield name, pos + hl, pos + size
+            pos += size
+    keys = {b"\xa9nam": "title", b"\xa9ART": "artist", b"\xa9alb": "album", b"\xa9gen": "genre", b"\xa9day": "year", b"covr": "art"}
+
+    def walk(start, stop, depth=0):
+        for name, a, b in atoms(start, stop):
+            if name in (b"moov", b"udta", b"ilst"):
+                walk(a, b, depth + 1)
+            elif name == b"meta":
+                walk(a + 4, b, depth + 1)
+            elif name in keys and keys[name] not in out:
+                for n2, a2, b2 in atoms(a, b):
+                    if n2 == b"data":
+                        fh.seek(a2 + 8)
+                        raw = fh.read(b2 - a2 - 8)
+                        out[keys[name]] = raw if name == b"covr" else raw.decode("utf-8", "replace")
+                        break
+    fh.seek(4)
+    if fh.read(4) != b"ftyp":
+        return {}
+    walk(0, end)
+    return out
+
+
+def read_tags(path):
+    """{title, artist, album, genre, year, art (octets de l'image)} lus dans le fichier ; {} si rien."""
+    try:
+        with open(path, "rb") as fh:
+            low = path.lower()
+            if low.endswith(".flac"):
+                return _flac(fh)
+            if low.endswith((".m4a", ".mp4", ".aac", ".alac", ".m4b")):
+                r = _mp4(fh)
+                if r or not low.endswith(".aac"):
+                    return r
+                fh.seek(0)
+            return _id3(fh)
+    except Exception:
+        return {}
+
+
+def folder_art(path):
+    try:
+        d = os.path.dirname(path)
+        imgs = [f for f in os.listdir(d) if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))]
+        low = {f.lower(): f for f in imgs}
+        for stem in ("cover", "folder", "front", "album", "albumart", "artwork", "pochette"):
+            for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                if stem + ext in low:
+                    return os.path.join(d, low[stem + ext])
+        pick = next((f for f in imgs if any(k in f.lower() for k in ("cover", "front", "folder", "album", "pochette"))), None)
+        if pick or len(imgs) == 1:
+            return os.path.join(d, pick or imgs[0])
+    except OSError:
+        pass
+    return None
+
+
+def square_image(img, size):
+    """Image recadrée au carré et réduite (QImage : utilisable hors du fil de l'interface)."""
+    if img is None or img.isNull():
+        return None
+    s = min(img.width(), img.height())
+    img = img.copy((img.width() - s) // 2, (img.height() - s) // 2, s, s)
+    return img.scaled(size, size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+
+def track_meta(path, size=96):
+    """(infos, pochette QImage ou None) : étiquettes, puis image du dossier, puis ffmpeg en dernier recours."""
+    tags = read_tags(path)
+    img = None
+    art = tags.pop("art", None)
+    if art:
+        q = QImage()
+        if q.loadFromData(art):
+            img = square_image(q, size)
+    if img is None:
+        fa = folder_art(path)
+        if fa:
+            img = square_image(QImage(fa), size)
+    if img is None and shutil.which("ffmpeg"):
+        png = cover_png(path, size)
+        if png:
+            q = QImage()
+            if q.loadFromData(png):
+                img = square_image(q, size)
+    return tags, img
+
+
+# ------------------------------------------------------------------ colonne des dossiers
+TRACK_MIME = "application/x-studio-tracks"
+
+
+class FolderBar(QWidget):
+    """Barre latérale des dossiers : clic = filtrer, glisser des titres dessus = les ranger, glisser des fichiers = les ajouter."""
+    RH = 32
+
+    def __init__(self, app):
+        super().__init__()
+        self.app, self.items, self.hov, self.drop = app, [], None, None
+        self.setFixedWidth(120)
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_items(self, items, cur):
+        """items : [(libellé, clé, nombre)] ; clé None = tous, "" = sans dossier."""
+        self.items, self.cur = items, cur
+        self.setMinimumHeight(min(96, 30 + (len(items) + 1) * self.RH))
+        self.update()
+
+    def row_at(self, y):
+        k = int((y - 26) // self.RH)
+        return k if 0 <= k <= len(self.items) else None
+
+    def mouseMoveEvent(self, e):
+        k = self.row_at(e.position().y())
+        if k != self.hov:
+            self.hov = k
+            self.update()
+
+    def leaveEvent(self, e):
+        self.hov = None
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        k = self.row_at(e.position().y())
+        if k is None:
+            return
+        if k == len(self.items):
+            return self.app.pl_new_folder()
+        key = self.items[k][1]
+        if e.button() == Qt.MouseButton.RightButton and key:
+            return self.app.pl_folder_menu(key, e.globalPosition().toPoint())
+        self.app.pl_set_view(key)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(TRACK_MIME) or e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        k = self.row_at(e.position().y())
+        ok = k is not None and k < len(self.items) and (self.items[k][1] is not None or e.mimeData().hasUrls())
+        if k != self.drop:
+            self.drop = k if ok else None
+            self.update()
+        e.acceptProposedAction() if ok else e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self.drop = None
+        self.update()
+
+    def dropEvent(self, e):
+        k, self.drop = self.row_at(e.position().y()), None
+        self.update()
+        if k is None or k >= len(self.items):
+            return
+        key = self.items[k][1]
+        md = e.mimeData()
+        if md.hasFormat(TRACK_MIME):
+            idx = [int(x) for x in bytes(md.data(TRACK_MIME)).decode().split(",") if x.isdigit()]
+            if key is not None:
+                self.app.pl_move(idx, key)
+                self.app.log(f"{len(idx)} titre(s) rangé(s) dans « {key or 'Sans dossier'} ».")
+        elif md.hasUrls():
+            prev = self.app.pl_view
+            self.app.pl_view = key or None
+            self.app.pl_drop([u.toLocalFile() for u in md.urls() if u.isLocalFile()])
+            if prev != self.app.pl_view:
+                self.app.pl_refresh()
+        e.acceptProposedAction()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W = self.width()
+        f = QFont(self.font())
+        f.setPointSizeF(7.6)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
+        p.setFont(f)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(10, 4, W, 18), Qt.AlignmentFlag.AlignVCenter, "BIBLIOTHÈQUE")
+        fn = QFont(self.font())
+        fn.setPointSizeF(9.6)
+        for k, (lb, key, n) in enumerate(self.items + [("Nouveau", "+", 0)]):
+            y = 26 + k * self.RH
+            r = QRectF(2, y + 2, W - 6, self.RH - 4)
+            on = key == self.cur and key != "+"
+            p.setPen(Qt.PenStyle.NoPen)
+            if self.drop == k:
+                p.setBrush(qc(ACC, 70))
+                p.drawRoundedRect(r, 10, 10)
+                p.setPen(QPen(QColor(ACC), 1.4))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(r, 10, 10)
+            elif on:
+                p.setBrush(mixc(PANEL, TXT, .07))
+                p.drawRoundedRect(r, 10, 10)
+            elif k == self.hov:
+                p.setBrush(mixc(PANEL, TXT, .05))
+                p.drawRoundedRect(r, 10, 10)
+            col = QColor(ACCT if on else (MUT if key == "+" else TXT))
+            ic = r.left() + 14
+            cy = r.center().y()
+            p.setPen(ppen(ACCT if on else MUT, 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if key is None:                          # note de musique
+                p.drawEllipse(QPointF(ic - 2, cy + 3), 2.6, 2.2)
+                p.drawLine(QPointF(ic + .6, cy + 3), QPointF(ic + .6, cy - 5))
+                p.drawLine(QPointF(ic + .6, cy - 5), QPointF(ic + 5, cy - 3))
+            elif key == "+":
+                p.drawLine(QPointF(ic - 4, cy), QPointF(ic + 4, cy))
+                p.drawLine(QPointF(ic, cy - 4), QPointF(ic, cy + 4))
+            else:                                    # dossier
+                path = QPainterPath(QPointF(ic - 6, cy + 5))
+                path.lineTo(ic - 6, cy - 4)
+                path.lineTo(ic - 2, cy - 4)
+                path.lineTo(ic, cy - 2)
+                path.lineTo(ic + 6, cy - 2)
+                path.lineTo(ic + 6, cy + 5)
+                path.closeSubpath()
+                p.drawPath(path)
+            fb = QFont(fn)
+            fb.setBold(on)
+            p.setFont(fb)
+            p.setPen(col)
+            fm = QFontMetrics(fb)
+            p.drawText(QRectF(ic + 12, y, W - ic - 44, self.RH), Qt.AlignmentFlag.AlignVCenter,
+                       fm.elidedText(lb, Qt.TextElideMode.ElideRight, int(W - ic - 46)))
+            if key != "+":
+                p.setFont(fn)
+                p.setPen(QColor(ACCT if on else MUT))
+                p.drawText(QRectF(W - 40, y, 32, self.RH), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, str(n))
+
+
+# ------------------------------------------------------------------ liste des titres
+class TrackList(QWidget):
+    """Liste façon Apple Musique : case de sélection (tout sélectionner dans l'en-tête), pochette, titre / artiste · album,
+    rotation, lectures, durée. Glisser des titres vers un dossier pour les ranger ; déposer des fichiers pour les ajouter."""
+    RH, HEAD = 46, 26          # hauteur de ligne visée ; la vraie (self.rh) s'ajuste pour que seules des lignes entières s'affichent
+
+    def __init__(self, on_toggle, on_play, on_menu=None, on_delete=None):
+        super().__init__()
+        self.setMinimumHeight(96)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAcceptDrops(True)
+        self.rows, self.now, self.prog, self.off = [], -1, 0.0, 0.0
+        self.rh = float(self.RH)
+        self.sel, self.hov, self.anchor = set(), None, None
+        self.cb_t, self.cb_p, self.cb_m, self.cb_d, self.cb_s, self.cb_drop = on_toggle, on_play, on_menu, on_delete, None, None
+        self.drag, self.press, self.dropping = None, None, False
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        Ticker.add(self, lambda t, dt: self.tick(), 30)   # petite animation du titre en cours : 30 i/s suffisent
+
+    # --- état
+    def tick(self):
+        if self.now >= 0 and ANIM:
+            k = next((i for i, r in enumerate(self.rows) if r["i"] == self.now), -1)
+            if k >= 0:
+                y = self.HEAD + k * self.rh - self.off
+                self.update(QRect(0, int(y), self.width(), self.rh))
+
+    def body_h(self):
+        return self.height() - self.HEAD
+
+    def nvis(self):
+        return max(1, round(self.body_h() / self.RH))
+
+    def resizeEvent(self, e):
+        top = int(round(self.off / self.rh)) if self.rh else 0
+        self.rh = max(30.0, self.body_h() / self.nvis())
+        self.off = top * self.rh
+        self.clamp()
+        super().resizeEvent(e)
+
+    def maxoff(self):
+        return max(0, len(self.rows) - self.nvis()) * self.rh
+
+    def clamp(self):
+        """Toujours aligné sur une ligne entière : jamais de pochette coupée en haut ou en bas."""
+        self.off = max(0.0, min(self.maxoff(), round(self.off / self.rh) * self.rh))
+
+    def set(self, rows, now=-1):
+        self.rows = [r for r in rows if r["i"] == now] + [r for r in rows if r["i"] != now]
+        self.now = now
+        self.sel &= {r["i"] for r in rows}
+        self._sc()
+        self.clamp()
+        self.update()
+
+    def set_prog(self, p):
+        if abs(p - self.prog) > .003:
+            self.prog = p
+
+    def selection(self):
+        return sorted(self.sel)
+
+    def _sc(self):
+        if self.cb_s:
+            self.cb_s(len(self.sel))
+
+    def select_all(self, on=True):
+        self.sel = {r["i"] for r in self.rows} if on else set()
+        self.anchor = None
+        self._sc()
+        self.update()
+
+    def all_selected(self):
+        return bool(self.rows) and len(self.sel) >= len(self.rows)
+
+    def cur_k(self):
+        ks = [k for k, r in enumerate(self.rows) if r["i"] in self.sel]
+        return ks[-1] if ks else -1
+
+    def show_k(self, k):
+        top = int(round(self.off / self.rh))
+        if k < top:
+            top = k
+        elif k >= top + self.nvis():
+            top = k - self.nvis() + 1
+        self.off = top * self.rh
+        self.clamp()
+
+    def step(self, d, extend=False):
+        if not self.rows:
+            return
+        k = self.cur_k()
+        k = 0 if k < 0 else max(0, min(len(self.rows) - 1, k + d))
+        i = self.rows[k]["i"]
+        if extend and self.anchor is not None:
+            a = next((q for q, r in enumerate(self.rows) if r["i"] == self.anchor), k)
+            self.sel = {r["i"] for r in self.rows[min(a, k):max(a, k) + 1]}
+        else:
+            self.sel, self.anchor = {i}, i
+        self.show_k(k)
+        self._sc()
+        self.update()
+
+    def keyPressEvent(self, e):
+        k, sh = e.key(), bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        K = Qt.Key
+        if k == K.Key_Up:
+            self.step(-1, sh)
+        elif k == K.Key_Down:
+            self.step(1, sh)
+        elif k == K.Key_PageUp:
+            self.step(-6)
+        elif k == K.Key_PageDown:
+            self.step(6)
+        elif k == K.Key_Home:
+            self.step(-9999)
+        elif k == K.Key_End:
+            self.step(9999)
+        elif k in (K.Key_Return, K.Key_Enter):
+            kk = self.cur_k()
+            if kk >= 0:
+                self.cb_p(self.rows[kk]["i"])
+        elif k == K.Key_Space:
+            if self.sel:
+                self.cb_t(min(self.sel))
+        elif k in (K.Key_Delete, K.Key_Backspace):
+            if self.cb_d and self.sel:
+                self.cb_d()
+        elif k == K.Key_A and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.select_all(not self.all_selected())
+        else:
+            return super().keyPressEvent(e)
+
+    # --- souris
+    def wheelEvent(self, e):
+        self._wacc = getattr(self, "_wacc", 0) + e.angleDelta().y()
+        n = int(self._wacc / 120)                    # une ligne entière par cran de molette
+        if n:
+            self._wacc -= n * 120
+            self.off -= n * self.rh
+            self.clamp()
+            self.update()
+
+    def row_at(self, y):
+        if y < self.HEAD:
+            return None
+        k = int((y - self.HEAD + self.off) // self.rh)
+        return k if 0 <= k < len(self.rows) else None
+
+    def cols(self):
+        W = self.width() - (12 if len(self.rows) > self.nvis() else 0)
+        plays = any(r.get("n") for r in self.rows)    # colonne « Lectures » seulement si quelque chose a été joué
+        return {"chk": 24, "art": 6, "txt": 50, "dur": W - 8, "plays": W - 58 if plays else W - 8, "show_plays": plays, "rot": -999, "W": W}
+
+    def mouseMoveEvent(self, e):
+        y = e.position().y()
+        if self.drag is not None:
+            H, tot = self.body_h(), len(self.rows) * self.rh
+            th = max(24, H * H / max(tot, 1))
+            self.off = max(0, min(self.maxoff(), self.drag[1] + (y - self.drag[0]) * (tot - H) / max(1, H - th)))
+            self.clamp()
+            return self.update()
+        if self.press and e.buttons() & Qt.MouseButton.LeftButton and (e.position() - self.press).manhattanLength() > 8 and self.sel:
+            self.press = None
+            from PySide6.QtCore import QMimeData
+            from PySide6.QtGui import QDrag
+            md = QMimeData()
+            md.setData(TRACK_MIME, ",".join(str(i) for i in sorted(self.sel)).encode())
+            dr = QDrag(self)
+            dr.setMimeData(md)
+            pm = QPixmap(150, 30)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            q.setBrush(QColor(ACC))
+            q.setPen(Qt.PenStyle.NoPen)
+            q.drawRoundedRect(QRectF(0, 0, 150, 30), 15, 15)
+            q.setPen(QColor(ONACC))
+            n = len(self.sel)
+            q.drawText(QRectF(0, 0, 150, 30), Qt.AlignmentFlag.AlignCenter, f"{n} titre{'s' if n > 1 else ''}")
+            q.end()
+            dr.setPixmap(pm)
+            dr.setHotSpot(QPoint(20, 15))
+            dr.exec(Qt.DropAction.MoveAction)
+            return
+        k = self.row_at(y)
+        if k != self.hov:
+            self.hov = k
+            self.update()
+
+    def leaveEvent(self, e):
+        if self.hov is not None:
+            self.hov = None
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+        self.press = None
+
+    def mousePressEvent(self, e):
+        self.setFocus()
+        x, y = e.position().x(), e.position().y()
+        C = self.cols()
+        if y < self.HEAD:                            # en-tête : case « tout sélectionner »
+            if x < 44:
+                self.select_all(not self.all_selected())
+            return
+        if e.button() == Qt.MouseButton.RightButton:
+            k = self.row_at(y)
+            if k is not None and self.cb_m:
+                if self.rows[k]["i"] not in self.sel:
+                    self.sel = {self.rows[k]["i"]}
+                    self._sc()
+                    self.update()
+                self.cb_m(self.rows[k]["i"], e.globalPosition().toPoint())
+            return
+        H, tot = self.body_h(), len(self.rows) * self.rh
+        if x > self.width() - 14 and tot > H:
+            th = max(24, H * H / tot)
+            ty = self.HEAD + self.off / (tot - H) * (H - th)
+            if not (ty <= y <= ty + th):
+                self.off = max(0, min(self.maxoff(), (y - self.HEAD - th / 2) / max(1, H - th) * (tot - H)))
+                self.clamp()
+                self.update()
+            self.drag = (y, self.off)
+            return
+        k = self.row_at(y)
+        if k is None:
+            self.sel.clear()
+            self._sc()
+            return self.update()
+        r = self.rows[k]
+        if x < 44 and (r["i"] in self.sel or k == self.hov) and self.sel:   # case sur la pochette : ajoute / retire sans toucher au reste
+            self.sel ^= {r["i"]}
+            self.anchor = r["i"]
+            self._sc()
+            return self.update()
+        mods = e.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            self.sel ^= {r["i"]}
+            self.anchor = r["i"]
+        elif mods & Qt.KeyboardModifier.ShiftModifier and self.anchor is not None:
+            a = next((q for q, xx in enumerate(self.rows) if xx["i"] == self.anchor), k)
+            self.sel = {xx["i"] for xx in self.rows[min(a, k):max(a, k) + 1]}
+        elif r["i"] not in self.sel or len(self.sel) <= 1:
+            self.sel, self.anchor = {r["i"]}, r["i"]
+        self.press = e.position()
+        self._sc()
+        self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        k = self.row_at(e.position().y())
+        if k is not None:
+            self.cb_p(self.rows[k]["i"])
+
+    # --- fichiers déposés
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            self.dropping = True
+            self.update()
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self.dropping = False
+        self.update()
+
+    def dropEvent(self, e):
+        self.dropping = False
+        self.update()
+        if self.cb_drop and e.mimeData().hasUrls():
+            self.cb_drop([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+            e.acceptProposedAction()
+
+    # --- dessin
+    @staticmethod
+    def fit(text, font, maxw):
+        return QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight, int(max(10, maxw)))
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        W0, H = self.width(), self.height()
+        if W0 < 160:
+            return
+        C = self.cols()
+        W = C["W"]
+        fh = QFont(self.font())
+        fh.setPointSizeF(7.4)
+        fh.setBold(True)
+        fh.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
+        # en-tête
+        p.setFont(fh)
+        allsel = self.all_selected()
+        paint_check(p, C["chk"], self.HEAD / 2, allsel, False, 16)   # au-dessus des pochettes
+        if self.sel and not allsel:                  # sélection partielle : tiret
+            p.setPen(ppen(MUT, 2))
+            p.drawLine(QPointF(C["chk"] - 3.5, self.HEAD / 2), QPointF(C["chk"] + 3.5, self.HEAD / 2))
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(C["txt"] - 6, 0, 200, self.HEAD), Qt.AlignmentFlag.AlignVCenter, "TITRE")
+        if C["show_plays"]:
+            p.drawText(QRectF(C["plays"] - 60, 0, 66, self.HEAD), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "LECTURES")
+        p.drawText(QRectF(C["dur"] - 44, 0, 44, self.HEAD), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "DURÉE")
+        p.setPen(QPen(mixc(LINE, PANEL, .4), 1))
+        p.drawLine(QPointF(4, self.HEAD - .5), QPointF(W0 - 4, self.HEAD - .5))
+        if not self.rows:
+            for dx, dy in ((-22, -6), (22, 2)):
+                draw_ermine(p, W0 / 2 + dx, (H + self.HEAD) / 2 + dy, mixc(PANEL, TXT, .22), 1.6)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(0, (H + self.HEAD) / 2 + 26, W0, 24), Qt.AlignmentFlag.AlignCenter,
+                       "Glisse des morceaux ici ou clique « ＋ Ajouter »  ·  Sonerezh !")
+            if self.dropping:
+                p.setPen(QPen(QColor(ACC), 1.6, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(QRectF(4, self.HEAD + 4, W0 - 8, H - self.HEAD - 8), 14, 14)
+            return
+        p.setClipRect(QRectF(0, self.HEAD, W0, H - self.HEAD))
+        first = int(round(self.off / self.rh))
+        last = min(len(self.rows), first + self.nvis())
+        fb, fn = QFont(self.font()), QFont(self.font())
+        fb.setPointSizeF(10.2)
+        fb.setWeight(QFont.Weight.DemiBold)
+        fn.setPointSizeF(8.8)
+        t = self.clock.elapsed() / 1000.0
+        cols = list(CART_COLORS.values())
+        for k in range(first, last):
+            r = self.rows[k]
+            y = self.HEAD + k * self.rh - self.off
+            now, off, sel = r["i"] == self.now, r["off"], r["i"] in self.sel
+            rr = QRectF(2, y + 2, W - 4, self.rh - 4)
+            p.setPen(Qt.PenStyle.NoPen)
+            if now or sel:
+                g = QLinearGradient(rr.left(), 0, rr.right(), 0)
+                g.setColorAt(0, mixc(PANEL, ACC, (.22 if now else .13) if not LIGHT else (.15 if now else .09)))
+                g.setColorAt(1, mixc(PANEL, "#ff5fa2" if PSYCHE else ACC2, .06 if now else .03))
+                p.setBrush(QBrush(g))
+                p.drawRoundedRect(rr, 12, 12)
+            elif k == self.hov:
+                p.setBrush(mixc(PANEL, TXT, .05))
+                p.drawRoundedRect(rr, 12, 12)
+            cy = y + self.rh / 2
+            # pochette
+            x0, y0 = C["art"], y + 6
+            img = r.get("img")
+            ar = QRectF(x0, cy - 18, 36, 36)
+            p.save()
+            if off:
+                p.setOpacity(.38)
+            if img is not None and not img.isNull():
+                path = QPainterPath()
+                path.addRoundedRect(ar, 7, 7)
+                p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+                p.drawPixmap(ar, img, QRectF(img.rect()))
+            else:
+                col = QColor(cols[abs(hash(r["artist"] + r["title"])) % len(cols)])
+                g = QLinearGradient(ar.topLeft(), ar.bottomRight())
+                g.setColorAt(0, col.lighter(118))
+                g.setColorAt(1, col.darker(118))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(g))
+                p.drawRoundedRect(ar, 7, 7)
+                p.setPen(ppen(qc("#ffffff", 200), 1.6))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                cx_, cy_ = ar.center().x(), ar.center().y()
+                p.drawEllipse(QPointF(cx_ - 3, cy_ + 5), 3.4, 2.8)
+                p.drawLine(QPointF(cx_ + .4, cy_ + 5), QPointF(cx_ + .4, cy_ - 7))
+                p.drawLine(QPointF(cx_ + .4, cy_ - 7), QPointF(cx_ + 7, cy_ - 4))
+            p.restore()
+            if now:                                  # égaliseur animé sur la pochette
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 120))
+                p.drawRoundedRect(ar, 7, 7)
+                p.setBrush(QColor("#ffffff"))
+                for b in range(4):
+                    hh = 4 + (abs(math.sin(t * (5.3 + b * 1.7) + b)) * 12 if ANIM else 8)
+                    p.drawRoundedRect(QRectF(ar.left() + 9 + b * 5.5, ar.bottom() - 9 - hh, 3.2, hh), 1.4, 1.4)
+            if sel or (k == self.hov and self.sel):   # case cochée posée sur la pochette
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 110))
+                p.drawRoundedRect(ar, 7, 7)
+                paint_check(p, ar.center().x(), cy, sel, not sel, 16)
+            # texte
+            tx = C["txt"] - 6
+            tmax = C["plays"] - 54 - tx
+            sub = r["artist"] or "Artiste inconnu"
+            if r.get("album"):
+                sub += "  ·  " + r["album"]
+            if r.get("folder"):
+                sub += "  ·  " + r["folder"]
+            p.setFont(fb)
+            p.setPen(QColor(ACCT if now else (MUT if off else TXT)))
+            p.drawText(QPointF(tx, cy - 2), self.fit(r["title"], fb, tmax))
+            p.setFont(fn)
+            p.setPen(QColor(mixc(MUT, PANEL, .3) if off else MUT))
+            p.drawText(QPointF(tx, cy + 13), self.fit(sub, fn, tmax))
+            if now and self.prog:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(LINE))
+                p.drawRoundedRect(QRectF(tx, y + self.rh - 7, tmax, 2.4), 1.2, 1.2)
+                p.setBrush(QColor(ACC))
+                p.drawRoundedRect(QRectF(tx, y + self.rh - 7, tmax * min(1, self.prog), 2.4), 1.2, 1.2)
+            if off:                                  # hors rotation : petite étiquette discrète
+                ft = QFont(fn)
+                ft.setPointSizeF(7.4)
+                p.setFont(ft)
+                tw_ = QFontMetrics(ft).horizontalAdvance("hors rotation") + 12
+                tr_ = QRectF(C["plays"] - 54 - tw_, cy - 8, tw_, 16)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(mixc(PANEL, TXT, .07))
+                p.drawRoundedRect(tr_, 8, 8)
+                p.setPen(QColor(MUT))
+                p.drawText(tr_, Qt.AlignmentFlag.AlignCenter, "hors rotation")
+            if False:
+                rx = C["rot"]
+                c = QColor(OKC if not off else MUT)
+                if k == self.hov:
+                    c = c.lighter(115)
+                p.setPen(ppen(c, 1.6))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawArc(QRectF(rx - 6, cy - 6, 12, 12), 40 * 16, 280 * 16)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(c)
+                tri = QPainterPath(QPointF(rx + 5.5, cy - 7.5))
+                tri.lineTo(QPointF(rx + 7.5, cy - 2))
+                tri.lineTo(QPointF(rx + 2, cy - 3))
+                tri.closeSubpath()
+                p.drawPath(tri)
+                if off:
+                    p.setPen(ppen(BADC, 1.6))
+                    p.drawLine(QPointF(rx - 7, cy + 7), QPointF(rx + 7, cy - 7))
+            p.setFont(fn)
+            n = r["n"]
+            p.setPen(QColor(mixc(MUT, PANEL, .25)))
+            if C["show_plays"]:
+                p.drawText(QRectF(C["plays"] - 46, y, 46, self.rh), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(n) if n else "–")
+            if r["dur"]:
+                p.setPen(QColor(MUT))
+                p.drawText(QRectF(C["dur"] - 64, y, 64, self.rh), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, fmt_ms(r["dur"]))
+        p.setClipping(False)
+        tot = len(self.rows) * self.rh
+        Hb = self.body_h()
+        if len(self.rows) > self.nvis():
+            th = max(24, Hb * Hb / tot)
+            ty = self.HEAD + self.off / (tot - Hb) * (Hb - th)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc(TXT, 50 if self.drag else 30))
+            p.drawRoundedRect(QRectF(W0 - 7, ty + 2, 4, th - 4), 2, 2)
+        if self.dropping:
+            p.setPen(QPen(QColor(ACC), 1.6, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(3, self.HEAD + 3, W0 - 6, H - self.HEAD - 6), 14, 14)
+
+
+# ------------------------------------------------------------------ fiche « Infos » d'un titre
+class TrackInfoDialog(QDialog):
+    def __init__(self, app, path, info, img, n):
+        super().__init__(app)
+        self.setWindowTitle("Infos")
+        self.setMinimumWidth(460)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 22, 24, 18)
+        v.setSpacing(14)
+        h = QHBoxLayout()
+        h.setSpacing(18)
+        art = QLabel()
+        art.setFixedSize(150, 150)
+        if img is not None and not img.isNull():
+            pm = QPixmap.fromImage(img).scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            r = QPixmap(150, 150)
+            r.fill(Qt.GlobalColor.transparent)
+            q = QPainter(r)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, 150, 150), 14, 14)
+            q.setClipPath(path)
+            q.drawPixmap(0, 0, pm)
+            q.end()
+            art.setPixmap(r)
+        else:
+            art.setPixmap(default_cover_pm(150))
+        h.addWidget(art)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = lab(info.get("title") or os.path.splitext(os.path.basename(path))[0], "", True)
+        t.setStyleSheet("font-size:19px;font-weight:800;")
+        col.addWidget(t)
+        a = lab(info.get("artist") or "Artiste inconnu", "", True)
+        a.setStyleSheet(f"font-size:14px;color:{ACCT};font-weight:600;")
+        col.addWidget(a)
+        if info.get("album"):
+            al = lab(info["album"], "mut", True)
+            col.addWidget(al)
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        v.addLayout(h)
+        f = QFormLayout()
+        f.setHorizontalSpacing(18)
+        for k, lbl in (("genre", "Genre"), ("year", "Année"), ("dur", "Durée"), ("n", "Lectures"), ("folder", "Dossier")):
+            val = {"dur": fmt_ms(info.get("dur", 0)) if info.get("dur") else "", "n": str(n)}.get(k, info.get(k, ""))
+            if val:
+                f.addRow(lab(lbl, "mut"), lab(str(val), ""))
+        pl = lab(path, "mut", True)
+        pl.setStyleSheet(f"color:{MUT};font-size:11px;")
+        pl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        f.addRow(lab("Fichier", "mut"), pl)
+        v.addLayout(f)
+        bb = QHBoxLayout()
+        bb.addStretch(1)
+        bb.addWidget(btn("OK", "primary", self.accept))
+        v.addLayout(bb)
+
+# ------------------------------------------------------------------ « Le saviez-vous ? » : anecdotes de radio, de broadcast et de son
+# (jour, mois, année, texte) ; jour / mois à None si seule l'année est sûre ; année à None pour un fait intemporel.
+# Le texte daté est complété automatiquement par « il y a N ans » (ou « jour pour jour » le jour anniversaire).
+FACTS = [
+    (9, 4, 1860, "Édouard-Léon Scott de Martinville enregistrait « Au clair de la lune » sur son phonautographe : la plus ancienne voix humaine enregistrée qu'on sache réécouter."),
+    (None, None, 1877, "Thomas Edison inventait le phonographe ; il y récita « Mary had a little lamb », premier enregistrement qu'il put lui-même réécouter."),
+    (None, None, 1881, "Clément Ader présentait le théâtrophone à l'Exposition d'électricité de Paris : on écoutait l'Opéra au téléphone, avec deux écouteurs pour l'effet de relief."),
+    (None, None, 1887, "Emile Berliner brevetait le gramophone et son disque plat, bien plus facile à reproduire que les cylindres d'Edison."),
+    (None, None, 1890, "le Français Édouard Branly mettait au point le « radioconducteur » (cohéreur), premier vrai détecteur d'ondes radio."),
+    (None, None, 1895, "le jeune Guglielmo Marconi réalisait ses premières transmissions sans fil dans la propriété familiale, près de Bologne."),
+    (12, 12, 1901, "Marconi recevait à Terre-Neuve la lettre « S » en morse envoyée depuis les Cornouailles : la première liaison radio transatlantique."),
+    (None, None, 1909, "Marconi et Ferdinand Braun recevaient ensemble le prix Nobel de physique pour la télégraphie sans fil."),
+    (24, 12, 1906, "Reginald Fessenden aurait diffusé voix et violon depuis Brant Rock (États-Unis) : on la cite souvent comme la première émission de radio."),
+    (2, 11, 1920, "KDKA, à Pittsburgh, annonçait en direct les résultats de l'élection présidentielle américaine : l'acte de naissance de la radio commerciale."),
+    (18, 10, 1922, "naissait la British Broadcasting Company, qui deviendra la BBC."),
+    (6, 11, 1922, "Radiola, première station privée française, commençait ses émissions régulières ; elle deviendra Radio-Paris."),
+    (None, None, 1931, "l'ingénieur Alan Blumlein déposait un brevet sur le son stéréophonique : tout le principe de la stéréo y est déjà."),
+    (12, 11, 1931, "ouvraient à Londres les studios EMI de la rue Abbey Road."),
+    (26, 12, 1933, "Edwin Armstrong obtenait ses brevets sur la modulation de fréquence : l'invention de la FM, beaucoup moins sensible aux parasites que l'AM."),
+    (None, None, 1935, "AEG présentait le Magnetophon au salon de la radio de Berlin, ancêtre de tous les magnétophones à bande."),
+    (30, 10, 1938, "Orson Welles diffusait « La Guerre des mondes » sous forme de faux flash d'information : certains auditeurs crurent à une vraie invasion martienne."),
+    (18, 6, 1940, "le général de Gaulle lançait son appel au micro de la BBC ; il n'en existe aucun enregistrement, mais le texte est resté célèbre."),
+    (1, 6, 1944, "Radio Londres diffusait les premiers vers de Verlaine, « Les sanglots longs des violons de l'automne », pour annoncer à la Résistance l'imminence du Débarquement."),
+    (None, None, 1948, "Columbia lançait le disque microsillon 33 tours : plus de 20 minutes par face au lieu de 4 pour un 78 tours."),
+    (None, None, 1954, "sortait la Regency TR-1, premier poste de radio à transistors vendu au grand public : la radio devenait portable."),
+    (4, 2, 1955, "Europe n°1 commençait à émettre, depuis un émetteur installé en Sarre, à l'époque sous influence française."),
+    (None, None, 1963, "Philips présentait la cassette audio compacte au salon de la radio de Berlin."),
+    (28, 3, 1964, "Radio Caroline émettait pour la première fois depuis un bateau ancré au large de l'Angleterre : la grande époque des radios pirates commençait."),
+    (26, 9, 1969, "les Beatles sortaient Abbey Road, enregistré dans les studios qui portent aujourd'hui ce nom."),
+    (None, None, 1977, "Radio Verte, l'une des premières radios libres françaises, émettait illégalement depuis Paris."),
+    (1, 7, 1979, "Sony lançait le Walkman : la musique enregistrée devenait vraiment personnelle et nomade."),
+    (9, 11, 1981, "la loi sur les radios locales privées mettait fin au monopole d'État en France : la naissance officielle des radios libres, dont beaucoup de radios associatives."),
+    (1, 10, 1982, "les premiers CD audio étaient mis en vente au Japon, avec le lecteur Sony CDP-101."),
+    (None, None, 1995, "la BBC et la radio norvégienne lançaient les premières émissions régulières en DAB, la radio numérique terrestre."),
+    (14, 7, 1995, "l'institut Fraunhofer choisissait l'extension « .mp3 » pour son format de compression audio."),
+    (None, None, 1998, "Nullsoft, les créateurs de Winamp, lançaient SHOUTcast, qui a permis à des milliers de webradios de naître."),
+    (None, None, 2016, "France Inter cessait d'émettre en grandes ondes sur 162 kHz depuis l'émetteur d'Allouis, dans le Cher ; cette fréquence continue de servir à diffuser l'heure légale."),
+    (None, None, None, "les ondes radio vont environ 900 000 fois plus vite que le son : en théorie, un auditeur à 1 000 km de l'émetteur entendrait la voix avant un spectateur assis à deux mètres du chanteur."),
+    (None, None, None, "le RDS n'affiche que 8 caractères pour le nom de la station : c'est pour ça que certaines radios font défiler leur nom par morceaux."),
+    (None, None, None, "en Europe, la bande FM s'étend de 87,5 à 108 MHz, avec des stations espacées de 100 kHz."),
+    (None, None, None, "un CD échantillonne le son 44 100 fois par seconde : de quoi reproduire des fréquences jusqu'à 22 kHz, au-delà de ce que l'oreille humaine perçoit."),
+    (None, None, None, "la recommandation EBU R128 vise une sonie moyenne de −23 LUFS : c'est elle qui a calmé la « guerre du volume » à la télévision européenne."),
+    (None, None, None, "par défaut, un serveur Icecast écoute sur le port 8000 ; SHOUTcast utilise aussi le 8000 pour les auditeurs et le port suivant pour la source."),
+    (None, None, None, "les ondes radio ont été mises en évidence par Heinrich Hertz à la fin des années 1880 : c'est pour ça que les fréquences se mesurent en hertz."),
+    (None, None, None, "une radio qui coupe son émetteur une seconde, c'est un « blanc » d'antenne : les bénévoles des radios associatives le redoutent autant que les pros."),
+    (None, None, 1969, "Neil Armstrong posait le pied sur la Lune : la retransmission en direct, à la radio comme à la télévision, fut suivie dans le monde entier."),
+    (None, None, 1999, "naissait Icecast, serveur de streaming libre aujourd'hui maintenu par la fondation Xiph.Org."),
+    (None, None, 2004, "le journaliste Ben Hammersley proposait le mot « podcasting » dans The Guardian, contraction d'iPod et de broadcasting."),
+    (20, 6, 2014, "la radio numérique terrestre démarrait en France, avec des multiplex à Paris, Marseille et Nice."),
+    (None, None, None, "le son parcourt environ 343 m par seconde dans l'air à 20 °C : le son d'une enceinte atteint donc un micro placé à trois mètres avec près de 9 ms de retard."),
+    (None, None, None, "le décibel doit son nom à Alexander Graham Bell, l'inventeur du téléphone : le « bel » était à l'origine l'unité de mesure d'un rapport de puissances (le décibel en est le dixième)."),
+    (None, None, None, "le DAB+ utilise le codec HE-AAC v2, le même genre de compression que beaucoup de flux Internet : à 64 kbit/s, il reste très correct pour de la voix."),
+    (None, None, None, "dans le jargon radio anglophone, un silence à l'antenne s'appelle « dead air » : l'air mort, hantise de tous les animateurs."),
+]
+MOIS_LONG = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre")
+
+
+def fact_text(f, today=None):
+    d, m, y, txt = f
+    today = today or time.localtime()
+    if y is None:
+        return "Le saviez-vous ? " + txt[0].upper() + txt[1:]
+    ago = today.tm_year - y - (1 if d and m and (today.tm_mon, today.tm_mday) < (m, d) else 0)
+    if d and m:
+        same = (today.tm_mon, today.tm_mday) == (m, d)
+        when = (f"Il y a {ago} ans jour pour jour" if same else f"Le {d if d > 1 else '1er'} {MOIS_LONG[m - 1]} {y}, il y a {ago} ans")
+    else:
+        when = f"En {y}, il y a {today.tm_year - y} ans"
+    return f"{when}, {txt}"
+
+
+def fact_order(today=None):
+    """Ordre de passage : d'abord les anniversaires du jour, puis ceux du mois, puis le reste mélangé."""
+    today = today or time.localtime()
+    idx = list(range(len(FACTS)))
+    random.Random(today.tm_yday).shuffle(idx)
+    day = [i for i in idx if FACTS[i][1] == today.tm_mon and FACTS[i][0] == today.tm_mday]
+    month = [i for i in idx if FACTS[i][1] == today.tm_mon and i not in day]
+    return day + month + [i for i in idx if i not in day and i not in month]
+
+
+class FactCard(Card):
+    """Carte « Le saviez-vous ? » : une anecdote d'une ou deux phrases, qui change toutes les 40 s (fondu doux)."""
+
+    def __init__(self):
+        super().__init__()
+        self.lay.setContentsMargins(16, 10, 12, 10)
+        h = QHBoxLayout()
+        h.setSpacing(12)
+        self.icon = QLabel()
+        self.icon.setFixedSize(30, 30)
+        pm = QPixmap(60, 60)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        q.scale(2, 2)
+        draw_logo(q, 15, 15, 15, None, 3, 0.0, sea=False)
+        q.end()
+        pm.setDevicePixelRatio(2)
+        self.icon.setPixmap(pm)
+        h.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignTop)
+        self.mini = False
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = self.title = lab("LE SAVIEZ-VOUS ?", "")
+        t.setStyleSheet(f"color:{ACCT};font-size:10px;font-weight:800;letter-spacing:1px;")
+        col.addWidget(t)
+        self.txt = lab("", "", True)
+        self.txt.setStyleSheet("font-size:12px;")
+        col.addWidget(self.txt)
+        h.addLayout(col, 1)
+        nx = IconButton("refresh", "Une autre anecdote", 30)
+        nx.clicked.connect(self.next)
+        h.addWidget(nx, 0, Qt.AlignmentFlag.AlignTop)
+        self.lay.addLayout(h)
+        self.order, self.k = fact_order(), -1
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        self.fx = QGraphicsOpacityEffect(self.txt)
+        self.fx.setOpacity(1.0)
+        self.txt.setGraphicsEffect(self.fx)
+        self.fade = QVariantAnimation(self)
+        self.fade.setDuration(260)
+        self.fade.valueChanged.connect(lambda v: self.fx.setOpacity(float(v)))
+        self.fade.finished.connect(self._faded)
+        self.fx.setEnabled(False)            # l'effet de fondu ne coûte que pendant le fondu (sinon rendu hors écran à chaque repeint)
+        self.tm = QTimer(self)
+        self.tm.timeout.connect(self.next)
+        self.tm.start(40000)
+        self.next(instant=True)
+
+    @staticmethod
+    def wrap2(text, font, width, lines=3):
+        """Coupe le texte en `lines` lignes au plus, aux espaces, avec « … » à la fin si besoin : jamais de texte rogné au milieu d'un mot."""
+        fm = QFontMetrics(font)
+        out, cur = [], ""
+        words = text.split()
+        for i, wd in enumerate(words):
+            t = (cur + " " + wd).strip()
+            if fm.horizontalAdvance(t) <= width:
+                cur = t
+                continue
+            out.append(cur)
+            cur = wd
+            if len(out) == lines - 1:
+                rest = " ".join(words[i:])
+                out.append(fm.elidedText(rest, Qt.TextElideMode.ElideRight, int(width)))
+                return "\n".join(out)
+        out.append(cur)
+        return "\n".join(out)
+
+    def wfont(self):
+        f = QFont(self.txt.font())
+        f.setPixelSize(11 if self.mini else 12)
+        return f
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.mini and getattr(self, "full", None):
+            self.render_text()
+
+    def render_text(self):
+        if self.mini:
+            self.txt.setText(self.wrap2(self.full, self.wfont(), max(120, self.txt.width() - 8)))
+        else:
+            self.txt.setText(self.full)
+
+    def set_mini(self, on):
+        """Fenêtre basse : plus d'icône, texte plus petit sur deux lignes au plus : l'anecdote reste visible."""
+        if on != self.mini:
+            self.mini = on
+            self.icon.setVisible(not on)
+            self.txt.setStyleSheet("font-size:11px;" if on else "font-size:12px;")
+            self.txt.setWordWrap(not on)
+            self.txt.setMaximumHeight(52 if on else 16777215)
+            self.lay.setContentsMargins(14, 6, 10, 6) if on else self.lay.setContentsMargins(16, 10, 12, 10)
+            if getattr(self, "full", None):
+                self.render_text()
+
+    def next(self, instant=False):
+        self.k = (self.k + 1) % len(self.order)
+        text = self.full = fact_text(FACTS[self.order[self.k]])
+        self.txt.setToolTip(text)
+        if self.mini:
+            text = self.wrap2(text, self.wfont(), max(120, self.txt.width() - 8))
+        if instant or not ANIM or not self.isVisible():
+            self.txt.setText(text)
+            return
+        self._next_text, self._phase = text, "out"
+        self.fx.setEnabled(True)
+        self.fade.stop()
+        self.fade.setStartValue(1.0)
+        self.fade.setEndValue(0.0)
+        self.fade.start()
+
+    def _faded(self):
+        if getattr(self, "_phase", "") == "out":
+            self._phase = "in"
+            self.txt.setText(self._next_text)
+            self.fade.setStartValue(0.0)
+            self.fade.setEndValue(1.0)
+            self.fade.start()
+        elif getattr(self, "_phase", "") == "in":
+            self._phase = ""
+            self.fx.setOpacity(1.0)
+            self.fx.setEnabled(False)
+
+# ------------------------------------------------------------------ boîtes de dialogue
+OPTS = {"protocol": ["Icecast", "Shoutcast"], "format": ["MP3", "AAC", "OGG", "OPUS", "WAV", "FLAC"],
+        "channels": ["1", "2"], "processing": ["Aucun", "Limiteur doux", "Radio (compresseur + limiteur)"],
+        "bitrate": ["64", "96", "128", "192", "256", "320"]}
+LABELS = {"name": "Nom", "protocol": "Protocole", "host": "Serveur", "port": "Port", "sc_port": "Port source (Shoutcast)",
+          "mount": "Point de montage", "user": "Utilisateur", "password": "Mot de passe", "format": "Format",
+          "bitrate": "Débit (kbit/s)", "channels": "Canaux", "genre": "Genre", "desc": "Description", "enabled": "Actif",
+          "reconnect": "Reconnexion auto", "processing": "Traitement", "device": "Carte son", "folder": "Dossier",
+          "rotate": "Rotation (min)", "keep_days": "Garder (jours, 0 = tout)", "prefix": "Préfixe", "pige": "Pige (h)",
+          "date": "Dossiers par date", "stamp": "Exemple d'horodatage", "rds": "RDS", "ps": "Nom RDS (PS)",
+          "rds_mode": "Mode RDS", "rds_target": "Cible RDS", "rds_template": "Modèle RDS", "mode": "Mode", "odr_path": "Chemin odr-audioenc",
+          "dest": "Destination", "profile": "Profil", "extra": "Options supplémentaires", "dls_file": "Fichier DLS",
+          "net_url": "URL réseau", "net_format": "Format réseau"}
+
+
+class FormDialog(QDialog):
+    """Éditeur générique d'un dictionnaire de réglages (flux, tuiles…)."""
+
+    def __init__(self, parent, title, data, skip=("id", "type"), labels=None, opts=None, files=()):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        self.data, self.w = data, {}
+        labels, opts = labels or LABELS, opts or OPTS
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        body = QWidget()
+        fl = QFormLayout(body)
+        fl.setContentsMargins(0, 0, 8, 0)
+        fl.setVerticalSpacing(10)
+        for k, v in data.items():
+            if k in skip or isinstance(v, (list, dict)):
+                continue
+            if isinstance(v, bool):
+                w = QCheckBox()
+                w.setChecked(v)
+            elif k in opts:
+                w = QComboBox()
+                w.setEditable(True)
+                w.addItems(opts[k])
+                w.setCurrentText(str(v))
+            elif k in files:
+                w = QLineEdit(str(v))
+            else:
+                w = QLineEdit("" if v is None else str(v))
+                if k == "password":
+                    w.setEchoMode(QLineEdit.EchoMode.Password)
+            self.w[k] = w
+            row = w
+            if k in files:
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(w, 1)
+                h.addWidget(btn("…", "", lambda w=w: self._pick(w)))
+            fl.addRow(labels.get(k, k.replace("_", " ").capitalize()), row)
+        sa.setWidget(body)
+        lay.addWidget(sa, 1)
+        bb = QHBoxLayout()
+        bb.addStretch(1)
+        bb.addWidget(btn("Annuler", "", self.reject))
+        bb.addWidget(btn("Enregistrer", "primary", self.accept))
+        lay.addLayout(bb)
+        self.resize(500, min(680, 140 + 46 * len(self.w)))
+
+    def _pick(self, w):
+        f, _ = QFileDialog.getOpenFileName(self, "Choisir un fichier", w.text())
+        if f:
+            w.setText(f)
+
+    def values(self):
+        out = dict(self.data)
+        for k, w in self.w.items():
+            if isinstance(w, QCheckBox):
+                out[k] = w.isChecked()
+            elif isinstance(w, QComboBox):
+                out[k] = w.currentText()
+            else:
+                t = w.text()
+                old = self.data.get(k)
+                if isinstance(old, (int, float)) and not isinstance(old, bool):
+                    try:
+                        t = type(old)(float(t.replace(",", ".")))
+                    except ValueError:
+                        t = old
+                out[k] = t
+        return out
+
+
+def qt_key_token(e):
+    """Nom court de la touche (F5, q, 7, KP_1…) pour les raccourcis du cartoucheur ; '' si inutilisable."""
+    m = e.modifiers()
+    if m & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier):
+        return ""
+    k = e.key()
+    if Qt.Key.Key_F1 <= k <= Qt.Key.Key_F12:
+        return "F%d" % (k - Qt.Key.Key_F1 + 1)
+    ch = e.text()
+    if m & Qt.KeyboardModifier.KeypadModifier and len(ch) == 1 and ch.isalnum():
+        return "KP_" + ch
+    if len(ch) == 1 and ch.isprintable() and not ch.isspace():
+        return ch.lower()
+    return ""
+
+
+class KeyEdit(QLineEdit):
+    """Champ qui capte la touche pressée."""
+
+    def __init__(self, tok=""):
+        super().__init__()
+        self.tok = tok
+        self.setReadOnly(True)
+        self.setPlaceholderText("clique ici puis appuie sur une touche")
+        self.setText(key_label(tok))
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            self.tok = ""
+        else:
+            t = qt_key_token(e)
+            if not t:
+                return
+            self.tok = t
+        self.setText(key_label(self.tok))
+
+
+class CartDialog(QDialog):
+    """Réglages avancés d'une tuile. Ce qui se règle déjà dans le panneau de droite du cartoucheur (volume, fondus,
+    boucle, couleur, entrée / sortie, notes) n'est volontairement pas répété ici."""
+
+    def __init__(self, parent, title, cart):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        self.cart, self.result = dict(cart), None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 16)
+        lay.setSpacing(6)
+
+        def section(t):
+            l = lab(t.upper(), "mut")
+            l.setStyleSheet(f"color:{MUT};font-size:10px;font-weight:800;letter-spacing:1px;margin-top:8px;")
+            lay.addWidget(l)
+
+        def hint(t):
+            l = lab(t, "mut", True)
+            l.setStyleSheet(f"color:{MUT};font-size:11px;")
+            lay.addWidget(l)
+        section("Son")
+        self.name = QLineEdit(cart.get("name", ""))
+        self.name.setPlaceholderText("Nom de la tuile")
+        lay.addWidget(self.name)
+        fr = QHBoxLayout()
+        self.file = QLineEdit(cart.get("file", ""))
+        fr.addWidget(self.file, 1)
+        fr.addWidget(btn("Parcourir…", "", self.browse))
+        lay.addLayout(fr)
+        self.trim = CheckLine("Couper les silences au début et à la fin")
+        self.trim.setChecked(bool(cart.get("trim")))
+        self.maxi = CheckLine("Égaliser le volume (normaliser)")
+        self.maxi.setChecked(bool(cart.get("maximize")))
+        lay.addWidget(self.trim)
+        lay.addWidget(self.maxi)
+        section("À l'antenne")
+        self.mode = QComboBox()
+        for k, v in CART_MODES.items():
+            self.mode.addItem(v, k)
+        self.mode.setCurrentIndex(max(0, list(CART_MODES).index(cart.get("mode", "Par-dessus")) if cart.get("mode", "Par-dessus") in CART_MODES else 0))
+        lay.addWidget(self.mode)
+        hint("Ce que devient le direct pendant que la tuile joue.")
+        gr = QHBoxLayout()
+        gr.addWidget(lab("Groupe", ""))
+        self.grp = QSpinBox()
+        self.grp.setRange(0, 9)
+        self.grp.setSpecialValueText("aucun")
+        self.grp.setValue(int(cart.get("group", 0) or 0))
+        self.grp.setFixedWidth(90)
+        gr.addWidget(self.grp)
+        gr.addSpacing(14)
+        gr.addWidget(lab("Fondu à l'arrêt", ""))
+        self.fc = QLineEdit("" if cart.get("fade_click") in (None, "") else str(cart.get("fade_click")))
+        self.fc.setPlaceholderText("général")
+        self.fc.setFixedWidth(80)
+        gr.addWidget(self.fc)
+        gr.addWidget(lab("s", "mut"))
+        gr.addStretch(1)
+        lay.addLayout(gr)
+        hint("Groupe : lancer une tuile coupe les autres tuiles du même numéro. Fondu à l'arrêt : vide = réglage général.")
+        section("Déclenchement")
+        kr = QHBoxLayout()
+        kr.addWidget(lab("Touche", ""))
+        self.key = KeyEdit(cart.get("key", ""))
+        kr.addWidget(self.key, 1)
+        self.midi = cart.get("midi", "")
+        self.midi_b = btn("Pad MIDI…", "", self.learn_midi)
+        if self.midi:
+            self.midi_b.setText("MIDI : " + midi_label(self.midi))
+        kr.addWidget(self.midi_b)
+        lay.addLayout(kr)
+        lay.addSpacing(8)
+        bb = QHBoxLayout()
+        bb.addWidget(btn("Supprimer la tuile", "danger", self.delete))
+        bb.addStretch(1)
+        bb.addWidget(btn("Annuler", "", self.reject))
+        bb.addWidget(btn("Enregistrer", "primary", self.ok))
+        lay.addLayout(bb)
+
+    def browse(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Choisir un son", self.file.text(), "Audio (*.mp3 *.wav *.flac *.ogg *.opus *.m4a *.aac);;Tous (*)")
+        if f:
+            self.file.setText(f)
+            if not self.name.text():
+                self.name.setText(os.path.splitext(os.path.basename(f))[0])
+
+    def ok(self):
+        c = self.cart
+        c.update(name=self.name.text().strip(), file=self.file.text().strip(), mode=self.mode.currentData(),
+                 trim=self.trim.isChecked(), maximize=self.maxi.isChecked(), group=self.grp.value(),
+                 fade_click=self.fc.text().strip() or None, key=self.key.tok, midi=self.midi)
+        self.result = c
+        self.accept()
+
+    def learn_midi(self):
+        app = self.parent()
+        if not (have_module("mido") and have_module("rtmidi")):
+            return info(self, "MIDI", "Le MIDI demande les modules « mido » et « python-rtmidi » (bouton d'installation dans Réglages).")
+        app.midi_start()
+        self.midi_b.setText("Appuie sur un pad…")
+        app.midi_learn = self.got_midi
+
+    def got_midi(self, tok):
+        self.midi = tok
+        self.midi_b.setText("MIDI : " + midi_label(tok))
+
+    def done(self, r):
+        app = self.parent()
+        if getattr(app, "midi_learn", None) == self.got_midi:
+            app.midi_learn = None
+        super().done(r)
+
+    def delete(self):
+        self.result = "delete"
+        self.accept()
+
+
+# ------------------------------------------------------------------ pages
+class FitScroll(QScrollArea):
+    """La page prend exactement la hauteur visible (tout tient sur un écran) ; elle ne défile que si la fenêtre devient
+    plus basse que le minimum de son contenu. Se réajuste quand le contenu change (ex. « Réglages avancés »)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWidgetResizable(False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def setWidget(self, w):
+        super().setWidget(w)
+        w.installEventFilter(self)
+        QTimer.singleShot(0, self.fit)
+
+    def eventFilter(self, o, ev):
+        if ev.type() == ev.Type.LayoutRequest:
+            QTimer.singleShot(0, self.fit)
+        return False
+
+    def fit(self):
+        w = self.widget()
+        if w is None:
+            return
+        vp = self.viewport().size()
+        sz = (max(100, vp.width()), max(vp.height(), w.minimumSizeHint().height()))
+        if (w.width(), w.height()) != sz:
+            w.resize(*sz)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.fit()
+
+
+class Page(FitScroll):
+    """Page de cartes qui tient dans la fenêtre."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = QWidget()
+        self.body.setObjectName("page")
+        self.setWidget(self.body)
+        self.grid = QGridLayout(self.body)
+        self.grid.setContentsMargins(2, 2, 8, 4)
+        self.grid.setSpacing(12)
+        self.grid.setColumnStretch(0, 1)
+        self.grid.setColumnStretch(1, 1)
+
+# ------------------------------------------------------------------ fenêtres de réglage des flux et des jingles
+class OutputDialog(QDialog):
+    """Fenêtre de réglage d'une sortie (Internet, FM, DAB+, enregistrement)."""
+
+    def __init__(self, app, cfg):
+        super().__init__(app)
+        self.app, self.cfg, self.result = app, dict(cfg), None
+        kind = cfg["type"]
+        self.setWindowTitle(f"{KINDS[kind][0]} {KINDS[kind][1]} - réglages du flux")
+        self.setMinimumWidth(620)
+        self.w, self.dev_map = {}, {}
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        t = lab(f"{KINDS[kind][0]} {KINDS[kind][1]}".strip(), "")
+        t.setStyleSheet("font-size:19px;font-weight:700;")
+        v.addWidget(t)
+        v.addWidget(lab(HINTS[kind], "mut", True))
+        main, adv = QFormLayout(), QFormLayout()
+        for f in (main, adv):
+            f.setVerticalSpacing(8)
+            f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        adv_keys = ADV.get(kind, ())
+        for key, label, typ, opts in FIELDS[kind]:
+            f = adv if key in adv_keys else main
+            if typ == "check":
+                w = Switch(label)
+                w.setChecked(bool(cfg.get(key, True)))
+                w.toggled.connect(self.update_state)
+                f.addRow("", w)
+            else:
+                val = str(cfg.get(key, ""))
+                if typ == "combo":
+                    w = QComboBox()
+                    w.setEditable(key == "bitrate")
+                    w.addItems([str(o) for o in opts])
+                    w.setCurrentText(val)
+                    w.currentTextChanged.connect(self.update_state)
+                elif typ == "devices":
+                    w = QComboBox()
+                    w.setEditable(True)
+                    w.setCurrentText(val)
+                elif typ in ("file", "folder"):
+                    e = QLineEdit(val)
+                    row = QWidget()
+                    h = QHBoxLayout(row)
+                    h.setContentsMargins(0, 0, 0, 0)
+                    h.addWidget(e, 1)
+                    h.addWidget(btn("…", "", lambda ee=e, tt=typ: self.browse(ee, tt)))
+                    e.textChanged.connect(self.update_state)
+                    self.w[key] = e
+                    f.addRow(label, row)
+                    continue
+                else:
+                    w = QLineEdit(val)
+                    if typ == "password":
+                        w.setEchoMode(QLineEdit.EchoMode.Password)
+                    w.textChanged.connect(self.update_state)
+            self.w[key] = w
+            if typ == "devices":
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(w, 1)
+                h.addWidget(btn("↻", "", self.refresh_devs))
+                f.addRow(label, row)
+            elif typ == "password":
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(w, 1)
+                sw = Switch("Afficher")
+                sw.toggled.connect(lambda on, ww=w: ww.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+                h.addWidget(sw)
+                f.addRow(label, row)
+            elif typ != "check":
+                f.addRow(label, w)
+        v.addLayout(main)
+        if kind == "internet":
+            self.url = QLineEdit()
+            self.url.setReadOnly(True)
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(self.url, 1)
+            h.addWidget(btn("Copier", "", lambda: app.copy_text(self.url.text(), "Adresse")))
+            fl = QFormLayout()
+            fl.addRow("Adresse d'écoute", row)
+            v.addLayout(fl)
+        self.btn_adv = btn("Réglages avancés  ▾", "", self.toggle_adv)
+        v.addWidget(self.btn_adv, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advw = QWidget()
+        self.advw.setLayout(adv)
+        self.advw.hide()
+        v.addWidget(self.advw)
+        self.testmsg = lab("", "", True)
+        v.addWidget(self.testmsg)
+        h = QHBoxLayout()
+        h.addWidget(btn("Tester", "", self.test))
+        h.addStretch(1)
+        h.addWidget(btn("Annuler", "", self.reject))
+        h.addWidget(btn("OK", "primary", self.ok))
+        v.addLayout(h)
+        if kind == "fm":
+            self.refresh_devs()
+        self.update_state()
+
+    def toggle_adv(self):
+        on = not self.advw.isVisible()
+        self.advw.setVisible(on)
+        self.btn_adv.setText("Réglages avancés  " + ("▴" if on else "▾"))
+        self.adjustSize()
+
+    def browse(self, e, typ):
+        p = QFileDialog.getExistingDirectory(self, "Dossier") if typ == "folder" else QFileDialog.getOpenFileName(self, "Fichier")[0]
+        if p:
+            e.setText(p)
+
+    def g(self, k):
+        w = self.w[k]
+        if isinstance(w, QComboBox):
+            return w.currentText()
+        if isinstance(w, QCheckBox):
+            return w.isChecked()
+        return w.text()
+
+    def refresh_devs(self):
+        w = self.w["device"]
+        if not have_module("sounddevice"):
+            self.testmsg.setText("Module sounddevice non installé (onglet SOS > Installer).")
+            self.testmsg.setStyleSheet(f"color:{BADC};")
+            return
+        try:
+            devs = list_output_devices()
+            self.dev_map = dict(devs)
+            cur = w.currentText()
+            w.clear()
+            w.addItems([d for d, _ in devs])
+            w.setCurrentText(cur)
+            self.testmsg.setText(f"{len(devs)} sortie(s) audio détectée(s).")
+            self.testmsg.setStyleSheet(f"color:{OKC};")
+        except Exception as e:
+            self.testmsg.setText(f"Détection impossible : {e}")
+            self.testmsg.setStyleSheet(f"color:{BADC};")
+
+    def enable(self, key, on):
+        w = self.w.get(key)
+        if w is not None:
+            w.setEnabled(bool(on))
+
+    def update_state(self, *_):
+        if not hasattr(self, "testmsg"):
+            return
+        kind = self.cfg["type"]
+        g = self.g
+        if kind == "internet":
+            try:
+                self.url.setText(listen_url({k: g(k) for k in ("host", "port", "mount", "protocol")}))
+            except (KeyError, AttributeError):
+                pass
+            shout = g("protocol") == "Shoutcast"
+            for k in ("mount", "user"):
+                self.enable(k, not shout)
+            self.enable("sc_port", shout)
+            fm = SHOUT_FORMATS if shout else list(FORMATS)
+            w = self.w["format"]
+            cur = w.currentText()
+            if [w.itemText(i) for i in range(w.count())] != list(fm):
+                w.blockSignals(True)
+                w.clear()
+                w.addItems(list(fm))
+                w.setCurrentText(cur if cur in fm else "MP3")
+                w.blockSignals(False)
+            self.enable("bitrate", g("format") != "FLAC")
+        elif kind == "fm":
+            for k in ("ps", "rds_mode", "rds_target", "rds_template"):
+                self.enable(k, bool(g("rds")))
+        elif kind == "dab":
+            odr = g("mode").startswith("ODR")
+            for k in ("odr_path", "dest", "extra"):
+                self.enable(k, odr)
+            for k in ("net_url", "net_format"):
+                self.enable(k, not odr)
+        elif kind == "record":
+            self.enable("bitrate", RecordOutput.CODECS.get(g("format"), (0, 0, True))[2])
+
+    def collect(self):
+        out = dict(self.cfg)
+        for k in self.w:
+            val = self.g(k)
+            out[k] = val if isinstance(val, bool) else val.strip()
+        return out
+
+    def ok(self):
+        c = self.collect()
+        kind = c["type"]
+        try:
+            if kind == "internet":
+                if not c["host"]:
+                    raise ValueError("Indique le serveur.")
+                int(c["port"])
+                if c["sc_port"]:
+                    int(c["sc_port"])
+            if kind in ("dab", "record"):
+                int(c["bitrate"] or 0)
+            if kind == "record":
+                if not c["folder"]:
+                    raise ValueError("Choisis un dossier d'enregistrement.")
+                float(c["rotate"] or 60)
+                float(c["keep_days"] or 0)
+        except ValueError as e:
+            return info(self, "Réglages", str(e) if str(e) and "invalid" not in str(e) else "Une valeur numérique est incorrecte.")
+        self.result = c
+        self.accept()
+
+    def test(self):
+        c = self.collect()
+        kind = c["type"]
+        try:
+            if kind == "internet":
+                port = int(c["sc_port"] or int(c["port"]) + 1) if c["protocol"] == "Shoutcast" else int(c["port"])
+                socket.create_connection((c["host"], port), timeout=3).close()
+                msg = f"✔ Serveur joignable ({c['host']}:{port}). Le mot de passe sera vérifié au démarrage."
+            elif kind == "fm":
+                if not have_module("sounddevice"):
+                    raise RuntimeError("sounddevice non installé")
+                found = c["device"] in dict(list_output_devices())
+                msg = "✔ Carte son trouvée." if found else "✖ Carte son introuvable : choisis-en une dans la liste."
+                if c["rds"] and c["rds_mode"] == "TCP":
+                    host, port = split_hostport(c["rds_target"])
+                    socket.create_connection((host, port), timeout=3).close()
+                    msg += " ✔ Encodeur RDS joignable."
+            elif kind == "dab":
+                if c["mode"].startswith("ODR"):
+                    exe = c["odr_path"] or "odr-audioenc"
+                    ok = shutil.which(exe) or os.path.isfile(exe)
+                    msg = "✔ odr-audioenc trouvé." if ok else "✖ odr-audioenc introuvable : indique son chemin."
+                else:
+                    msg = "✔ Réglages enregistrés (la connexion réseau se vérifie au démarrage)."
+            else:
+                os.makedirs(c["folder"], exist_ok=True)
+                free = shutil.disk_usage(c["folder"]).free / 1e9
+                kbps = 1411 if c["format"] in ("WAV",) else (700 if c["format"] == "FLAC" else int(c["bitrate"] or 192))
+                msg = f"✔ Dossier utilisable. Espace libre : {free:.1f} Go (~{free * 8e6 / kbps / 3600:.0f} h d'enregistrement)."
+        except Exception as e:
+            msg = f"✖ {e}"
+        self.testmsg.setText(msg)
+        self.testmsg.setStyleSheet(f"color:{'#1e8e3e' if msg.startswith('✔') else '#c0392b'};")
+
+
+class JingleDialog(QDialog):
+    """Liste des jingles du secours, avec le nombre de lectures de chacun."""
+
+    def __init__(self, app, files):
+        super().__init__(app)
+        self.setWindowTitle("Jingles de la playlist de secours")
+        self.app, self.files, self.result = app, list(files), None
+        self.setMinimumSize(520, 380)
+        v = QVBoxLayout(self)
+        v.addWidget(lab("Le jingle le moins lu est joué à chaque échéance.", "mut"))
+        self.tb = QTableWidget(0, 2)
+        self.tb.setHorizontalHeaderLabels(["JINGLE", "LECTURES"])
+        self.tb.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tb.verticalHeader().hide()
+        self.tb.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tb.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tb.setShowGrid(False)
+        v.addWidget(self.tb, 1)
+        h = QHBoxLayout()
+        h.addWidget(btn("＋ Ajouter…", "", self.add))
+        h.addWidget(btn("✕ Retirer", "", self.rem))
+        h.addStretch(1)
+        h.addWidget(btn("Annuler", "", self.reject))
+        h.addWidget(btn("OK", "primary", self.ok))
+        v.addLayout(h)
+        self.fill()
+
+    def fill(self):
+        c = self.app.data.get("counts", {})
+        self.tb.setRowCount(len(self.files))
+        for i, f in enumerate(self.files):
+            self.tb.setItem(i, 0, QTableWidgetItem(os.path.basename(f)))
+            it = QTableWidgetItem(str(c.get(f, 0)))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tb.setItem(i, 1, it)
+
+    def add(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "Jingles", "", "Audio (*.mp3 *.wav *.flac *.ogg *.opus *.m4a *.aac);;Tous (*)")
+        self.files += [f for f in fs if f not in self.files]
+        self.fill()
+
+    def rem(self):
+        for i in sorted({ix.row() for ix in self.tb.selectedIndexes()}, reverse=True):
+            del self.files[i]
+        self.fill()
+
+    def ok(self):
+        self.result = self.files
+        self.accept()
+
+# ------------------------------------------------------------------ cartoucheur façon Farrago
+# Grille de tuiles (titre en couleur, forme d'onde, temps écoulé · touche · durée), inspecteur à droite :
+# grande forme d'onde où l'on place la tête de lecture (même pendant la lecture), points d'entrée / sortie,
+# retour / lecture-pause / fondu, volume, fondus, couleur, boucle, solo, pause autorisée, « tant que j'appuie ».
+def wave_resample(bins, n):
+    """Réduit une forme d'onde à n barres (maximum de chaque tranche)."""
+    m = len(bins)
+    if not m or n <= 0:
+        return []
+    if m <= n:
+        return list(bins)
+    return [max(bins[int(i * m / n):max(int(i * m / n) + 1, int((i + 1) * m / n))]) for i in range(n)]
+
+
+def cart_col(d):
+    return QColor(CART_COLORS.get(d.get("color"), CART_COLORS["Bleu"]))
+
+
+def cart_span(d, dur):
+    """(début, fin) en secondes dans le fichier ; fin = durée totale si aucun point de sortie."""
+    try:
+        a = max(0.0, float(d.get("start") or 0))
+    except (TypeError, ValueError):
+        a = 0.0
+    try:
+        b = float(d.get("end") or 0)
+    except (TypeError, ValueError):
+        b = 0.0
+    if dur and (b <= a + .08 or b > dur):
+        b = dur
+    if dur and a >= b:
+        a = 0.0
+    return a, b
+
+
+class FTile(QWidget):
+    """Tuile du cartoucheur. L'état de lecture vient du moteur :
+    (position, durée, boucle, écoute, fondu, crête, pause, point d'entrée)."""
+    pressed = Signal(object)
+    released = Signal(object)
+    menu = Signal(object, object)
+
+    def __init__(self, d, cid, parent=None):
+        super().__init__(parent)
+        self.d, self.cid, self.idx = d, cid, 0
+        self.st, self.sel, self.hov, self.cue = None, False, False, None
+        self.bins, self.dur, self._wv = [], 0.0, None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumSize(110, 70)
+        self.setToolTip("Clic : lancer · clic droit : options · Maj + clic : au casque")
+
+    def set_state(self, st):
+        if st != self.st:
+            self.st = st
+            self.update()
+
+    def set_sel(self, on):
+        if on != self.sel:
+            self.sel = on
+            self.update()
+
+    def enterEvent(self, e):
+        self.hov = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self.hov = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.pressed.emit(self)
+        elif e.button() == Qt.MouseButton.RightButton:
+            self.menu.emit(self, e.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.released.emit(self)
+
+    def resizeEvent(self, e):
+        self._wv = None
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        w, h = self.width(), self.height()
+        d, st = self.d, self.st
+        col = cart_col(d)
+        playing = st is not None
+        paused = playing and len(st) > 6 and st[6]
+        fading = playing and st[4]
+        a, b = cart_span(d, self.dur)
+        r = QRectF(1, 1, w - 2, h - 2)
+        p.setPen(QPen(col, 2) if self.sel else QPen(mixc(LINE, col, .35), 1))
+        p.setBrush(mixc(PANEL, col, (.20 if playing else .08) + (.04 if self.hov else 0)))
+        p.drawRoundedRect(r.adjusted(.5, .5, -.5, -.5), 10, 10)
+        # titre
+        tf = QFont(self.font())
+        tf.setPointSizeF(9.6)
+        tf.setWeight(QFont.Weight.Bold)
+        p.setFont(tf)
+        tcol = col.darker(118) if LIGHT else col.lighter(150)
+        p.setPen(tcol)
+        name = d.get("name") or os.path.basename(d.get("file") or "") or "Tuile vide"
+        p.drawText(QRectF(10, 6, w - 20 - (14 if playing else 0), 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(tf).elidedText(name, Qt.TextElideMode.ElideRight, int(w - 22 - (14 if playing else 0))))
+        if playing:                                  # pastille : rouge = à l'antenne, turquoise = écoute au casque
+            c = QColor("#e0a800") if paused else QColor("#2fb5a3" if st[3] else "#ff3b4e")
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            if paused:
+                p.drawRoundedRect(QRectF(w - 19, 10, 3, 10), 1, 1)
+                p.drawRoundedRect(QRectF(w - 14, 10, 3, 10), 1, 1)
+            else:
+                p.drawEllipse(QPointF(w - 15, 15), 4, 4)
+        # forme d'onde
+        wy0, wy1 = 27, h - 22
+        mid, amp = (wy0 + wy1) / 2, (wy1 - wy0) / 2
+        x0, x1 = 10, w - 10
+        n = max(8, int((x1 - x0) / 3))
+        if self._wv is None or len(self._wv) != n:
+            self._wv = wave_resample(self.bins, n)
+        bins = self._wv
+        T = self.dur or 0.0
+        pos = (st[7] + st[0]) if playing and len(st) > 7 else (self.cue if self.cue is not None else a)
+        fr = pos / T if T else (st[0] / st[1] if playing and st[1] else 0.0)
+        bw = (x1 - x0) / max(1, len(bins))
+        p.setPen(Qt.PenStyle.NoPen)
+        groups = ([], [], [])                        # hors du passage joué · déjà joué · reste : un appel de dessin par couleur
+        nb = len(bins)
+        ta, tb = (a / T, b / T) if T else (0.0, 1.0)
+        bw1 = max(1.0, bw - 1)
+        for i, v in enumerate(bins):
+            t = (i + .5) / nb
+            hh = max(1.0, v * amp)
+            g = 0 if (T and not ta <= t <= tb) else (1 if (playing and t <= fr) else 2)
+            groups[g].append(QRectF(x0 + i * bw, mid - hh, bw1, hh * 2))
+        cn = col.name()
+        for g, c in zip(groups, (qc(cn, 50), (col.lighter(125) if not LIGHT else col), qc(cn, 135 if playing else 165))):
+            if g:
+                p.setBrush(c)
+                p.drawRects(g)
+        if playing or self.cue is not None:
+            x = x0 + (x1 - x0) * max(0.0, min(1.0, fr))
+            p.setPen(ppen("#e0a800" if fading else ("#ffffff" if not LIGHT else "#20242c"), 1.6))
+            p.drawLine(QPointF(x, wy0 - 1), QPointF(x, wy1 + 1))
+        # bas : écoulé · touche · durée
+        bf = QFont(self.font())
+        bf.setPointSizeF(8.2)
+        p.setFont(bf)
+        yb = QRectF(10, h - 20, w - 20, 16)
+        el = max(0.0, pos - a) if (playing or self.cue is not None) else 0.0
+        p.setPen(QColor("#e0a800") if paused else QColor(TXT if playing else MUT))
+        p.drawText(yb, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, fmt_cs(el))
+        p.setPen(QColor(MUT))
+        tot = (b - a) if T else (st[1] if playing else 0)
+        p.drawText(yb, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   ("∞ " if d.get("loop") else "") + (fmt_cs(tot) if tot else "–"))
+        key = d.get("key", "")
+        if key:
+            kf = QFont(bf)
+            kf.setWeight(QFont.Weight.Bold)
+            p.setFont(kf)
+            kw = QFontMetrics(kf).horizontalAdvance(key) + 12
+            kr = QRectF((w - kw) / 2, h - 19, kw, 14)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc(col.name(), 150))
+            p.drawRoundedRect(kr, 4, 4)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(kr, Qt.AlignmentFlag.AlignCenter, key)
+
+
+class CartNow(QWidget):
+    """Cartouche en cours, dans l'en-tête : pastille de la couleur de la tuile, nom, temps restant et barre de progression.
+    Un clic la coupe en fondu. Invisible (et sans largeur) quand rien ne joue."""
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(46)
+        self.setMinimumWidth(250)
+        self.setMaximumWidth(330)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.items, self.n = [], 0
+        self.setToolTip("Clic : arrêter la cartouche (fondu)")
+        self.hide()
+
+    def set_items(self, items):
+        """items : [(nom, couleur, position, durée, boucle, écoute, fondu, pause)], la plus récente en dernier."""
+        sig = [(a, b, round(c, 1), d, e, f, g, h) for a, b, c, d, e, f, g, h in items]
+        if sig == self.items:
+            return
+        self.items = sig
+        self.setVisible(bool(items))
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        self.clicked.emit()
+
+    def paintEvent(self, e):
+        if not self.items:
+            return
+        p = new_painter(self)
+        name, col, pos, dur, loop, pre, fading, paused = self.items[-1]
+        col = QColor(col)
+        w, h = self.width(), self.height()
+        r = QRectF(.5, .5, w - 1, h - 1)
+        p.setPen(QPen(mixc(LINE, col, .5), 1))
+        p.setBrush(mixc(PANEL, col, .16))
+        p.drawRoundedRect(r, 12, 12)
+        # pastille de lecture
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(8, 8, 4, h - 16), 2, 2)
+        f = QFont(self.font())
+        f.setPointSizeF(10)
+        f.setWeight(QFont.Weight.Bold)
+        p.setFont(f)
+        tag = "PAUSE" if paused else ("FONDU" if fading else ("CASQUE" if pre else "ANTENNE"))
+        tc = QColor("#e0a800" if paused or fading else ("#2fb5a3" if pre else "#ff5a6a"))
+        fm = QFontMetrics(f)
+        tf = QFont(f)
+        tf.setPointSizeF(7.4)
+        tw = QFontMetrics(tf).horizontalAdvance(tag) + 4
+        rem = ("∞" if loop else "−" + fmt_cs(max(0.0, dur - pos)))
+        rw = QFontMetrics(f).horizontalAdvance(rem) + 2
+        p.setPen(QColor(TXT))
+        extra = f"  +{len(self.items) - 1}" if len(self.items) > 1 else ""
+        p.drawText(QRectF(20, 5, w - 20 - rw - 14, 18), Qt.AlignmentFlag.AlignVCenter,
+                   fm.elidedText(name, Qt.TextElideMode.ElideRight, int(w - 20 - rw - 20 - fm.horizontalAdvance(extra))) + extra)
+        p.setPen(QColor(MUT if not paused else "#e0a800"))
+        p.drawText(QRectF(w - rw - 12, 5, rw, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, rem)
+        # étiquette + progression
+        p.setFont(tf)
+        p.setPen(tc)
+        p.drawText(QRectF(20, 25, tw + 8, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, tag)
+        bx0, bx1 = 20 + tw + 8, w - 14
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc(TXT, 40))
+        p.drawRoundedRect(QRectF(bx0, 30, bx1 - bx0, 4), 2, 2)
+        fr = 1.0 if loop else (min(1.0, pos / dur) if dur else 0.0)
+        p.setBrush(tc if (paused or fading) else col.lighter(125))
+        p.drawRoundedRect(QRectF(bx0, 30, max(4.0, (bx1 - bx0) * fr), 4), 2, 2)
+
+
+class CartWave(QWidget):
+    """Grande forme d'onde de l'inspecteur : cliquer / glisser place la tête de lecture ;
+    les deux poignées du bas règlent l'entrée et la sortie du son."""
+    seek = Signal(float)
+    trim = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(96)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.bins, self._wv, self.dur, self.col = [], None, 0.0, QColor(ACC)
+        self.a, self.b, self.pos, self.playing, self.fading = 0.0, 0.0, None, False, False
+        self.hx, self.drag, self._last = None, None, 0.0
+
+    def set_data(self, bins, dur, col, a, b):
+        self.bins, self.dur, self.col, self.a, self.b, self._wv = bins or [], dur or 0.0, col, a, b, None
+        self.update()
+
+    def set_pos(self, pos, playing, fading=False):
+        if (pos, playing, fading) != (self.pos, self.playing, self.fading):
+            self.pos, self.playing, self.fading = pos, playing, fading
+            self.update()
+
+    def resizeEvent(self, e):
+        self._wv = None
+
+    def geo(self):
+        return 8.0, self.width() - 8.0
+
+    def x2t(self, x):
+        x0, x1 = self.geo()
+        return max(0.0, min(1.0, (x - x0) / max(1.0, x1 - x0))) * self.dur
+
+    def t2x(self, t):
+        x0, x1 = self.geo()
+        return x0 + (x1 - x0) * (t / self.dur if self.dur else 0.0)
+
+    def handle_at(self, x, y):
+        if not self.dur or y < self.height() - 26:
+            return None
+        da, db = abs(x - self.t2x(self.a)), abs(x - self.t2x(self.b))
+        if min(da, db) > 9:
+            return None
+        return "a" if da <= db else "b"
+
+    def mousePressEvent(self, e):
+        if not self.dur or e.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = e.position().x(), e.position().y()
+        hd = self.handle_at(x, y)
+        self.drag = hd or "seek"
+        if self.drag == "seek":
+            self.seek.emit(max(self.a, min(self.b - .05, self.x2t(x))))
+            self._last = time.time()
+
+    def mouseMoveEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        self.hx = x
+        if self.drag == "seek":
+            if time.time() - self._last > .045:        # pas plus de ~20 sauts par seconde : pas de friture
+                self._last = time.time()
+                self.seek.emit(max(self.a, min(self.b - .05, self.x2t(x))))
+        elif self.drag in ("a", "b"):
+            t = self.x2t(x)
+            if self.drag == "a":
+                self.a = max(0.0, min(t, self.b - .2))
+            else:
+                self.b = min(self.dur, max(t, self.a + .2))
+        else:
+            self.setCursor(Qt.CursorShape.SizeHorCursor if self.handle_at(x, y) else Qt.CursorShape.IBeamCursor)
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self.drag == "seek":
+            self.seek.emit(max(self.a, min(self.b - .05, self.x2t(e.position().x()))))
+        elif self.drag in ("a", "b"):
+            self.trim.emit(self.a, self.b)
+        self.drag = None
+
+    def leaveEvent(self, e):
+        self.hx = None
+        self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        w, h = self.width(), self.height()
+        col = self.col
+        g = QLinearGradient(0, 0, 0, h)
+        g.setColorAt(0, mixc(PANEL, col, .26))
+        g.setColorAt(1, mixc(PANEL, col, .12))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 10, 10)
+        x0, x1 = self.geo()
+        if not self.bins:
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "Forme d'onde en préparation…" if self.dur == 0 and self.col else "")
+            return
+        n = max(20, int((x1 - x0) / 2.5))
+        if self._wv is None or len(self._wv) != n:
+            self._wv = wave_resample(self.bins, n)
+        mid, amp = (h - 18) / 2 + 2, (h - 24) / 2
+        bw = (x1 - x0) / len(self._wv)
+        T = self.dur or 1.0
+        fr = (self.pos / T) if self.pos is not None else -1
+        bright = QColor("#ffffff") if not LIGHT else col.darker(130)
+        for i, v in enumerate(self._wv):
+            t = (i + .5) / len(self._wv)
+            inside = self.a / T <= t <= self.b / T
+            if not inside:
+                c = qc(bright.name(), 45)
+            elif self.playing and t <= fr:
+                c = bright
+            else:
+                c = qc(bright.name(), 150)
+            hh = max(1.0, v * amp)
+            p.setBrush(c)
+            p.drawRect(QRectF(x0 + i * bw, mid - hh, max(1.0, bw - .8), hh * 2))
+        # points d'entrée / sortie (poignées en bas)
+        for t in (self.a, self.b):
+            x = self.t2x(t)
+            p.setPen(ppen(qc(bright.name(), 200), 1.2))
+            p.drawLine(QPointF(x, 4), QPointF(x, h - 14))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bright)
+            tri = QPainterPath(QPointF(x, h - 15))
+            tri.lineTo(QPointF(x - 6, h - 4))
+            tri.lineTo(QPointF(x + 6, h - 4))
+            tri.closeSubpath()
+            p.drawPath(tri)
+        # tête de lecture
+        if self.pos is not None:
+            x = self.t2x(self.pos)
+            c = QColor("#e0a800") if self.fading else QColor(ACC)
+            p.setPen(ppen(c, 2))
+            p.drawLine(QPointF(x, 2), QPointF(x, h - 16))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawEllipse(QPointF(x, 5), 4, 4)
+        if self.hx is not None and self.drag is None and x0 <= self.hx <= x1:
+            p.setPen(ppen(qc(bright.name(), 90), 1))
+            p.drawLine(QPointF(self.hx, 4), QPointF(self.hx, h - 16))
+            f = QFont(self.font())
+            f.setPointSizeF(7.8)
+            p.setFont(f)
+            txt = fmt_cs(self.x2t(self.hx))
+            tw = QFontMetrics(f).horizontalAdvance(txt) + 10
+            rx = min(w - tw - 2, max(2, self.hx + 4))
+            p.setBrush(QColor(0, 0, 0, 120))
+            p.drawRoundedRect(QRectF(rx, 4, tw, 15), 4, 4)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRectF(rx, 4, tw, 15), Qt.AlignmentFlag.AlignCenter, txt)
+
+
+class TBtn(QAbstractButton):
+    """Bouton de transport : icône dessinée + petit libellé dessous (Retour, Lecture, Fondu)."""
+
+    def __init__(self, kind, text, parent=None, size=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.setText(text)
+        self.setFixedSize(*(size or (66, 50)))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    def set_kind(self, kind, text):
+        if (kind, text) != (self.kind, self.text()):
+            self.kind = kind
+            self.setText(text)
+            self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        w = self.width()
+        on = self.isEnabled()
+        hov = self.underMouse() and on
+        c = QColor(ACC) if on else QColor(MUT)
+        if hov:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(mixc(PANEL, TXT, .06))
+            p.drawRoundedRect(QRectF(0, 0, w, self.height()), 10, 10)
+        cx, cy = w / 2, (17 if self.text() else self.height() / 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        if self.kind == "stop":
+            p.drawRoundedRect(QRectF(cx - 7, cy - 7, 14, 14), 2.5, 2.5)
+        elif self.kind == "back":
+            p.drawRect(QRectF(cx - 9, cy - 7, 2.6, 14))
+            tri = QPainterPath(QPointF(cx + 8, cy - 7))
+            tri.lineTo(QPointF(cx - 5, cy))
+            tri.lineTo(QPointF(cx + 8, cy + 7))
+            tri.closeSubpath()
+            p.drawPath(tri)
+        elif self.kind == "play":
+            tri = QPainterPath(QPointF(cx - 6, cy - 9))
+            tri.lineTo(QPointF(cx + 9, cy))
+            tri.lineTo(QPointF(cx - 6, cy + 9))
+            tri.closeSubpath()
+            p.drawPath(tri)
+        elif self.kind == "pause":
+            p.drawRoundedRect(QRectF(cx - 7, cy - 8, 4.5, 16), 1.5, 1.5)
+            p.drawRoundedRect(QRectF(cx + 2.5, cy - 8, 4.5, 16), 1.5, 1.5)
+        elif self.kind == "fade":
+            path = QPainterPath(QPointF(cx - 11, cy - 7))
+            path.cubicTo(QPointF(cx - 2, cy - 7), QPointF(cx + 2, cy + 7), QPointF(cx + 11, cy + 7))
+            p.setPen(ppen(c, 2.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+        if self.text():
+            f = QFont(self.font())
+            f.setPointSizeF(8)
+            p.setFont(f)
+            p.setPen(QColor(TXT if on else MUT))
+            p.drawText(QRectF(0, 32, w, 16), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class ColorDots(QWidget):
+    """Pastilles de couleur de la tuile."""
+    picked = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.names, self.cur = list(CART_COLORS), ""
+        self.setFixedSize(20 * len(self.names), 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set(self, name):
+        self.cur = name
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        k = int(e.position().x() // 20)
+        if 0 <= k < len(self.names):
+            self.cur = self.names[k]
+            self.update()
+            self.picked.emit(self.cur)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        for k, n in enumerate(self.names):
+            cx = 10 + k * 20
+            if n == self.cur:
+                p.setPen(ppen(TXT, 1.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(cx, 12), 8.6, 8.6)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(CART_COLORS[n]))
+            p.drawEllipse(QPointF(cx, 12), 6, 6)
+
+
+class CheckLine(QAbstractButton):
+    """Case à cocher sobre (même dessin que les listes)."""
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setFixedHeight(24)
+
+    def sizeHint(self):
+        return QSize(26 + self.fontMetrics().horizontalAdvance(self.text()), 24)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        paint_check(p, 9, 12, self.isChecked(), self.underMouse(), 16)
+        p.setPen(QColor(TXT))
+        p.drawText(QRectF(25, 0, self.width() - 25, 24), Qt.AlignmentFlag.AlignVCenter,
+                   self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, self.width() - 26))
+
+
+# ------------------------------------------------------------------ page et logique
+class CartMixin:
+    def _page_cart(self):
+        self.cart_sel, self.cart_cue, self._hold = None, {}, set()
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        # barre du haut : recherche · volume général · tout en pause / fondu / arrêter · pré-écoute · options
+        bar = Card()
+        bar.lay.setContentsMargins(14, 8, 14, 8)
+        h = QHBoxLayout()
+        h.setSpacing(10)
+        self.ed_cq = QLineEdit()
+        self.ed_cq.setPlaceholderText("Rechercher")
+        self.ed_cq.setClearButtonEnabled(True)
+        self.ed_cq.setMinimumWidth(60)
+        self.ed_cq.setStyleSheet("border-radius:14px;padding:4px 12px;")
+        self.ed_cq.textChanged.connect(lambda *_: self.refresh_tiles())
+        h.addWidget(lab("Volume", "mut"))
+        self.sl_master = Slider(Qt.Orientation.Horizontal)
+        self.sl_master.setRange(0, 150)
+        self.sl_master.setFixedWidth(110)
+        self.sl_master.setToolTip("Volume général de toutes les tuiles")
+        self.sl_master.setValue(int(self.prof["carts"].get("master", 100)))
+        self.l_master = lab("", "")
+        self.l_master.setFixedWidth(40)
+        self.sl_master.valueChanged.connect(self.master_changed)
+        h.addWidget(self.sl_master)
+        h.addWidget(self.l_master)
+        h.addStretch(1)
+        for kind, tip, fn in (("stop", "Tout arrêter (fondu) · Maj : arrêt net", self.stop_all_btn),
+                              ("play", "Reprendre tout ce qui est en pause", lambda: self.pause_all(False)),
+                              ("pause", "Tout mettre en pause", lambda: self.pause_all(True))):
+            b = TBtn(kind, "", size=(40, 34))
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            h.addWidget(b)
+        h.addSpacing(8)
+        self.cb_cdev = QComboBox()
+        self.cb_cdev.hide()                              # liste réelle des sorties (le bouton ci-dessous l'affiche en menu)
+        self.cb_cdev.activated.connect(self.cart_dev_changed)
+        self.b_cdev = btn("Casque : aucun")
+        self.b_cdev.setToolTip("Carte son de pré-écoute : là où les tuiles se jouent hors antenne ou avec Maj + clic")
+        self.b_cdev.setMinimumWidth(120)
+        self.b_cdev.setMaximumWidth(210)
+        self.m_cdev = QMenu(self.b_cdev)
+        self.m_cdev.aboutToShow.connect(self.cdev_menu)
+        self.b_cdev.setMenu(self.m_cdev)
+        h.addWidget(self.b_cdev)
+        self.cb_route = QComboBox()
+        self.cb_route.addItems(ROUTES)
+        self.cb_route.hide()                              # toujours à l'antenne
+        ob = btn("Options")
+        om = QMenu(ob)
+        box = QWidget()
+        bl = QGridLayout(box)
+        bl.setContentsMargins(14, 10, 14, 10)
+        bl.setHorizontalSpacing(10)
+        bl.setVerticalSpacing(6)
+        bl.addWidget(lab("Quand j'arrête un son", "mut"), 0, 0, 1, 3)
+        bl.addWidget(lab("Durée du fondu", ""), 1, 0)
+        self.sl_fc = Slider(Qt.Orientation.Horizontal)
+        self.sl_fc.setRange(0, 100)
+        self.sl_fc.setFixedWidth(130)
+        self.sl_fc.valueChanged.connect(self.fc_changed)
+        bl.addWidget(self.sl_fc, 1, 1)
+        self.l_fc = lab("", "")
+        self.l_fc.setFixedWidth(46)
+        bl.addWidget(self.l_fc, 1, 2)
+        self.sw_solo = Switch("Un seul son à la fois")
+        self.sw_solo.setToolTip("Lancer une tuile arrête toutes les autres")
+        self.sw_solo.toggled.connect(lambda on: self.prof["carts"].__setitem__("solo", on))
+        bl.addWidget(self.sw_solo, 2, 0, 1, 3)
+        wa = QWidgetAction(om)
+        wa.setDefaultWidget(box)
+        om.addAction(wa)
+        ob.setMenu(om)
+        ob.setMinimumWidth(ob.fontMetrics().horizontalAdvance("Options") + 52)
+        h.addWidget(ob)
+        bar.lay.addLayout(h)
+        v.addWidget(bar)
+        # corps : sets · grille · inspecteur
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        side = Card()
+        side.setFixedWidth(170)
+        side.lay.addWidget(self.ed_cq)
+        side.lay.addWidget(lab("SETS", "mut"))
+        self.lw_sets = QListWidget()
+        self.lw_sets.currentRowChanged.connect(self.pick_set)
+        self.lw_sets.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lw_sets.customContextMenuRequested.connect(self.sets_menu)
+        side.lay.addWidget(self.lw_sets, 1)
+        self.lw_sets.itemDoubleClicked.connect(lambda *_: self.rename_set())
+        self.lw_sets.setToolTip("Double-clic : renommer · clic droit : renommer ou supprimer")
+        side.lay.addWidget(btn("+ Nouveau set", "", self.new_set))
+        body.addWidget(side)
+        mid = QVBoxLayout()
+        mid.setSpacing(8)
+        self.sa = QScrollArea()
+        self.sa.setWidgetResizable(True)
+        self.sa.setFrameShape(QFrame.Shape.NoFrame)
+        self.tile_host = QWidget()
+        self.tile_host.setObjectName("page")
+        self.flow = Flow(self.tile_host, gap=8)
+        self.flow.tw, self.flow.ratio, self.flow.th_min = 142, .56, 74
+        self.sa.setWidget(self.tile_host)
+        mid.addWidget(self.sa, 1)
+        hb = QHBoxLayout()
+        hb.addWidget(btn("+ Ajouter des sons", "primary", self.add_sounds))
+        hb.addStretch(1)
+        self.l_midi = lab("", "mut")
+        self.l_midi.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.l_midi.mouseReleaseEvent = lambda e: self.midi_click()
+        hb.addWidget(self.l_midi)
+        mid.addLayout(hb)
+        body.addLayout(mid, 1)
+        body.addWidget(self._cart_inspector())
+        v.addLayout(body, 1)
+        self.setAcceptDrops(True)
+        return w
+
+    def _cart_inspector(self):
+        ins = Card()
+        ins.setFixedWidth(300)
+        L = ins.lay
+        L.setSpacing(7)
+        self.ci_empty = lab("Clique sur une tuile pour la régler ici : tête de lecture, entrée et sortie, volume, fondus…", "mut", True)
+        L.addWidget(self.ci_empty)
+        self.ci_box = QWidget()
+        b = QVBoxLayout(self.ci_box)
+        b.setContentsMargins(0, 0, 0, 0)
+        b.setSpacing(7)
+        self.ci_name = QLineEdit()
+        self.ci_name.setPlaceholderText("Nom de la tuile")
+        self.ci_name.textEdited.connect(lambda t: self.ci_set("name", t))
+        b.addWidget(self.ci_name)
+        tr = QHBoxLayout()
+        tr.setSpacing(4)
+        tr.addStretch(1)
+        self.ci_back = TBtn("back", "Retour")
+        self.ci_back.clicked.connect(self.ci_rewind)
+        self.ci_play = TBtn("play", "Lecture")
+        self.ci_play.clicked.connect(self.ci_playpause)
+        self.ci_fade = TBtn("fade", "Fondu")
+        self.ci_fade.clicked.connect(self.ci_fadeout)
+        for x in (self.ci_back, self.ci_play, self.ci_fade):
+            tr.addWidget(x)
+        tr.addStretch(1)
+        b.addLayout(tr)
+        self.ci_wave = CartWave()
+        self.ci_wave.setFixedHeight(104)
+        self.ci_wave.seek.connect(self.ci_seek)
+        self.ci_wave.trim.connect(self.ci_trim)
+        b.addWidget(self.ci_wave)
+        tm = QHBoxLayout()
+        self.ci_tin, self.ci_trem, self.ci_tout = lab("", "mut"), lab("", ""), lab("", "mut")
+        self.ci_trem.setStyleSheet("font-weight:700;")
+        self.ci_trem.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ci_tout.setAlignment(Qt.AlignmentFlag.AlignRight)
+        for x in (self.ci_tin, self.ci_trem, self.ci_tout):
+            tm.addWidget(x, 1)
+        b.addLayout(tm)
+        self.ci_seg = Segmented(["Réglages", "Notes"], w=104, h=28)
+        self.ci_seg.changed.connect(lambda k: self.ci_stack.setCurrentIndex(k))
+        sg = QHBoxLayout()
+        sg.addStretch(1)
+        sg.addWidget(self.ci_seg)
+        sg.addStretch(1)
+        b.addLayout(sg)
+        self.ci_stack = QStackedWidget()
+        pg = QWidget()
+        g = QGridLayout(pg)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(4)
+        self.ci_sl = {}
+        for row, (k, text, hi) in enumerate((("vol", "Volume", 150), ("fade_in", "Fondu d'entrée", 50), ("fade_out", "Fondu de sortie", 50))):
+            g.addWidget(lab(text, "mut"), row, 0)
+            s = Slider(Qt.Orientation.Horizontal)
+            s.setRange(0, hi)
+            s.setMinimumWidth(90)
+            vl = lab("", "")
+            vl.setFixedWidth(40)
+            vl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            s.valueChanged.connect(lambda val, k=k: self.ci_slider(k, val))
+            g.addWidget(s, row, 1)
+            g.addWidget(vl, row, 2)
+            self.ci_sl[k] = (s, vl)
+        g.addWidget(lab("Couleur", "mut"), 3, 0)
+        self.ci_col = ColorDots()
+        self.ci_col.picked.connect(lambda n: self.ci_set("color", n))
+        g.addWidget(self.ci_col, 3, 1, 1, 2, Qt.AlignmentFlag.AlignRight)
+        ck = QGridLayout()
+        ck.setContentsMargins(0, 4, 0, 0)
+        ck.setHorizontalSpacing(8)
+        ck.setVerticalSpacing(2)
+        ck.setColumnStretch(0, 1)
+        ck.setColumnStretch(1, 1)
+        g.addLayout(ck, 4, 0, 1, 3)
+        self.ci_ck = {}
+        for n, (k, text, tip) in enumerate((("loop", "Boucle", "Recommence au point d'entrée jusqu'à l'arrêt"),
+                                            ("solo", "Solo", "Coupe les autres tuiles quand celle-ci part"),
+                                            ("pausable", "Clic = pause", "Un clic pendant la lecture met en pause au lieu d'arrêter"),
+                                            ("hold", "Tant que j'appuie", "Ne joue que tant que le bouton ou la touche reste enfoncé"))):
+            c = CheckLine(text)
+            c.setToolTip(tip)
+            c.toggled.connect(lambda on, k=k: self.ci_set(k, on))
+            ck.addWidget(c, n // 2, n % 2)
+            self.ci_ck[k] = c
+        g.setColumnStretch(1, 1)
+        self.ci_stack.addWidget(pg)
+        self.ci_notes = QPlainTextEdit()
+        self.ci_notes.setPlaceholderText("Notes pour l'animateur : quand passer ce son, à qui il appartient…")
+        self.ci_notes.textChanged.connect(lambda: self.ci_set("notes", self.ci_notes.toPlainText(), quiet=True))
+        self.ci_stack.addWidget(self.ci_notes)
+        b.addWidget(self.ci_stack)
+        fr = QHBoxLayout()
+        self.ci_file = lab("", "mut")
+        self.ci_file.setMinimumWidth(40)
+        fr.addWidget(self.ci_file, 1)
+        fr.addWidget(btn("Plus…", "", lambda: self.ci_more()))
+        b.addLayout(fr)
+        L.addWidget(self.ci_box, 1)
+        L.addStretch(0)
+        self.ci_box.hide()
+        self._ci_loading = False
+        return ins
+
+    # ---- sets
+    def carts(self):
+        return self.prof["carts"]["pages"]
+
+    def cid(self, si, i):
+        return si * CID + i
+
+    def refresh_sets(self):
+        c = self.prof["carts"]
+        self.lw_sets.blockSignals(True)
+        self.lw_sets.clear()
+        for n in c["names"]:
+            self.lw_sets.addItem(n)
+        self.cur_set = min(self.cur_set, len(c["names"]) - 1)
+        self.lw_sets.setCurrentRow(self.cur_set)
+        self.lw_sets.blockSignals(False)
+        if hasattr(self, "sl_master"):
+            self.sl_master.blockSignals(True)
+            self.sl_master.setValue(int(c.get("master", 100)))
+            self.sl_master.blockSignals(False)
+            self.l_master.setText(f"{self.sl_master.value()} %")
+        self.refresh_tiles()
+
+    def pick_set(self, i):
+        if i >= 0:
+            self.cur_set = i
+            self.refresh_tiles()
+
+    def sets_menu(self, pos):
+        m = QMenu(self)
+        m.addAction("Renommer…", self.rename_set)
+        m.addAction("Supprimer le set", self.del_set)
+        m.exec(self.lw_sets.mapToGlobal(pos))
+
+    def new_set(self):
+        n, ok = QInputDialog.getText(self, "Nouveau set", "Nom du set :")
+        if ok and n.strip():
+            c = self.prof["carts"]
+            c["pages"].append([])
+            c["names"].append(n.strip())
+            c["locks"].append("")
+            self.cur_set = len(c["names"]) - 1
+            self.refresh_sets()
+
+    def rename_set(self):
+        c = self.prof["carts"]
+        n, ok = QInputDialog.getText(self, "Renommer", "Nom du set :", text=c["names"][self.cur_set])
+        if ok and n.strip():
+            c["names"][self.cur_set] = n.strip()
+            self.refresh_sets()
+
+    def del_set(self):
+        c = self.prof["carts"]
+        if len(c["names"]) < 2:
+            return
+        if QMessageBox.question(self, "Supprimer", f"Supprimer le set « {c['names'][self.cur_set]} » et ses tuiles ?") != QMessageBox.StandardButton.Yes:
+            return
+        for k in ("pages", "names", "locks"):
+            del c[k][self.cur_set]
+        self.cur_set = 0
+        self.refresh_sets()
+
+    # ---- tuiles
+    def refresh_tiles(self):
+        for t in self.tiles:
+            t.setParent(None)
+            t.hide()
+            t.deleteLater()
+        self.tiles = []
+        while self.flow.count():
+            self.flow.takeAt(0)
+        q = self.ed_cq.text().strip().lower() if hasattr(self, "ed_cq") else ""
+        for i, d in enumerate(self.carts()[self.cur_set]):
+            if q and q not in (d.get("name", "") + " " + os.path.basename(d.get("file", ""))).lower():
+                continue
+            t = FTile(d, self.cid(self.cur_set, i), self.tile_host)
+            t.idx = i
+            t.pressed.connect(self.tile_press)
+            t.released.connect(self.tile_release)
+            t.menu.connect(self.tile_menu)
+            w = self.waves.want(d["file"]) if d.get("file") else None
+            if w:
+                t.bins, t.dur = w
+            t.cue = self.cart_cue.get(t.cid)
+            t.set_sel(self.cart_sel == t.cid)
+            t.show()
+            self.flow.addItem(_WItem(t))
+            self.tiles.append(t)
+        self.resize_tiles()
+        self.ci_load()
+
+    def resize_tiles(self):
+        w = self.sa.viewport().width()
+        h = self.flow.heightForWidth(w)
+        self.tile_host.setMinimumHeight(h)
+        self.tile_host.setFixedWidth(w)
+        self.flow.setGeometry(QRect(0, 0, w, h))
+
+    def wave_ready(self, path, bins, dur):
+        for t in self.tiles:
+            if t.d.get("file") == path:
+                t.bins, t.dur, t._wv = bins, dur, None
+                t.update()
+        d = self.ci_cart()
+        if d and d.get("file") == path:
+            self.ci_load()
+
+    def add_sounds(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "Ajouter des sons", "", "Audio (*.mp3 *.wav *.flac *.ogg *.opus *.m4a *.aac);;Tous (*)")
+        self.add_files(fs)
+
+    def add_files(self, fs):
+        pg = self.carts()[self.cur_set]
+        cols = list(CART_COLORS)
+        for f in fs:
+            c = new_cart()
+            c.update(file=f, name=os.path.splitext(os.path.basename(f))[0], color=cols[len(pg) % (len(cols) - 1)])
+            pg.append(c)
+        if fs:
+            self.refresh_tiles()
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if self.page_key == 'cart':
+            self.add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile() and os.path.isfile(u.toLocalFile())])
+
+    def tile_menu(self, t, gp):
+        self.select_tile(t.cid)
+        m = QMenu(self)
+        m.addAction("Modifier…", lambda: self.tile_edit(t))
+        cm = m.addMenu("Couleur")
+        for n in CART_COLORS:
+            cm.addAction(n, lambda n=n: self.ci_set("color", n))
+        m.addSeparator()
+        m.addAction("Supprimer la tuile", lambda: self.tile_delete(t.idx))
+        m.exec(gp)
+
+    def tile_delete(self, i):
+        pg = self.carts()[self.cur_set]
+        if 0 <= i < len(pg):
+            if self.engine:
+                self.engine.stop_cart(self.cid(self.cur_set, i), 0.04)
+            del pg[i]
+            self.cart_sel = None
+            self.refresh_tiles()
+
+    def tile_edit(self, t):
+        pg = self.carts()[self.cur_set]
+        i = t.idx
+        d = CartDialog(self, f"Tuile · {self.prof['carts']['names'][self.cur_set]}", pg[i])
+        d.exec()
+        if d.result == "delete":
+            del pg[i]
+            self.cart_sel = None
+            self.refresh_tiles()
+        elif d.result is not None:
+            pg[i] = fill(d.result, new_cart())
+            self.refresh_tiles()
+
+    def select_tile(self, cid):
+        if cid != self.cart_sel:
+            self.cart_sel = cid
+            for t in self.tiles:
+                t.set_sel(t.cid == cid)
+            self.ci_load()
+
+    def tile_press(self, t):
+        self.select_tile(t.cid)
+        if not t.d.get("file"):
+            return self.tile_edit(t)
+        if t.d.get("hold"):
+            self._hold.add(t.cid)
+            e = self.engine
+            if not (e and e.cart_playing(t.cid)):
+                self.trigger(t.d, t.cid)
+            return
+        self.trigger(t.d, t.cid)
+
+    def tile_release(self, t):
+        if t.cid in self._hold:
+            self._hold.discard(t.cid)
+            if self.engine:
+                self.engine.stop_cart(t.cid)
+
+    def cart_engine(self, pre):
+        """Moteur prêt pour jouer une tuile (lance le moteur hors antenne au besoin). None si impossible."""
+        dev = self.prof["carts"].get("device", "")
+        if pre and not dev:
+            QMessageBox.information(self, "Carte son", "Choisis d'abord la carte son de pré-écoute (en haut à droite du cartoucheur) : "
+                                    "c'est là que les sons se jouent hors antenne.")
+            return None
+        if not self.engine:
+            self.start_cart_engine()
+        elif self.standalone and self.engine.cmon.label != dev:
+            self.engine.cmon.set_device(dev)
+        return self.engine
+
+    def voice_state(self, cid):
+        e = self.engine
+        return e.cart_status()[0].get(cid) if e else None
+
+    def trigger(self, d, cid, force_play=False):
+        """Clic sur une tuile (ou sa touche) : lance, met en pause / reprend, ou arrête."""
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        st = self.voice_state(cid)
+        e = self.engine
+        if st is not None and e:
+            if st[6]:                                 # en pause : on reprend
+                return e.pause_cart(cid, False)
+            if d.get("pausable") and not shift and not force_play:
+                return e.pause_cart(cid, True)
+            return e.stop_cart(cid, fade=0.05 if shift else None)
+        e = self.cart_engine((not self.on_air) or shift)
+        if not e:
+            return
+        if self.prof["carts"].get("solo"):
+            e.stop_cart()
+        at = self.cart_cue.pop(cid, None)
+        for t in self.tiles:
+            if t.cid == cid:
+                t.cue = None
+        e.play_cart(cid, d, (not self.on_air) or shift, at=at)
+
+    def pause_all(self, on):
+        if self.engine:
+            self.engine.pause_cart(None, bool(on))
+
+    def stop_all_btn(self):
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self.stop_all(0.04 if shift else None)
+
+    def stop_all(self, fade=None):
+        if self.engine:
+            self.engine.pause_cart(None, False)
+            self.engine.stop_cart(None, fade)
+
+    def cdev_label(self):
+        t = self.cb_cdev.currentText() if self.cb_cdev.currentData() else ""
+        t = dev_short(t) if t else ""
+        self.b_cdev.setText("Casque : " + (t if t else "aucun"))
+        self.b_cdev.setToolTip("Carte son de pré-écoute : " + (self.cb_cdev.currentText() if t else "aucune choisie"))
+
+    def cdev_menu(self):
+        m = self.m_cdev
+        m.clear()
+        for i in range(self.cb_cdev.count()):
+            a = m.addAction(self.cb_cdev.itemText(i) if self.cb_cdev.itemData(i) else "Aucun (pas de pré-écoute)")
+            a.setCheckable(True)
+            a.setChecked(i == self.cb_cdev.currentIndex())
+            a.triggered.connect(lambda _=False, i=i: (self.cb_cdev.setCurrentIndex(i), self.cart_dev_changed(i)))
+
+    def master_changed(self, v):
+        self.prof["carts"]["master"] = v
+        self.l_master.setText(f"{v} %")
+        if self.engine:
+            self.engine.prof_update("carts", master=v)
+
+    # ---- inspecteur
+    def ci_cart(self):
+        if self.cart_sel is None:
+            return None
+        si, i = divmod(self.cart_sel, CID)
+        try:
+            return self.carts()[si][i]
+        except (IndexError, TypeError):
+            return None
+
+    def ci_tile(self):
+        return next((t for t in self.tiles if t.cid == self.cart_sel), None)
+
+    def ci_load(self):
+        if not hasattr(self, "ci_box"):
+            return
+        d = self.ci_cart()
+        self.ci_box.setVisible(d is not None)
+        self.ci_empty.setVisible(d is None)
+        if d is None:
+            return
+        self._ci_loading = True
+        try:
+            if self.ci_name.text() != d.get("name", ""):
+                self.ci_name.setText(d.get("name", ""))
+            w = self.waves.want(d["file"]) if d.get("file") else None
+            bins, dur = w if w else ([], 0.0)
+            a, b = cart_span(d, dur)
+            self.ci_wave.set_data(bins, dur, cart_col(d), a, b)
+            for k, (s, vl) in self.ci_sl.items():
+                try:
+                    val = int(d.get("vol", 100)) if k == "vol" else int(round(float(d.get(k) or 0) * 10))
+                except (TypeError, ValueError):
+                    val = 100 if k == "vol" else 0
+                s.setValue(val)
+                self.ci_slider_label(k, s.value())
+            self.ci_col.set(d.get("color", "Bleu"))
+            for k, c in self.ci_ck.items():
+                c.setChecked(bool(d.get(k)))
+            if self.ci_notes.toPlainText() != d.get("notes", ""):
+                self.ci_notes.setPlainText(d.get("notes", ""))
+            fn = os.path.basename(d.get("file", ""))
+            self.ci_file.setText(self.ci_file.fontMetrics().elidedText(fn, Qt.TextElideMode.ElideMiddle, 200))
+            self.ci_file.setToolTip(d.get("file", ""))
+        finally:
+            self._ci_loading = False
+        self.ci_tick()
+
+    def ci_slider_label(self, k, v):
+        self.ci_sl[k][1].setText(f"{v} %" if k == "vol" else f"{v / 10:.1f} s".replace(".", ","))
+
+    def ci_slider(self, k, v):
+        self.ci_slider_label(k, v)
+        if self._ci_loading:
+            return
+        if k == "vol":
+            self.ci_set("vol", v)
+            if self.engine:
+                self.engine.set_cart_live(self.cart_sel, vol=v / 100)
+        else:
+            self.ci_set(k, v / 10)
+            if k == "fade_out" and self.engine:
+                self.engine.set_cart_live(self.cart_sel, fo=v / 10)
+
+    def ci_set(self, k, val, quiet=False):
+        if self._ci_loading:
+            return
+        d = self.ci_cart()
+        if d is None:
+            return
+        d[k] = val
+        if k == "loop" and self.engine:
+            self.engine.set_cart_live(self.cart_sel, loop=val)
+        if k == "color":
+            self.ci_col.set(val)
+            self.ci_wave.col = cart_col(d)
+            self.ci_wave.update()
+        t = self.ci_tile()
+        if t and not quiet:
+            t.update()
+
+    def ci_seek(self, sec):
+        """Tête de lecture déplacée dans l'inspecteur : saute pendant la lecture, sinon point de départ du prochain clic."""
+        cid = self.cart_sel
+        e = self.engine
+        if e and e.cart_playing(cid):
+            e.seek_cart(cid, sec)
+        else:
+            self.cart_cue[cid] = sec
+            t = self.ci_tile()
+            if t:
+                t.cue = sec
+                t.update()
+        self.ci_tick()
+
+    def ci_trim(self, a, b):
+        d = self.ci_cart()
+        if d is None:
+            return
+        dur = self.ci_wave.dur
+        self.ci_wave.a, self.ci_wave.b = a, b
+        self.ci_wave.update()
+        d["start"] = round(a, 2) if a > .02 else 0.0
+        d["end"] = 0.0 if dur and b >= dur - .02 else round(b, 2)
+        cue = self.cart_cue.get(self.cart_sel)
+        if cue is not None and not a <= cue < b:
+            self.cart_cue.pop(self.cart_sel, None)
+        t = self.ci_tile()
+        if t:
+            t.cue = self.cart_cue.get(self.cart_sel)
+            t.update()
+        self.ci_tick()
+
+    def ci_rewind(self):
+        d, cid = self.ci_cart(), self.cart_sel
+        if d is None:
+            return
+        e = self.engine
+        if e and e.cart_playing(cid):
+            e.seek_cart(cid, cart_span(d, self.ci_wave.dur)[0])
+        else:
+            self.cart_cue.pop(cid, None)
+            t = self.ci_tile()
+            if t:
+                t.cue = None
+                t.update()
+        self.ci_tick()
+
+    def ci_playpause(self):
+        d, cid = self.ci_cart(), self.cart_sel
+        if d is None or not d.get("file"):
+            return
+        st = self.voice_state(cid)
+        if st is not None and self.engine:
+            self.engine.pause_cart(cid, not st[6])
+        else:
+            self.trigger(d, cid, force_play=True)
+
+    def ci_fadeout(self):
+        d, cid = self.ci_cart(), self.cart_sel
+        if d is None or not self.engine:
+            return
+        try:
+            fo = float(d.get("fade_out") or 0)
+        except (TypeError, ValueError):
+            fo = 0.0
+        self.engine.stop_cart(cid, fade=fo if fo > 0 else None)
+
+    def ci_more(self):
+        t = self.ci_tile()
+        if t:
+            self.tile_edit(t)
+
+    def ci_tick(self, st=None):
+        """Temps et tête de lecture de l'inspecteur (appelé à chaque image sur la page Cartoucheur)."""
+        d = self.ci_cart()
+        if d is None or not self.ci_box.isVisible():
+            return
+        if st is None:
+            st = self.voice_state(self.cart_sel)
+        dur = self.ci_wave.dur
+        a, b = self.ci_wave.a, self.ci_wave.b
+        if not dur:
+            a, b = cart_span(d, 0)
+        if st is not None:
+            pos = st[7] + st[0]
+            self.ci_wave.set_pos(pos, True, st[4])
+            self.ci_play.set_kind("play" if st[6] else "pause", "Reprendre" if st[6] else "Pause")
+        else:
+            pos = self.cart_cue.get(self.cart_sel)
+            self.ci_wave.set_pos(pos, False)
+            self.ci_play.set_kind("play", "Lecture")
+            pos = a if pos is None else pos
+        self.ci_fade.setEnabled(st is not None)
+        tin = f"Entrée {fmt_cs(a)}"
+        tout = f"Sortie {fmt_cs(b)}" if b else "Sortie –"
+        trem = f"−{fmt_cs(max(0.0, b - pos))}" if b else "–"
+        for l_, t_ in ((self.ci_tin, tin), (self.ci_trem, trem), (self.ci_tout, tout)):
+            if l_.text() != t_:
+                l_.setText(t_)
+
+    def cart_now_update(self, st):
+        items = []
+        for cid, v in st.items():
+            si, i = divmod(cid, CID)
+            try:
+                d = self.carts()[si][i]
+            except (IndexError, TypeError):
+                continue
+            items.append((d.get("name") or os.path.basename(d.get("file", "")), CART_COLORS.get(d.get("color"), CART_COLORS["Bleu"]),
+                          v[0], v[1], v[2], v[3], v[4], len(v) > 6 and v[6]))
+        self.cart_now.set_items(items)
+
+    def cart_strip(self, e, st):
+        """Appelé par la boucle d'affichage : état des tuiles + inspecteur."""
+        for t in self.tiles:
+            t.set_state(st.get(t.cid))
+        self.ci_tick(st.get(self.cart_sel) if self.cart_sel is not None else None)
+        if self.b_cdev.text() == "":
+            self.cdev_label()
+
+    # ---- raccourcis clavier et MIDI
+    def find_key(self, tok, field="key"):
+        for si, pg in enumerate(self.carts()):
+            for i, c in enumerate(pg):
+                if c.get(field) == tok:
+                    return si, i
+        return None
+
+    def cart_key(self, e):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox)) or (isinstance(fw, QComboBox) and fw.isEditable()):
+            return False
+        tok = qt_key_token(e)
+        if not tok:
+            return False
+        if e.isAutoRepeat():
+            return self.find_key(tok) is not None
+        now = time.time()
+        kt = self.__dict__.setdefault("_ktime", {})
+        if now - kt.get(tok, 0) < .35:
+            return True
+        kt[tok] = now
+        ref = self.find_key(tok)
+        if ref is None and re.fullmatch(r"F\d{1,2}", tok) and self.data.get("settings", {}).get("fkeys", True):
+            n = int(tok[1:]) - 1
+            pg = self.carts()[self.cur_set]
+            if 0 <= n < min(CART_PER, len(pg)) and not pg[n].get("key"):
+                ref = (self.cur_set, n)
+        if ref:
+            self.cart_click_ref(ref, press=True)
+            return True
+        return False
+
+    def keyReleaseEvent(self, e):
+        if not e.isAutoRepeat():
+            tok = qt_key_token(e)
+            ref = self.find_key(tok) if tok else None
+            if ref:
+                cid = self.cid(*ref)
+                if cid in self._hold:
+                    self._hold.discard(cid)
+                    if self.engine:
+                        self.engine.stop_cart(cid)
+                    return
+        super().keyReleaseEvent(e)
+
+    def cart_click_ref(self, ref, press=True):
+        si, i = ref
+        d, cid = self.carts()[si][i], self.cid(si, i)
+        if si == self.cur_set:
+            self.select_tile(cid)
+        if not d.get("file"):
+            return
+        if d.get("hold"):
+            self._hold.add(cid)
+            if not (self.engine and self.engine.cart_playing(cid)):
+                self.trigger(d, cid)
+            return
+        self.trigger(d, cid)
+
+    def midi_start(self):
+        if not (have_module("mido") and have_module("rtmidi")):
+            return False
+        if getattr(self, "midi", None) is None:
+            self.midi = MidiListener(lambda tok: self.ui(self.midi_msg, tok))
+        n = self.midi.start()
+        if n:
+            self.log(f"MIDI : {n} entrée(s) à l'écoute.")
+        return bool(n)
+
+    def midi_msg(self, tok):
+        cb = getattr(self, "midi_learn", None)
+        if cb:
+            self.midi_learn = None
+            return cb(tok)
+        ref = self.find_key(tok, "midi")
+        if ref:
+            d = self.carts()[ref[0]][ref[1]]
+            if d.get("hold"):                            # MIDI : pas de relâchement connu, la tuile joue normalement
+                return self.trigger(d, self.cid(*ref))
+            return self.cart_click_ref(ref)
+
+    def midi_label_update(self):
+        ok = have_module("mido") and have_module("rtmidi")
+        n = len(self.midi.ports) if getattr(self, "midi", None) else 0
+        self.l_midi.setText(f"MIDI : {n} entrée(s)" if n else "MIDI : activer" if ok else "MIDI : installer")
+
+    def midi_click(self):
+        if have_module("mido") and have_module("rtmidi"):
+            self.midi_start()
+            return self.midi_label_update()
+        self.install("mido")
+        self.install("python-rtmidi")
+
+# ------------------------------------------------------------------ utilitaires de dialogue + pages Réglages / Enregistrement / À propos
+def _msg(parent, kind, title, text):
+    m = QMessageBox(parent)
+    m.setWindowTitle(title)
+    m.setText(text)
+    m.setIcon({"info": QMessageBox.Icon.Information, "err": QMessageBox.Icon.Critical, "warn": QMessageBox.Icon.Warning}.get(kind, QMessageBox.Icon.Information))
+    m.exec()
+
+
+def info(parent, title, text):
+    _msg(parent, "info", title, text)
+
+
+def err(parent, title, text):
+    _msg(parent, "err", title, text)
+
+
+def yes(parent, title, text):
+    m = QMessageBox(parent)
+    m.setWindowTitle(title)
+    m.setText(text)
+    m.setIcon(QMessageBox.Icon.Question)
+    m.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    m.button(QMessageBox.StandardButton.Yes).setText("Oui")
+    m.button(QMessageBox.StandardButton.No).setText("Non")
+    return m.exec() == QMessageBox.StandardButton.Yes
+
+
+def ask_text(parent, title, label, init=""):
+    t, ok = QInputDialog.getText(parent, title, label, text=init)
+    return t if ok else None
+
+
+class Swatches(QWidget):
+    """Pastilles de couleur d'accent."""
+    picked = Signal(str)
+
+    def __init__(self, cur):
+        super().__init__()
+        self.cur = cur
+        self.setFixedSize(len(ACCENTS) * 42, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        k = int(e.position().x() // 42)
+        names = list(ACCENTS)
+        if 0 <= k < len(names):
+            self.cur = names[k]
+            self.update()
+            self.picked.emit(names[k])
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        for k, (name, (col, _)) in enumerate(ACCENTS.items()):
+            x = 20 + k * 42
+            if name == self.cur:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(col), 2))
+                p.drawEllipse(QPointF(x, 16), 15, 15)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(col))
+            p.drawEllipse(QPointF(x, 16), 10, 10)
+
+
+class Hero(QWidget):
+    """Triskell + hermines (ambiances sobre / psyché)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(320, 84)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        draw_logo(p, 42, 42, 38, None, 4, 0.0)
+        f = QFont(self.font())
+        f.setPointSizeF(24)
+        f.setWeight(QFont.Weight.ExtraBold)
+        p.setFont(f)
+        p.setPen(QColor(TXT))
+        p.drawText(QRectF(94, 10, 220, 40), Qt.AlignmentFlag.AlignVCenter, APP)
+        f.setPointSizeF(8)
+        f.setWeight(QFont.Weight.Normal)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        p.setFont(f)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(95, 50, 220, 20), Qt.AlignmentFlag.AlignVCenter, "BROADCAST TOOL")
+
+
+def row(label, w, width=150):
+    h = QHBoxLayout()
+    l = lab(label, "mut")
+    l.setFixedWidth(width)
+    h.addWidget(l)
+    if isinstance(w, QWidget):
+        h.addWidget(w)
+    else:
+        h.addLayout(w)
+    h.addStretch(1)
+    return h
+
+
+class PagesMixin1:
+    TABNAMES = {"Diffusion": "diff", "Traitement son": "son", "Cartoucheur": "cart", "Enregistrement": "rec", "Monitoring": "mon", "SOS": "sos"}
+
+    @property
+    def outputs_cfg(self):
+        return self.prof["outputs"]
+
+    def ui(self, fn):
+        QTimer.singleShot(0, fn)
+
+    def bell(self):
+        QApplication.beep()
+
+    def copy_text(self, txt, what="Adresse"):
+        QApplication.clipboard().setText(txt)
+        self.log(f"{what} copiée : {txt}")
+
+    def note_restart(self):
+        if self.on_air:
+            self.log("Modification enregistrée : elle sera prise en compte au prochain démarrage.")
+
+    def open_path(self, p):
+        try:
+            if SYS == "Windows":
+                os.startfile(p)
+            else:
+                subprocess.Popen(["open" if SYS == "Darwin" else "xdg-open", p])
+        except Exception as e:
+            self.log(f"Impossible d'ouvrir : {e}")
+
+    # ------------------------------------------------------------ réglages généraux
+    def save_settings(self):
+        try:
+            save_data(self.data)
+        except OSError as e:
+            self.log(f"Enregistrement des réglages impossible : {e}")
+
+    def keep_awake(self, on):
+        try:
+            if SYS == "Windows":
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x00000001 | 0x00000002 if on else 0))
+                return
+            p = getattr(self, "_awake", None)
+            if p and p.poll() is None:
+                p.terminate()
+            self._awake = None
+            if on:
+                cmd = ["caffeinate", "-di"] if SYS == "Darwin" else ["systemd-inhibit", "--what=idle:sleep", "--why=Antenne", "sleep", "infinity"]
+                if shutil.which(cmd[0]):
+                    self._awake = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def apply_settings(self, first=False):
+        S = self.data.setdefault("settings", {})
+        fl = self.windowFlags()
+        top = bool(S.get("topmost"))
+        if top != bool(fl & Qt.WindowType.WindowStaysOnTopHint):
+            vis = self.isVisible()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, top)
+            if vis:
+                self.show()
+        self.keep_awake(bool(S.get("keep_awake")))
+        if first and S.get("start_tab", "diff") != "diff":
+            QTimer.singleShot(200, lambda: self.go_tab(S["start_tab"]))
+        if first and S.get("fullscreen_start"):
+            QTimer.singleShot(400, self.toggle_fullscreen)
+
+    # ---- propositions des Réglages
+    MARK = os.path.expanduser("~/.bev_onair")
+
+    def props_init(self):
+        from PySide6.QtGui import QShortcut
+        S = self.data.setdefault("settings", {})
+        self._crashed = os.path.exists(self.MARK)
+        try:
+            os.remove(self.MARK)
+        except OSError:
+            pass
+        if self._crashed and S.get("resume_crash") and not self.data.get("autostart"):
+            self.log("Fermeture brutale détectée : reprise de l'antenne.")
+            QTimer.singleShot(2500, lambda: None if self.engine else self.start())
+        self.prop_n, self._disk_t = 0, 0.0
+        self.prop_tm = QTimer(self)
+        self.prop_tm.timeout.connect(self.props_tick)
+        self.prop_tm.start(5000)
+        sc = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc.activated.connect(self.panic)
+
+    def panic(self):
+        if not self.data.get("settings", {}).get("panic_key"):
+            return
+        e = self.engine
+        if not (e and self.on_air and self.playlist):
+            return self.toast("Raccourci d'urgence : démarre la diffusion avec une playlist de secours pour l'utiliser")
+        self.toggle_manual()
+        self.toast("Playlist de secours lancée" if e.manual else "Retour au direct")
+
+    def props_tick(self):
+        S = self.data.get("settings", {})
+        self.prop_n += 1
+        try:                                                    # marqueur « antenne en cours » pour détecter une fermeture brutale
+            if self.on_air:
+                if not os.path.exists(self.MARK):
+                    open(self.MARK, "w").close()
+            elif os.path.exists(self.MARK):
+                os.remove(self.MARK)
+        except OSError:
+            pass
+        if S.get("siren") and getattr(self, "alert_kind", None) in ("flux", "son") and self.prop_n % 2 == 0:
+            QApplication.beep()
+        if S.get("disk_warn") and time.time() - self._disk_t > 1800:
+            try:
+                d = self.rec_dir() or ""
+                if d and os.path.isdir(d) and shutil.disk_usage(d).free < 2e9:
+                    self._disk_t = time.time()
+                    QApplication.beep()
+                    self.log(f"⚠ Disque presque plein : moins de 2 Go libres pour les enregistrements ({d}).")
+                    self.toast("Disque presque plein : moins de 2 Go libres", 6000)
+            except OSError:
+                pass
+
+    def daily_log(self, line):
+        try:
+            d = os.path.expanduser("~/Bev_journaux")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, time.strftime("%Y-%m-%d") + ".log"), "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def set_val(self, key, val):
+        self.data.setdefault("settings", {})[key] = val
+        self.save_settings()
+
+    def set_flag(self, key, val, restart=False):
+        self.data.setdefault("settings", {})[key] = bool(val)
+        self.save_settings()
+        if restart:
+            self.l_restart.setText("Redémarrage nécessaire")
+        else:
+            self.apply_settings()
+
+    def need_restart(self, key, val):
+        S = self.data.setdefault("settings", {})
+        if S.get("look_v") != 2:                      # premier choix : on fige l'apparence actuelle (Phare) avant de changer un seul réglage
+            S["mood"], S["accent"], S["look_v"] = "phare", "Phare", 2
+        self.set_val(key, val)
+        self.l_restart.setText("Redémarrage nécessaire")
+
+    def _page_settings(self):
+        pg = Page()
+        g = pg.grid
+        S = self.data.setdefault("settings", {})
+        # apparence
+        c = Card("Apparence", "Thème, ambiance et couleur d'accent")
+        wm = Switch("Mode minimaliste : sobre, sans animation, centré sur la diffusion")
+        wm.setChecked(bool(S.get("mini")))
+        wm.setToolTip("Palette grise, aucune animation, menu réduit à Diffusion, Cartoucheur, Enregistrement, Monitoring, SOS et Réglages. "
+                      "Le plus léger pour l'ordinateur ; à choisir pour les vieilles machines ou les émissions où l'on ne veut rien d'autre sous les yeux.")
+        wm.toggled.connect(lambda on: self.set_flag("mini", on, restart=True))
+        c.lay.addWidget(wm)
+        s1 = Segmented(["Sombre", "Clair", "Auto"], 84)
+        s1.setValue({"dark": 0, "light": 1, "auto": 2}.get(S.get("theme", "dark"), 0))
+        s1.changed.connect(lambda k: self.need_restart("theme", ("dark", "light", "auto")[k]))
+        c.lay.addLayout(row("Mode", s1))
+        s2 = Segmented(["Phare", "Sobre", "Psyché", "Océan"], 84)
+        s2.setValue({"sobre": 1, "psyche": 2, "ocean": 3}.get(S.get("mood", "phare") if S.get("look_v") == 2 else "phare", 0))
+        s2.changed.connect(lambda k: self.need_restart("mood", ("phare", "sobre", "psyche", "ocean")[k]))
+        c.lay.addLayout(row("Ambiance", s2))
+        s3 = Segmented(["Menu latéral", "Barre du haut"], 120)
+        s3.setValue(1 if S.get("nav") == "top" else 0)
+        s3.changed.connect(lambda k: self.need_restart("nav", "top" if k else "side"))
+        c.lay.addLayout(row("Navigation", s3))
+        sw = Swatches(S.get("accent", "Phare") if S.get("look_v") == 2 else "Phare")
+        sw.picked.connect(lambda n: self.need_restart("accent", n))
+        c.lay.addLayout(row("Accent", sw))
+        w = Switch("Mode performance (ordinateur lent : coupe les effets)")
+        w.setChecked(bool(S.get("perf")))
+        w.toggled.connect(lambda on: self.set_flag("perf", on, restart=True))
+        c.lay.addWidget(w)
+        h = QHBoxLayout()
+        self.l_restart = lab("", "")
+        self.l_restart.setStyleSheet(f"color:{ACCT};")
+        h.addWidget(self.l_restart)
+        h.addStretch(1)
+        h.addWidget(btn("Appliquer et redémarrer", "primary", self.restart_app))
+        c.lay.addLayout(h)
+        c.lay.addStretch(1)
+        g.addWidget(c, 0, 0)
+        # fonctionnement
+        c = Card("Fonctionnement", "Comportement en exploitation")
+        self.sw_auto = Switch("Démarrer l'antenne au lancement (auto-démarrage)")
+        self.sw_auto.setChecked(bool(self.prof.get("autostart")))
+        self.sw_auto.toggled.connect(lambda on: self.prof.__setitem__("autostart", on))
+        c.lay.addWidget(self.sw_auto)
+        for key, label in (("topmost", "Toujours au premier plan"), ("keep_awake", "Empêcher la mise en veille de l'ordinateur"),
+                           ("confirm_stop", "Demander confirmation avant d'arrêter l'antenne"), ("fullscreen_start", "Démarrer en plein écran")):
+            w = Switch(label)
+            w.setChecked(bool(S.get(key)))
+            w.toggled.connect(lambda on, k=key: self.set_flag(k, on))
+            c.lay.addWidget(w)
+        w = Switch("Moteur audio séparé (recommandé : l'interface ne peut plus faire décrocher l'antenne)")
+        w.setChecked(bool(S.get("engine_proc", True)))
+        w.setToolTip("Le son est traité dans un processus à part, sur son propre cœur de processeur.\n"
+                     "Pris en compte au prochain démarrage de l'antenne.")
+        w.toggled.connect(lambda on: (self.set_flag("engine_proc", on), self.prewarm() if on else None))
+        c.lay.addWidget(w)
+        h = QHBoxLayout()
+        h.addWidget(lab("Baisse du direct sous une cartouche", ""))
+        h.addStretch(1)
+        self.l_duck = lab("", "mut")
+        h.addWidget(self.l_duck)
+        c.lay.addLayout(h)
+        self.sl_duck = Slider(Qt.Orientation.Horizontal)
+        self.sl_duck.setRange(0, 100)
+        self.sl_duck.setValue(int(self.prof["carts"].get("duck", 40)))
+        self.l_duck.setText(f"{self.sl_duck.value()} %")
+        self.sl_duck.valueChanged.connect(self.duck_changed)
+        c.lay.addWidget(self.sl_duck)
+        c.lay.addStretch(1)
+        g.addWidget(c, 0, 1)
+        # ma radio
+        c = Card("Ma radio", "Identité de la station et démarrage")
+        self.ed_station = QLineEdit(S.get("station", ""))
+        self.ed_station.setMaximumWidth(260)
+        self.ed_station.textChanged.connect(self.set_station)
+        c.lay.addLayout(row("Nom de la radio", self.ed_station, 130))
+        self.cb_start = QComboBox()
+        self.cb_start.addItems(list(self.TABNAMES))
+        self.cb_start.setCurrentText(next((n for n, k in self.TABNAMES.items() if k == S.get("start_tab", "diff")), "Diffusion"))
+        self.cb_start.activated.connect(lambda *_: self.set_val("start_tab", self.TABNAMES.get(self.cb_start.currentText(), "diff")))
+        c.lay.addLayout(row("Page au démarrage", self.cb_start, 130))
+        for key, label, d in (("fkeys", "Touches F1 à F12 pour jouer les cartouches", True), ("update_check", "Vérifier les mises à jour au lancement", True)):
+            w = Switch(label)
+            w.setChecked(bool(S.get(key, d)))
+            w.toggled.connect(lambda on, k=key: self.set_flag(k, on))
+            c.lay.addWidget(w)
+        c.lay.addStretch(1)
+        g.addWidget(c, 1, 0)
+        # propositions
+        c = Card("Propositions", "Des idées pour sécuriser l'antenne : à activer si elles vous parlent")
+        for key, label, tip in (
+                ("siren", "Bip répété tant qu'une panne dure", "Un bip toutes les 10 s sur cet ordinateur, jusqu'au retour de l'antenne (au lieu d'un seul)."),
+                ("resume_crash", "Reprendre l'antenne après une fermeture brutale", "Si Bev ou l'ordinateur a planté en pleine émission, la diffusion repart toute seule au prochain lancement."),
+                ("daily_log", "Garder un journal par jour dans un fichier", "Un fichier texte par jour dans le dossier « Bev_journaux » de votre dossier personnel."),
+                ("disk_warn", "Prévenir quand le disque des enregistrements se remplit", "Alerte (bip + journal) sous 2 Go libres, rappelée toutes les 30 minutes."),
+                ("panic_key", "Raccourci d'urgence Ctrl + Maj + S", "Bascule tout de suite sur la playlist de secours, et revient au direct en réappuyant.")):
+            w = Switch(label)
+            w.setToolTip(tip)
+            w.setChecked(bool(S.get(key, False)))
+            w.toggled.connect(lambda on, k=key: self.set_val(k, bool(on)))
+            c.lay.addWidget(w)
+            t = lab(tip, "mut", True)
+            t.setStyleSheet(f"color:{MUT};font-size:11px;margin-left:52px;margin-bottom:2px;")
+            t.setMinimumHeight(36)
+            c.lay.addWidget(t)
+        c.lay.addStretch(1)
+        g.addWidget(c, 1, 1)
+        # sauvegarde
+        c = Card()
+        c.lay.setContentsMargins(18, 10, 18, 10)
+        h = QHBoxLayout()
+        tl = QVBoxLayout()
+        tl.setSpacing(0)
+        t = lab("Sauvegarde", "")
+        t.setStyleSheet("font-size:15px;font-weight:700;")
+        tl.addWidget(t)
+        tl.addWidget(lab("Profils, touches, flux et alertes : une copie, ou les installer sur un autre ordinateur", "mut"))
+        h.addLayout(tl, 1)
+        h.addWidget(btn("Exporter…", "", self.export_conf))
+        h.addWidget(btn("Importer…", "", self.import_conf))
+        h.addWidget(btn("Ouvrir le dossier", "", lambda: self.open_path(os.path.dirname(CONF))))
+        c.lay.addLayout(h)
+        g.addWidget(c, 2, 0, 1, 2)
+        g.setRowStretch(3, 1)
+        return pg
+
+    def gael_settings(self):
+        """Petite fenêtre « Gaël · conversation avancée », ouverte depuis l'assistant (onglet SOS)."""
+        S = self.data.setdefault("settings", {})
+        if getattr(self, "gael_dlg", None) is None:
+            d = self.gael_dlg = QDialog(self)
+            d.setWindowTitle("Gaël · conversation avancée")
+            d.setMinimumWidth(460)
+            c = QVBoxLayout(d)
+            c.setContentsMargins(20, 16, 20, 16)
+            c.setSpacing(10)
+            c.addWidget(lab("Sans clé, Gaël répond en local. Avec une clé API Anthropic, tu lui parles librement ; "
+                            "il prépare les réglages, tu valides toujours d'un clic.", "mut", True))
+            self.sw_gai = Switch("Activer la conversation avancée")
+            self.sw_gai.setChecked(bool(S.get("gael_ai", True)) and bool(S.get("gael_key")))
+            self.sw_gai.toggled.connect(lambda on: (self.set_val("gael_ai", bool(on)), self.assistant.set_status()))
+            c.addWidget(self.sw_gai)
+            kr = QHBoxLayout()
+            self.ed_gkey = QLineEdit(S.get("gael_key", ""))
+            self.ed_gkey.setEchoMode(QLineEdit.EchoMode.Password)
+            self.ed_gkey.setPlaceholderText("sk-ant-…  (console.anthropic.com > API Keys)")
+            self.ed_gkey.editingFinished.connect(self.gael_key_saved)
+            kr.addWidget(self.ed_gkey, 1)
+            kr.addWidget(btn("Afficher", "", lambda: self.ed_gkey.setEchoMode(
+                QLineEdit.EchoMode.Normal if self.ed_gkey.echoMode() == QLineEdit.EchoMode.Password else QLineEdit.EchoMode.Password)))
+            c.addLayout(kr)
+            kr = QHBoxLayout()
+            self.cb_gmodel = QComboBox()
+            for mid, ml in LLM_MODELS:
+                self.cb_gmodel.addItem(ml, mid)
+            cur = S.get("gael_model") or LLM_MODELS[0][0]
+            if self.cb_gmodel.findData(cur) < 0:
+                self.cb_gmodel.addItem(cur, cur)
+            self.cb_gmodel.setCurrentIndex(max(0, self.cb_gmodel.findData(cur)))
+            self.cb_gmodel.activated.connect(lambda *_: self.set_val("gael_model", self.cb_gmodel.currentData()))
+            kr.addWidget(self.cb_gmodel, 1)
+            kr.addWidget(btn("Tester", "", self.gael_test))
+            c.addLayout(kr)
+            self.l_gtest = lab("Clé gardée sur cet ordinateur. Les questions et un résumé de l'antenne (sans mot de passe) sont envoyés à Anthropic ; "
+                               "usage facturé sur ton compte.", "mut", True)
+            self.l_gtest.setStyleSheet(f"color:{MUT};font-size:11px;")
+            c.addWidget(self.l_gtest)
+        self.gael_dlg.show()
+        self.gael_dlg.raise_()
+
+    def gael_key_saved(self):
+        k = self.ed_gkey.text().strip()
+        if k != self.data.get("settings", {}).get("gael_key", ""):
+            self.set_val("gael_key", k)
+            if k and hasattr(self, "sw_gai") and not self.sw_gai.isChecked():
+                self.sw_gai.setChecked(True)
+            self.assistant.set_status()
+
+    def gael_test(self):
+        self.gael_key_saved()
+        key = self.ed_gkey.text().strip()
+        if not key:
+            return self.l_gtest.setText("Saisis d'abord une clé API.")
+        self.l_gtest.setText("Test en cours…")
+        model = self.cb_gmodel.currentData()
+
+        def work():
+            import urllib.request
+            try:
+                body = json.dumps({"model": model, "max_tokens": 30, "messages": [{"role": "user", "content": "Dis bonjour en cinq mots."}]}).encode()
+                req = urllib.request.Request(API_URL, data=body, method="POST", headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                                                                                          "content-type": "application/json"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    js = json.loads(r.read().decode("utf-8"))
+                txt = "".join(b.get("text", "") for b in js.get("content", []))
+                msg, col = f"Ça marche ! Gaël répond : « {txt.strip()[:80]} »", OKC
+            except urllib.error.HTTPError as e:
+                msg, col = {401: "Clé refusée : vérifie-la sur console.anthropic.com.", 404: "Modèle introuvable : choisis l'autre modèle."}.get(
+                    e.code, f"Erreur {e.code} : " + e.read().decode("utf-8", "replace")[:160]), BADC
+            except Exception as e:
+                msg, col = f"Impossible de joindre le service : {e}", BADC
+            self.ui(lambda: (self.l_gtest.setText(msg), self.l_gtest.setStyleSheet(f"color:{col};font-size:11px;")))
+        threading.Thread(target=work, daemon=True).start()
+
+    def duck_changed(self, v):
+        self.prof["carts"]["duck"] = int(v)
+        self.l_duck.setText(f"{int(v)} %")
+        if self.engine:
+            try:
+                self.engine.prof_update("carts", duck=int(v))
+            except Exception:
+                pass
+
+    def set_station(self, *_):
+        name = self.ed_station.text().strip()
+        self.set_val("station", name)
+        self.nav_w.set_title(name)
+        self.setWindowTitle((name + " · " if name else "") + APP)
+
+    def export_conf(self):
+        self.save_all()
+        dst, _ = QFileDialog.getSaveFileName(self, "Exporter les réglages", "reglages_radio.json", "Réglages (*.json)")
+        if dst:
+            shutil.copyfile(CONF, dst)
+            self.log("Réglages exportés : " + dst)
+
+    def import_conf(self):
+        src, _ = QFileDialog.getOpenFileName(self, "Importer des réglages", "", "Réglages (*.json);;Tous (*)")
+        if not src:
+            return
+        try:
+            with open(src, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict) or "profiles" not in d:
+                raise ValueError("ce fichier n'est pas un export de réglages")
+        except Exception as e:
+            return err(self, "Importer", f"Fichier refusé : {e}")
+        if not yes(self, "Importer", "Remplacer tes réglages actuels par ceux de ce fichier ? (une copie .avant-import est gardée)"):
+            return
+        try:
+            shutil.copyfile(CONF, CONF + ".avant-import")
+        except OSError:
+            pass
+        shutil.copyfile(src, CONF)
+        self.log("Réglages importés. Redémarrage…")
+        self.restart_app()
+
+    def restart_app(self):
+        if self.on_air:
+            return info(self, "Redémarrer", "Arrête d'abord la diffusion : l'application doit se relancer.")
+        try:
+            self.save_all()
+        except Exception:
+            pass
+        try:
+            subprocess.Popen([sys.executable] + (sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv))
+        except Exception as e:
+            return err(self, "Redémarrer", f"Impossible de relancer : {e}")
+        self._closing = True
+        self.close()
+
+    # ------------------------------------------------------------ Enregistrement
+    def rec_cfg(self):
+        return next((c for c in self.outputs_cfg if c["type"] == "record"), None)
+
+    def _page_record(self):
+        pg = Page()
+        g = pg.grid
+        st = Card("En cours", "Captation synchronisée avec l'antenne")
+        self.rec_state = lab("", "")
+        self.rec_state.setStyleSheet("font-size:19px;font-weight:700;")
+        self.rec_file = lab("", "")
+        self.rec_file.setStyleSheet(f"color:{ACCT};")
+        self.rec_disk = lab("", "mut")
+        st.lay.addWidget(self.rec_state)
+        st.lay.addWidget(self.rec_file)
+        st.lay.addWidget(self.rec_disk)
+        self.btn_rec = btn("", "primary", self.rec_toggle)
+        self.btn_rec.setMinimumHeight(40)
+        st.lay.addWidget(self.btn_rec, 0, Qt.AlignmentFlag.AlignLeft)
+        st.lay.addStretch(1)
+        g.addWidget(st, 0, 0)
+        cf = Card("Réglages", "Format, découpage et conservation")
+        self.rv = {k: "" for k in ("folder", "format", "bitrate", "rotate", "keep_days", "prefix", "stamp")}
+        self.rw = {}
+        self.rw["folder"] = QLineEdit()             # valeur (cachée) ; l'affichage est la carte dossier ci-dessous
+        self.rw["folder"].hide()
+        h = QHBoxLayout()
+        self.rec_chip = FolderChip()
+        self.rec_chip.clicked.connect(self.rec_pick)
+        h.addWidget(self.rec_chip, 1)
+        h.addWidget(btn("Ouvrir", "", self.rec_open_dir))
+        cf.lay.addLayout(h)
+        self.rw["folder"].textChanged.connect(lambda t: self.rec_chip.set_path(t))
+        self.rw["prefix"] = QLineEdit()
+        self.rw["prefix"].setMaximumWidth(260)
+        cf.lay.addLayout(row("Nom du fichier", self.rw["prefix"], 110))
+        self.rec_ex = lab("", "")
+        self.rec_ex.setStyleSheet(f"color:{ACCT};")
+        self.rec_ex.setWordWrap(True)
+        cf.lay.addWidget(self.rec_ex)
+        self.sw_rdate = Switch("Ajouter la date et l'heure au nom du fichier")
+        self.sw_rdate.setChecked(True)
+        cf.lay.addWidget(self.sw_rdate)
+        self.sw_rpige = Switch("Pige ARCOM : découper l'enregistrement en fichiers réguliers")
+        cf.lay.addWidget(self.sw_rpige)
+        self.rec_pige = QWidget()
+        pv = QVBoxLayout(self.rec_pige)
+        pv.setContentsMargins(0, 0, 0, 0)
+        self.rw["rotate"] = QComboBox()
+        self.rw["rotate"].setEditable(True)
+        self.rw["rotate"].addItems(["15", "30", "60", "120", "180"])
+        self.rw["rotate"].setMaximumWidth(90)
+        h = QHBoxLayout()
+        h.addWidget(self.rw["rotate"])
+        h.addWidget(lab("min  (60 = à l'heure pile)", "mut"))
+        pv.addLayout(row("Un fichier toutes les", h, 150))
+        self.rw["keep_days"] = QLineEdit()
+        self.rw["keep_days"].setMaximumWidth(60)
+        h = QHBoxLayout()
+        h.addWidget(self.rw["keep_days"])
+        h.addWidget(lab("jours  (0 = toujours · vérifiez la durée exigée pour votre radio)", "mut"))
+        pv.addLayout(row("Garder pendant", h, 150))
+        cf.lay.addWidget(self.rec_pige)
+        self.btn_radv = btn("Réglages avancés  ▾", "", self.rec_toggle_adv)
+        cf.lay.addWidget(self.btn_radv, 0, Qt.AlignmentFlag.AlignLeft)
+        self.rec_adv = QWidget()
+        av = QVBoxLayout(self.rec_adv)
+        av.setContentsMargins(0, 0, 0, 0)
+        self.rw["stamp"] = QComboBox()
+        self.rw["stamp"].addItems(list(REC_STAMPS))
+        self.rw["format"] = QComboBox()
+        self.rw["format"].addItems(REC_FORMATS)
+        self.rw["bitrate"] = QComboBox()
+        self.rw["bitrate"].setEditable(True)
+        self.rw["bitrate"].addItems([str(b) for b in BITRATES])
+        for t, k in (("Présentation de la date", "stamp"), ("Format", "format"), ("Débit (kb/s)", "bitrate")):
+            self.rw[k].setMaximumWidth(260)
+            av.addLayout(row(t, self.rw[k], 150))
+        self.rec_adv.hide()
+        cf.lay.addWidget(self.rec_adv)
+        self.rec_saved = lab("", "mut")
+        self.rec_saved.setAlignment(Qt.AlignmentFlag.AlignRight)
+        cf.lay.addWidget(self.rec_saved)
+        g.addWidget(cf, 0, 1)
+        fl = Card("Enregistrements", "Archives disponibles dans le dossier")
+        self.tb_rec = QTableWidget(0, 4)
+        self.tb_rec.setHorizontalHeaderLabels(["", "FICHIER", "DATE", "TAILLE"])
+        dl = style_table(self.tb_rec, check_col=0)
+        dl.check_from_selection = True               # la case reflète la sélection (Ctrl / Maj + clic, Ctrl+A)
+        hh = self.tb_rec.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.tb_rec.setColumnWidth(0, 44)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.tb_rec.setColumnWidth(2, 150)
+        self.tb_rec.setColumnWidth(3, 90)
+        hh.sectionClicked.connect(lambda c: self.rec_select_all() if c == 0 else None)
+        self.tb_rec.verticalHeader().hide()
+        self.tb_rec.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tb_rec.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tb_rec.cellClicked.connect(self.rec_cell_click)
+        self.tb_rec.itemSelectionChanged.connect(self.rec_sel_changed)
+        self.tb_rec.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tb_rec.setShowGrid(False)
+        self.tb_rec.setMinimumHeight(90)
+        self.tb_rec.doubleClicked.connect(lambda *_: self.rec_play())
+        fl.lay.addWidget(self.tb_rec)
+        h = QHBoxLayout()
+        self.b_recall = btn("Tout sélectionner", "", self.rec_select_all)
+        h.addWidget(self.b_recall)
+        self.l_recsel = lab("", "")
+        self.l_recsel.setStyleSheet(f"color:{ACCT};font-weight:700;")
+        h.addWidget(self.l_recsel)
+        h.addStretch(1)
+        self.rec_btns = {}
+        for t, fn in (("Écouter", self.rec_play), ("Renommer…", self.rec_rename), ("Déplacer…", self.rec_move),
+                      ("Copier le chemin", self.rec_copy), ("Supprimer", self.rec_delete)):
+            b = btn(t, "danger" if t == "Supprimer" else "", fn)
+            self.rec_btns[t] = b
+            h.addWidget(b)
+        mb = btn("Plus")
+        mm = QMenu(mb)
+        mm.addAction("Actualiser la liste", self.rec_files)
+        mm.addAction("Ouvrir le dossier", self.rec_open_dir)
+        mm.addAction("Ouvrir la corbeille", lambda: self.open_path(self.rec_trash()))
+        mm.addAction("Vider la corbeille…", self.rec_empty_trash)
+        mb.setMenu(mm)
+        h.addWidget(mb)
+        fl.lay.addLayout(h)
+        g.addWidget(fl, 1, 0, 1, 2)
+        g.setRowStretch(2, 1)
+        self._rec_job = QTimer(self)
+        self._rec_job.setSingleShot(True)
+        self._rec_job.timeout.connect(self.rec_autosave)
+        self._rec_ready = False
+        self.rec_sig, self.rec_newest, self.rec_visit = None, None, 0
+        self.rec_load()
+        for k, w in self.rw.items():
+            if isinstance(w, QComboBox):
+                w.currentTextChanged.connect(self.rec_dirty)
+            else:
+                w.textChanged.connect(self.rec_dirty)
+        self.sw_rdate.toggled.connect(self.rec_dirty)
+        self.sw_rpige.toggled.connect(self.rec_pige_toggle)
+        self.rec_sel_changed()
+        return pg
+
+    def rv_get(self, k):
+        w = self.rw[k]
+        return (w.currentText() if isinstance(w, QComboBox) else w.text()).strip()
+
+    def rv_set(self, k, v):
+        w = self.rw[k]
+        if isinstance(w, QComboBox):
+            w.setCurrentText(str(v))
+        else:
+            w.setText(str(v))
+
+    def rec_load(self):
+        c = self.rec_cfg() or new_output("record")
+        self._rec_ready = False
+        for k in self.rw:
+            self.rv_set(k, str(c.get(k, "")) or ("2026-10-23_16h30" if k == "stamp" else ""))
+        self.sw_rpige.setChecked(c.get("pige") == "1")
+        self.sw_rdate.setChecked(c.get("date", "1") != "0")
+        self.rec_pige.setVisible(self.sw_rpige.isChecked())
+        self.rec_example()
+        QTimer.singleShot(300, lambda: setattr(self, "_rec_ready", True))
+
+    def rec_pick(self):
+        d = QFileDialog.getExistingDirectory(self, "Dossier des enregistrements", self.rv_get("folder") or "")
+        if d:
+            self.rv_set("folder", d)
+
+    def rec_pige_toggle(self, on):
+        if on:
+            if self.rv_get("rotate") in ("", "0"):
+                self.rv_set("rotate", "60")
+            if self.rv_get("keep_days") in ("", "0"):
+                self.rv_set("keep_days", "30")
+        self.rec_pige.setVisible(on)
+        self.rec_dirty()
+
+    def rec_toggle_adv(self):
+        on = not self.rec_adv.isVisible()
+        self.rec_adv.setVisible(on)
+        self.btn_radv.setText("Réglages avancés  " + ("▴" if on else "▾"))
+
+    def rec_dirty(self, *_):
+        self.rec_example()
+        if not self._rec_ready:
+            return
+        self.rec_saved.setText("…")
+        self._rec_job.start(900)
+
+    def rec_autosave(self):
+        self.rec_apply()
+        self.rec_saved.setText("✓ Enregistré")
+
+    def rec_example(self):
+        try:
+            ext = RecordOutput.CODECS.get(self.rv_get("format") or "MP3", RecordOutput.CODECS["MP3"])[1]
+            pre = re.sub(r'[\\/:*?"<>|]', "_", self.rv_get("prefix"))
+            if self.sw_rpige.isChecked():
+                try:
+                    mn = int(float(self.rv_get("rotate") or 60))
+                except ValueError:
+                    mn = 60
+                st = "%Y-%m-%d_%Hh" if mn == 60 else "%Y-%m-%d_%Hh%M"
+                if pre and pre[-1] not in "_- ":
+                    pre += "_"
+                txt = "Exemple : " + pre + time.strftime(st) + ext + "  (puis un nouveau fichier toutes les %d min)" % mn
+            else:
+                name = pre
+                if self.sw_rdate.isChecked():
+                    if name and name[-1] not in "_- ":
+                        name += "_"
+                    name += time.strftime(REC_STAMPS.get(self.rv_get("stamp"), "%Y-%m-%d_%Hh%M"))
+                txt = "Exemple : " + (name.strip("_- ") or "Enregistrement") + ext + "  (un seul fichier par émission)"
+            self.rec_ex.setText(txt)
+        except Exception:
+            pass
+
+    def rec_apply(self):
+        c = self.rec_cfg()
+        if not c:
+            c = new_output("record")
+            self.outputs_cfg.append(c)
+        for k in self.rw:
+            c[k] = self.rv_get(k)
+        c["pige"] = "1" if self.sw_rpige.isChecked() else "0"
+        c["date"] = "1" if self.sw_rdate.isChecked() else "0"
+        if c["pige"] == "1" and not c.get("prefix"):
+            c["prefix"] = "Pige_"
+        for k, d in (("rotate", "60"), ("keep_days", "0"), ("bitrate", "192")):
+            if k == "rotate" and c["pige"] != "1":
+                continue
+            try:
+                c[k] = str(max(0, int(float(c.get(k) or d))))
+            except ValueError:
+                c[k] = d
+        self.refresh_outputs()
+        self.note_restart()
+        self.save_all()
+        self.rec_files()
+        self.log("Réglages d'enregistrement enregistrés.")
+
+    def rec_toggle(self):
+        c = self.rec_cfg()
+        if not c:
+            c = new_output("record")
+            self.outputs_cfg.append(c)
+        else:
+            c["enabled"] = not c.get("enabled", True)
+        self.refresh_outputs()
+        self.note_restart()
+        self.save_all()
+        self.rec_tick()
+
+    def rec_dir(self):
+        return self.rv_get("folder") or (self.rec_cfg() or {}).get("folder", "")
+
+    def rec_files(self):
+        d = self.rec_dir()
+        exts = (".mp3", ".wav", ".flac", ".ogg", ".opus")
+        rows = []
+        try:
+            for n in os.listdir(d):
+                if n.lower().endswith(exts):
+                    p = os.path.join(d, n)
+                    rows.append((os.path.getmtime(p), n, p, os.path.getsize(p)))
+        except OSError:
+            pass
+        rows.sort(reverse=True)
+        keep = set(self.rec_paths()) if hasattr(self, "rec_btns") else set()
+        self.tb_rec.setRowCount(0)
+        for mt, n, p, sz in rows[:400]:
+            r = self.tb_rec.rowCount()
+            self.tb_rec.insertRow(r)
+            for k, t in enumerate(("", n, time.strftime("%d/%m/%Y  %H:%M", time.localtime(mt)),
+                                   f"{sz / 1e6:.1f} Mo" if sz >= 1e6 else f"{sz / 1e3:.0f} Ko")):
+                it = QTableWidgetItem(t)
+                it.setData(Qt.ItemDataRole.UserRole, p)
+                self.tb_rec.setItem(r, k, it)
+        self.rec_newest = rows[0] if rows else None
+        if keep:
+            from PySide6.QtCore import QItemSelectionModel
+            for r in range(self.tb_rec.rowCount()):
+                if self.tb_rec.item(r, 1).data(Qt.ItemDataRole.UserRole) in keep:
+                    self.tb_rec.selectionModel().select(self.tb_rec.model().index(r, 0),
+                                                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        if hasattr(self, "rec_btns"):
+            self.rec_sel_changed()
+
+    def rec_paths(self):
+        rows = sorted({i.row() for i in self.tb_rec.selectedIndexes()})
+        out = []
+        for r in rows:
+            it = self.tb_rec.item(r, 1)
+            if it:
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+    def rec_sel(self):
+        p = self.rec_paths()
+        return p[0] if p else None
+
+    def rec_cell_click(self, r, c):
+        if c == 0:                                    # clic sur la case : ajoute / retire la ligne sans toucher au reste
+            sm = self.tb_rec.selectionModel()
+            from PySide6.QtCore import QItemSelectionModel
+            sm.select(self.tb_rec.model().index(r, 0), QItemSelectionModel.SelectionFlag.Toggle | QItemSelectionModel.SelectionFlag.Rows)
+
+    def rec_select_all(self):
+        n = self.tb_rec.rowCount()
+        if n and len(self.rec_paths()) >= n:
+            self.tb_rec.clearSelection()
+        else:
+            self.tb_rec.selectAll()
+
+    def rec_sel_changed(self):
+        ps = self.rec_paths()
+        n, tot = len(ps), self.tb_rec.rowCount()
+        size = 0
+        for p in ps:
+            try:
+                size += os.path.getsize(p)
+            except OSError:
+                pass
+        self.l_recsel.setText(f"{n} sélectionné{'s' if n > 1 else ''}  ·  {size / 1e6:.0f} Mo" if n else "")
+        self.b_recall.setText("Tout désélectionner" if tot and n >= tot else "Tout sélectionner")
+        for t, b in self.rec_btns.items():
+            b.setEnabled(n == 1 if t in ("Écouter", "Copier le chemin") else n > 0)
+
+    def rec_trash(self):
+        d = os.path.join(self.rec_dir() or os.path.expanduser("~"), ".corbeille")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def free_name(d, name):
+        base, ext = os.path.splitext(name)
+        p, k = os.path.join(d, name), 2
+        while os.path.exists(p):
+            p, k = os.path.join(d, f"{base} ({k}){ext}"), k + 1
+        return p
+
+    def rec_play(self):
+        p = self.rec_sel()
+        if p:
+            self.open_path(p)
+
+    def rec_open_dir(self):
+        d = self.rec_dir()
+        if d:
+            os.makedirs(d, exist_ok=True)
+            self.open_path(d)
+
+    def rec_copy(self):
+        p = self.rec_sel()
+        if p:
+            self.copy_text(p, "Chemin")
+
+    def rec_rename(self):
+        ps = self.rec_paths()
+        if not ps:
+            return
+        moves = []
+        if len(ps) == 1:
+            p = ps[0]
+            base, ext = os.path.splitext(os.path.basename(p))
+            n = ask_text(self, "Renommer", "Nouveau nom :", base)
+            if not (n and n.strip()):
+                return
+            dst = self.free_name(os.path.dirname(p), re.sub(r'[\\/:*?"<>|]', "_", n.strip()) + ext)
+            try:
+                os.rename(p, dst)
+                moves.append((dst, p))
+            except OSError as e:
+                err(self, "Renommer", str(e))
+        else:
+            n = ask_text(self, "Renommer", f"Nom commun pour les {len(ps)} fichiers (ils seront numérotés 01, 02…) :", "Emission")
+            if not (n and n.strip()):
+                return
+            n = re.sub(r'[\\/:*?"<>|]', "_", n.strip())
+            for k, p in enumerate(sorted(ps, key=os.path.getmtime), 1):
+                ext = os.path.splitext(p)[1]
+                dst = self.free_name(os.path.dirname(p), f"{n}_{k:02d}{ext}")
+                try:
+                    os.rename(p, dst)
+                    moves.append((dst, p))
+                except OSError:
+                    pass
+        self.undo_push_files(moves, f"renommage de {len(moves)} enregistrement(s)")
+        self.rec_files()
+        if moves:
+            self.toast(f"{len(moves)} enregistrement(s) renommé(s)   ·   Ctrl+Z pour annuler")
+
+    def rec_move(self):
+        ps = self.rec_paths()
+        if not ps:
+            return
+        d = QFileDialog.getExistingDirectory(self, f"Déplacer {len(ps)} enregistrement(s) vers…", self.rec_dir() or "")
+        if not d or os.path.abspath(d) == os.path.abspath(self.rec_dir() or ""):
+            return
+        moves = []
+        for p in ps:
+            dst = self.free_name(d, os.path.basename(p))
+            try:
+                shutil.move(p, dst)
+                moves.append((dst, p))
+            except OSError as e:
+                self.log(f"Déplacement impossible : {e}")
+        self.undo_push_files(moves, f"déplacement de {len(moves)} enregistrement(s)")
+        self.rec_files()
+        if moves:
+            self.toast(f"{len(moves)} enregistrement(s) déplacé(s) vers « {os.path.basename(d)} »   ·   Ctrl+Z pour annuler")
+
+    def rec_delete(self):
+        ps = self.rec_paths()
+        if not ps:
+            return
+        if not yes(self, "Supprimer", f"Mettre {len(ps)} enregistrement(s) à la corbeille ?\n(Ctrl+Z pour annuler ; la corbeille se vide depuis « Plus ».)"):
+            return
+        tr = self.rec_trash()
+        moves = []
+        for p in ps:
+            dst = self.free_name(tr, os.path.basename(p))
+            try:
+                shutil.move(p, dst)
+                moves.append((dst, p))
+            except OSError as e:
+                self.log(f"Suppression impossible : {e}")
+        self.undo_push_files(moves, f"suppression de {len(moves)} enregistrement(s)")
+        self.rec_files()
+        if moves:
+            self.toast(f"{len(moves)} enregistrement(s) mis à la corbeille   ·   Ctrl+Z pour annuler")
+
+    def rec_empty_trash(self):
+        tr = self.rec_trash()
+        files = [os.path.join(tr, f) for f in os.listdir(tr)]
+        if not files:
+            return info(self, "Corbeille", "La corbeille est vide.")
+        size = sum(os.path.getsize(f) for f in files if os.path.isfile(f)) / 1e6
+        if yes(self, "Vider la corbeille", f"Supprimer définitivement {len(files)} fichier(s) ({size:.0f} Mo) ? Cette action ne peut pas être annulée."):
+            for f in files:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            self.undo_stack[:] = [x for x in self.undo_stack if not (x[0] == "files" and any(c.startswith(tr) for c, _ in x[1]))]
+            self.log(f"Corbeille vidée ({len(files)} fichier(s)).")
+
+    def rec_tick(self):
+        try:
+            c = self.rec_cfg()
+            live = self.engine.output(c["id"]) if (c and self.on_air and self.engine) else None
+            if not c:
+                st, col, bt = "Aucun enregistrement", MUT, "Créer l'enregistrement"
+            elif not c.get("enabled", True):
+                st, col, bt = "Enregistrement désactivé", MUT, "Activer l'enregistrement"
+            elif live and live.state == "live":
+                st, col, bt = "Enregistrement en cours", BADC, "Désactiver l'enregistrement"
+            elif live:
+                st, col, bt = live.status_text(), ACC2, "Désactiver l'enregistrement"
+            else:
+                st, col, bt = "Prêt : démarre avec l'antenne", OKC, "Désactiver l'enregistrement"
+            self.rec_state.setText(("●  " if live and live.state == "live" else "") + st)
+            set_ss(self.rec_state, f"font-size:19px;font-weight:700;color:{col};")
+            self.btn_rec.setText(bt)
+            d = self.rec_dir()
+            self.rec_file.setText("")
+            if live and live.state == "live" and self.rec_newest:
+                self.rec_file.setText(f"{self.rec_newest[1]}  ·  {self.rec_newest[3] / 1e6:.1f} Mo")
+            try:
+                root = d
+                while root and not os.path.isdir(root):
+                    root = os.path.dirname(root)
+                free = shutil.disk_usage(root or ".").free / 1e9
+                fmt = (c or {}).get("format", "MP3")
+                kbps = 1411 if fmt == "WAV" else (700 if fmt == "FLAC" else int(float((c or {}).get("bitrate") or 192)))
+                self.rec_disk.setText(f"Espace libre : {free:.1f} Go  ·  environ {free * 8e6 / kbps / 3600:.0f} h d'enregistrement")
+            except (OSError, ValueError):
+                self.rec_disk.setText("")
+            if self.on_air or self.page_key == "rec":
+                sig = (d, int(time.time() // 5) if self.on_air else self.rec_visit)
+                if sig != self.rec_sig:
+                    self.rec_sig = sig
+                    self.rec_files()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ À propos
+    def _page_about(self):
+        pg = Page()
+        g = pg.grid
+        hero = Card()
+        if OCEAN:
+            hero.lay.addWidget(SeaScene(440, 96, bg=PANEL, light_x=.86), 0, Qt.AlignmentFlag.AlignLeft)
+        else:
+            hero.lay.addWidget(Hero(), 0, Qt.AlignmentFlag.AlignLeft)
+        hero.lay.addWidget(lab("« Bev », c'est « direct » en breton.", "", True))
+        hero.lay.addWidget(lab("On est parti d'un constat simple : beaucoup de radios associatives diffusent avec un vieux PC, un logiciel bricolé et "
+                               "un bénévole qui croise les doigts le samedi soir. Bev essaie de lui faciliter la vie : envoyer l'émission vers "
+                               "Internet, la FM ou le DAB+, passer sur une playlist si le micro lâche, lancer ses jingles, et être prévenu quand "
+                               "quelque chose cloche.", "", True))
+        hero.lay.addWidget(lab("Il est fait avec et pour des radios bretonnes, sans budget ni équipe technique, et il n'est pas fini. "
+                               "Si quelque chose vous agace, plante ou manque, dites-le : c'est comme ça qu'il avance.", "mut", True))
+        k = lab("Trugarez ha kenavo ! Merci, et bonne émission.", "")
+        k.setStyleSheet(f"color:{ACCT};font-weight:700;font-size:14px;")
+        hero.lay.addWidget(k)
+        hero.lay.addStretch(1)
+        g.addWidget(hero, 0, 0)
+        sy = Card("Système", "Version et composants installés")
+        ff = ""
+        if shutil.which("ffmpeg"):
+            ff = (run(["ffmpeg", "-version"]).strip().splitlines() or [""])[0].replace("ffmpeg version ", "")[:48]
+        try:
+            import PySide6
+            qv = PySide6.__version__
+        except Exception:
+            qv = "?"
+        self.about_info = [("Version de l'application", VERSION), ("Python", platform.python_version()), ("Qt (PySide6)", qv),
+                           ("Système", platform.platform()[:52]), ("ffmpeg", ff or "introuvable"),
+                           ("numpy (calcul rapide)", "oui" if np is not None else "non"),
+                           ("sounddevice (cartes son)", "oui" if have_module("sounddevice") else "non"),
+                           ("Glisser-déposer", "oui"), ("Réglages", CONF)]
+        for a, b in self.about_info:
+            h = QHBoxLayout()
+            l = lab(a, "mut")
+            l.setFixedWidth(180)
+            v = lab(b, "", True)
+            h.addWidget(l)
+            h.addWidget(v, 1)
+            sy.lay.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(btn("Copier les infos", "", lambda: self.copy_text("\n".join(f"{a} : {b}" for a, b in self.about_info), "Infos")))
+        h.addWidget(btn("Vérifier les mises à jour", "", lambda: self.update_start(True)))
+        h.addStretch(1)
+        sy.lay.addLayout(h)
+        g.addWidget(sy, 0, 1)
+        sk = Card("Raccourcis", "Commandes clavier et souris")
+        grid = QGridLayout()
+        for i, (k, v) in enumerate((("F1 à F12", "jouer la touche du cartoucheur"), ("Maj + clic sur une touche", "jouer sur la sortie audio seule (sans antenne)"),
+                                    ("Clic droit sur une touche", "régler la touche (nom, couleur, volume…)"), ("Échap", "arrêter toutes les cartouches"),
+                                    ("F11", "plein écran"), ("Glisser un son sur une touche", "l'affecter à la touche"),
+                                    ("Glisser des fichiers sur la liste", "les ajouter à la playlist de secours"), ("Ctrl + Z  /  Ctrl + Y", "annuler / rétablir la dernière modification"))):
+            l = QLabel(f"<b style='color:{ACCT}'>{k}</b>  {v}")
+            grid.addWidget(l, i // 2, i % 2)
+        sk.lay.addLayout(grid)
+        g.addWidget(sk, 1, 0, 1, 2)
+        g.setRowStretch(2, 1)
+        return pg
+
+# ------------------------------------------------------------------ Traitement du son
+class EQCurve(QWidget):
+    """Courbe de réponse de l'égaliseur."""
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(110)
+        self.setMinimumWidth(260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.vals = {}
+
+    @staticmethod
+    def db_at(f, v):
+        r = 0.0
+        r += float(v.get("bass", 0)) / (1 + (f / 150.0) ** 2)
+        r += float(v.get("treble", 0)) * (f / 6000.0) ** 2 / (1 + (f / 6000.0) ** 2)
+        r += float(v.get("mid", 0)) * math.exp(-(math.log2(f / 1600.0) / 0.9) ** 2)
+        if v.get("hp"):
+            r -= 12 * math.log10(1 + (70.0 / f) ** 4) / 1.2
+        return r
+
+    def set(self, vals):
+        self.vals = dict(vals)
+        self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        x0, x1, y0, y1 = 34, W - 12, 8, H - 22
+        grid = QColor("#d5d9e3" if LIGHT else "#2b3242")
+        txt = QColor("#8a93a8" if LIGHT else "#6c7589")
+        fx = lambda f: x0 + (math.log10(f) - math.log10(30)) / (math.log10(16000) - math.log10(30)) * (x1 - x0)
+        dy = lambda d: (y0 + y1) / 2 - d / 12.0 * (y1 - y0) / 2
+        f8 = QFont(self.font())
+        f8.setPointSizeF(7.5)
+        p.setFont(f8)
+        for d in (-12, -6, 0, 6, 12):
+            p.setPen(QPen(grid, 1, Qt.PenStyle.DashLine if d else Qt.PenStyle.SolidLine))
+            p.drawLine(QPointF(x0, dy(d)), QPointF(x1, dy(d)))
+            p.setPen(txt)
+            p.drawText(QRectF(0, dy(d) - 8, x0 - 6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "%+d" % d if d else "0")
+        for f, l in ((50, "50"), (100, "100"), (500, "500"), (1000, "1 k"), (5000, "5 k"), (10000, "10 k")):
+            p.setPen(QPen(grid, 1))
+            p.drawLine(QPointF(fx(f), y0), QPointF(fx(f), y1))
+            p.setPen(txt)
+            p.drawText(QRectF(fx(f) - 20, y1 + 3, 40, 14), Qt.AlignmentFlag.AlignCenter, l)
+        pts = []
+        for i in range(141):
+            f = 30 * (16000 / 30.0) ** (i / 140.0)
+            pts.append(QPointF(fx(f), dy(max(-12, min(12, self.db_at(f, self.vals))))))
+        mid = dy(0)
+        fill = QPainterPath()
+        fill.moveTo(pts[0].x(), mid)
+        for q in pts:
+            fill.lineTo(q)
+        fill.lineTo(pts[-1].x(), mid)
+        fill.closeSubpath()
+        g = QLinearGradient(x0, 0, x1, 0)
+        stops = ("#4cc9f0", "#a76bff", "#ff5fa2") if PSYCHE else (ACC, ACC2, ACC)
+        for i, c in enumerate(stops):
+            g.setColorAt(i / 2, QColor(c))
+        fc = QBrush(g)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setOpacity(.18)
+        p.setBrush(fc)
+        p.drawPath(fill)
+        p.setOpacity(1)
+        line = QPainterPath()
+        line.moveTo(pts[0])
+        for q in pts[1:]:
+            line.lineTo(q)
+        p.setPen(QPen(fc, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(line)
+
+
+class PagesMixin2:
+    FXBOOL = ("on", "hp", "loud", "agc", "mono")
+    FXNUM = ("bass", "mid", "treble", "comp", "agc_lvl", "limit", "lufs", "nr", "deess", "excite", "width", "gain")
+
+    def fx_slider(self, card, label, key, lo, hi, fmt):
+        h = QHBoxLayout()
+        l = lab(label, "")
+        l.setFixedWidth(100)
+        h.addWidget(l)
+        sl = Slider(Qt.Orientation.Horizontal)
+        sl.setRange(int(lo * 10), int(hi * 10))
+        sl.setValue(int(round(float(self.fx[key]) * 10)))
+        val = lab("", "")
+        val.setFixedWidth(78)
+        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val.setStyleSheet(f"color:{ACCT};font-weight:700;")
+        val.setText(fmt % (sl.value() / 10))
+
+        def moved(v, k=key):
+            val.setText(fmt % (v / 10))
+            if not self._fx_loading:
+                self.fxv[k] = v / 10
+                self.fx_changed(True)
+        sl.valueChanged.connect(moved)
+        h.addWidget(sl, 1)
+        h.addWidget(val)
+        card.lay.addLayout(h)
+        self.fxw[key] = (sl, val, fmt)
+
+    def fx_switch(self, card, text, key):
+        w = Switch(text)
+        w.setChecked(bool(self.fx[key]))
+
+        def tg(on, k=key):
+            if not self._fx_loading:
+                self.fxv[k] = bool(on)
+                self.fx_changed()
+        w.toggled.connect(tg)
+        card.lay.addWidget(w)
+        self.fxw[key] = (w,)
+        return w
+
+    def _page_son(self):
+        pg = Page()
+        g = pg.grid
+        g.setColumnStretch(2, 1)
+        pages = self.data.get("fx_pages")
+        if not pages:
+            old = self.data.get("fx") or {}
+            pages = {}
+            for k in FX_LETTERS:
+                pn, on = FX_PAGES_DEFAULT[k]
+                pages[k] = dict(FX_PRESETS[pn], on=on, preset=pn, lufs=-16)
+            if old:
+                pages["A"].update({k: v for k, v in old.items() if k != "gate"})
+            self.data["fx_pages"] = pages
+        for k in FX_LETTERS:
+            p_ = pages.setdefault(k, dict(FX_DEFAULT))
+            for kk, v in dict(FX_DEFAULT).items():
+                p_.setdefault(kk, v)
+            p_.pop("gate", None)
+        self.fx_page = self.data.get("fx_page", "A") if self.data.get("fx_page", "A") in FX_LETTERS else "A"
+        self.fx = pages[self.fx_page]
+        self.data["fx"] = self.fx
+        self.fxv = {k: self.fx[k] for k in self.FXNUM + self.FXBOOL}
+        self.fxw, self._fx_loading, self.fx_dirty, self._fx_proc = {}, False, False, None
+        self.fx_names = list(FX_PRESETS)
+        top = Card("Traitement son", "Quatre préréglages A–D, attribuables flux par flux")
+        h = QHBoxLayout()
+        h.addWidget(lab("Page", "mut"))
+        self.seg_page = Segmented(list(FX_LETTERS), 52, 28)
+        self.seg_page.setValue(FX_LETTERS.index(self.fx_page))
+        self.seg_page.changed.connect(self.fx_page_switch)
+        h.addWidget(self.seg_page)
+        h.addSpacing(14)
+        self.sw_fxon = Switch("Page active")
+        self.sw_fxon.setChecked(bool(self.fx["on"]))
+        self.sw_fxon.toggled.connect(self.fx_on_toggled)
+        h.addWidget(self.sw_fxon)
+        h.addStretch(1)
+        self.l_fx = lab("", "mut")
+        h.addWidget(self.l_fx)
+        top.lay.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(lab("Style", "mut"))
+        short = {"Neutre": "Neutre", "Voix parlée": "Voix", "Musique": "Musique", "Radio punchy": "Punchy", "Doux (nuit)": "Nuit"}
+        self.seg_fx = Segmented([short.get(n, n) for n in self.fx_names], 78, 28)
+        self.seg_fx.setValue(self.fx_names.index(self.fx["preset"]) if self.fx.get("preset") in self.fx_names else 1)
+        self.seg_fx.changed.connect(lambda k: self.fx_apply_preset(self.fx_names[k], False))
+        h.addWidget(self.seg_fx)
+        h.addStretch(1)
+        h.addWidget(btn("Écouter (20 s)", "", self.fx_listen))
+        h.addWidget(btn("Stop", "", self.fx_stop))
+        h.addWidget(btn("Remettre à zéro", "", lambda: self.fx_apply_preset("Neutre", True)))
+        h.addWidget(btn("Appliquer aux flux", "primary", self.fx_push))
+        top.lay.addLayout(h)
+        self.l_fxinfo = lab("", "mut")
+        top.lay.addWidget(self.l_fxinfo)
+        g.addWidget(top, 0, 0, 1, 3)
+        eq = Card("Égaliseur", "Correction tonale trois bandes")
+        self.eqc = EQCurve()
+        eq.lay.addWidget(self.eqc)
+        for l, k, lo, hi in (("Graves", "bass", -12, 12), ("Médiums", "mid", -12, 12), ("Aigus", "treble", -12, 12)):
+            self.fx_slider(eq, l, k, lo, hi, "%+.0f dB")
+        self.fx_switch(eq, "Couper sous 70 Hz (souffle, chocs)", "hp")
+        eq.lay.addStretch(1)
+        g.addWidget(eq, 1, 0)
+        dy = Card("Dynamique", "AGC, compression et loudness")
+        self.fx_switch(dy, "AGC : volume automatique", "agc")
+        self.fx_slider(dy, "Force AGC", "agc_lvl", 0, 100, "%.0f %%")
+        self.fx_slider(dy, "Compresseur", "comp", 0, 100, "%.0f %%")
+        self.fx_slider(dy, "Plafond", "limit", -9, 0, "%.1f dB")
+        self.fx_switch(dy, "Normaliser (loudness)", "loud")
+        self.fx_slider(dy, "Cible", "lufs", -23, -12, "%.0f LUFS")
+        dy.lay.addStretch(1)
+        g.addWidget(dy, 1, 1)
+        vx = Card("Voix et espace", "Débruitage, de-essing et image stéréo")
+        self.fx_slider(vx, "Anti-bruit", "nr", 0, 100, "%.0f %%")
+        self.fx_slider(vx, "Anti-sifflement", "deess", 0, 100, "%.0f %%")
+        self.fx_slider(vx, "Brillance", "excite", 0, 100, "%.0f %%")
+        self.fx_slider(vx, "Largeur stéréo", "width", 0, 150, "%.0f %%")
+        self.fx_slider(vx, "Gain de sortie", "gain", -12, 12, "%+.1f dB")
+        self.fx_switch(vx, "Mono (compatible autoradio / FM)", "mono")
+        vx.lay.addStretch(1)
+        g.addWidget(vx, 1, 2)
+        pf = Card("Un traitement par flux", "Préréglage ou style appliqué à chaque destination")
+        self.fx_rows = QGridLayout()
+        pf.lay.addLayout(self.fx_rows)
+        g.addWidget(pf, 2, 0, 1, 3)
+        g.setRowStretch(3, 1)
+        self.fx_flux_rows()
+        self.fx_refresh()
+        self.fx_chains_update()
+        return pg
+
+    def fx_chains_update(self):
+        FX["chains"] = {k: build_fx_chain(self.data["fx_pages"][k]) for k in FX_LETTERS}
+        FX["chain"] = FX["chains"]["A"]
+
+    def fx_load_widgets(self):
+        """Recopie les valeurs de la page courante dans les curseurs."""
+        self._fx_loading = True
+        try:
+            for k in self.FXNUM:
+                self.fxv[k] = float(self.fx[k])
+                sl, val, fmt = self.fxw[k]
+                sl.setValue(int(round(self.fxv[k] * 10)))
+                val.setText(fmt % (sl.value() / 10))
+            for k in ("hp", "loud", "agc", "mono"):
+                self.fxv[k] = bool(self.fx[k])
+                self.fxw[k][0].setChecked(self.fxv[k])
+            self.fxv["on"] = bool(self.fx["on"])
+            self.sw_fxon.setChecked(self.fxv["on"])
+            self.seg_fx.setValue(self.fx_names.index(self.fx["preset"]) if self.fx.get("preset") in self.fx_names else 0)
+        finally:
+            self._fx_loading = False
+
+    def fx_page_switch(self, idx):
+        k = FX_LETTERS[idx]
+        self.fx_page = k
+        self.data["fx_page"] = k
+        self.fx = self.data["fx_pages"][k]
+        self.data["fx"] = self.fx
+        self.fx_load_widgets()
+        self.fx_refresh()
+        self.save_settings()
+
+    def fx_on_toggled(self, on):
+        if not self._fx_loading:
+            self.fxv["on"] = bool(on)
+            self.fx_changed()
+
+    def fx_values(self):
+        d = dict(self.fxv)
+        for k in ("bass", "mid", "treble", "limit", "gain"):
+            d[k] = round(d[k] * 2) / 2
+        d["comp"], d["agc_lvl"], d["lufs"] = round(d["comp"]), round(d["agc_lvl"]), round(d["lufs"])
+        for k in ("nr", "deess", "excite", "width"):
+            d[k] = round(d[k])
+        return d
+
+    def fx_changed(self, manual=False):
+        """Appelé à chaque mouvement de curseur : la courbe se met à jour tout de suite, mais l'écriture sur le disque
+        (lente) n'a lieu qu'une fois le geste terminé : le curseur reste parfaitement fluide."""
+        self.fx.update(self.fx_values())
+        if manual:
+            self.fx["preset"] = "Personnalisé"
+        if not hasattr(self, "_fx_ref_tm"):
+            self._fx_ref_tm = QTimer(self)
+            self._fx_ref_tm.setSingleShot(True)
+            self._fx_ref_tm.timeout.connect(self.fx_refresh)
+            self._fx_save_tm = QTimer(self)
+            self._fx_save_tm.setSingleShot(True)
+            self._fx_save_tm.timeout.connect(self.save_settings)
+        self.eqc.set(self.fx_values())
+        self._fx_ref_tm.start(60)
+        self._fx_save_tm.start(700)
+
+    def fx_apply_preset(self, name, update_seg):
+        self.fx.update(FX_PRESETS[name])
+        self.fx["preset"] = name
+        self.fx_load_widgets()
+        self.fx.update(self.fx_values())
+        self.fx["preset"] = name
+        if update_seg:
+            self.seg_fx.setValue(self.fx_names.index(name))
+        self.fx_refresh()
+        self.save_settings()
+
+    def fx_refresh(self):
+        v = self.fx_values()
+        self.eqc.set(v)
+        on = bool(v["on"])
+        users = [c["name"] for c in self.outputs_cfg if c.get("fxmode", FX_PAGE) == "Page " + self.fx_page]
+        if on:
+            self.l_fx.setText(f"● Page {self.fx_page} active · " + (", ".join(users) if users else "aucun flux ne l'utilise"))
+        else:
+            self.l_fx.setText(f"○ Page {self.fx_page} désactivée : les flux qui l'utilisent partent sans traitement")
+        set_ss(self.l_fx, f"color:{OKC if on else MUT};")
+        now = {k: build_fx_chain(self.data["fx_pages"][k]) for k in FX_LETTERS}
+        same = (FX["chains"] == now) and not self.fx_dirty
+        self.l_fxinfo.setText("Réglages envoyés aux flux." if same else
+                              "Réglages modifiés : clique sur « Appliquer aux flux »"
+                              + (" (coupure d'une seconde)." if self.on_air else " (pris en compte au prochain démarrage)."))
+        set_ss(self.l_fxinfo, f"color:{MUT if same else ACC2};")
+
+    def fx_push(self):
+        self.fx_chains_update()
+        self.fx_dirty = False
+        self.fx_refresh()
+        self.save_settings()
+        if self.on_air and self.engine:
+            self.log("Traitement son appliqué : redémarrage des flux...")
+            outs = list(self.engine.outputs)
+            for o in outs:
+                o.stop()
+            QTimer.singleShot(1200, lambda: [o.start() for o in outs if self.on_air and o.cfg.get("enabled", True)])
+        else:
+            self.log("Traitement son enregistré : il sera actif au prochain démarrage.")
+
+    def fx_flux_rows(self):
+        while self.fx_rows.count():
+            it = self.fx_rows.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        choices = FX_CHOICES + [FX_NONE] + list(FX_PRESETS)
+        for i, c in enumerate(self.outputs_cfg):
+            h = QHBoxLayout()
+            w = QWidget()
+            w.setLayout(h)
+            h.setContentsMargins(0, 2, 12, 2)
+            l = lab(c["name"], "")
+            l.setFixedWidth(150)
+            h.addWidget(l)
+            cb = QComboBox()
+            cb.addItems(choices)
+            cur = c.get("fxmode", FX_PAGE)
+            cb.setCurrentText(cur if cur in choices else FX_PAGE)
+            cb.activated.connect(lambda _i, cc=c, b=cb: self.fx_flux_set(cc, b.currentText()))
+            cb.setMinimumWidth(170)
+            h.addWidget(cb)
+            h.addStretch(1)
+            self.fx_rows.addWidget(w, i // 2, i % 2)
+        if not self.outputs_cfg:
+            self.fx_rows.addWidget(lab("Aucun flux pour l'instant : ajoute-en un dans Diffusion.", "mut"), 0, 0)
+
+    def fx_flux_set(self, cfg, mode):
+        cfg["fxmode"] = mode
+        self.fx_dirty = True
+        self.fx_refresh()
+        self.save_all()
+
+    def fx_stop(self):
+        p, self._fx_proc = self._fx_proc, None
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def fx_listen(self):
+        if not shutil.which("ffplay"):
+            return info(self, "Écouter", "ffplay est introuvable (il est fourni avec ffmpeg).")
+        f = next((p for p in self.playlist if os.path.isfile(p)), "")
+        if not f:
+            f, _ = QFileDialog.getOpenFileName(self, "Choisis un son pour essayer l'effet", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;Tous (*)")
+        if not f:
+            return
+        self.fx_stop()
+        chain = build_fx_chain(self.fx_values(), force=True)
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-t", "20", "-ss", "20"] + (["-af", chain] if chain else []) + [f]
+        try:
+            self._fx_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log("Écoute de l'effet : " + os.path.basename(f))
+        except OSError as e:
+            err(self, "Écouter", str(e))
+
+# ------------------------------------------------------------------ Monitoring
+class FluxLamp(QWidget):
+    """Voyant d'état d'un flux (pulse doucement quand tout va bien)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(22, 22)
+        self.col, self.t = MUT, 0.0
+
+    def set_color(self, c):
+        self.col = c
+        self.update()
+
+    def tick(self):
+        self.t += .12
+        self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        c = QColor(self.col)
+        k = (math.sin(self.t) + 1) / 2 if ANIM else .5
+        halo = QColor(c)
+        halo.setAlphaF(.10 + .22 * k)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(halo)
+        p.drawEllipse(QPointF(11, 11), 6 + 4 * k, 6 + 4 * k)
+        p.setBrush(c)
+        p.drawEllipse(QPointF(11, 11), 5.5, 5.5)
+
+
+def log_html(ts, msg):
+    cls = log_class(msg)
+    col = {"ok": OKC, "bad": BADC, "warn": ACC2, "info": TXT}[cls]
+    esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<span style='color:{col}'>●</span> <span style='color:{MUT}'>{esc(ts)}</span>&nbsp; <span style='color:{col}'>{esc(msg)}</span>"
+
+
+class PagesMixin3:
+    def _page_mon(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 4, 0)
+        v.setSpacing(10)
+        m = self.data["monitor"]
+        m.setdefault("streams", [])
+        m.setdefault("interval", 30)
+        m.setdefault("threshold", -50)
+        self.mon_streams = m["streams"]
+        self.mon_iv, self.mon_thr = m["interval"], m["threshold"]
+        add = Card("Surveiller un flux", "Alerte en cas de coupure ou de silence")
+        h = QHBoxLayout()
+        self.ed_mon_url = QLineEdit()
+        self.ed_mon_url.setPlaceholderText("Adresse du flux (http://…)")
+        self.ed_mon_url.returnPressed.connect(lambda: self.mon_add())
+        h.addWidget(self.ed_mon_url, 1)
+        h.addWidget(btn("Ajouter", "primary", lambda: self.mon_add()))
+        more = btn("Plus")
+        mm = QMenu(more)
+        for txt, cmd in (("Coller des adresses", self.mon_paste), ("Ajouter mes flux Internet", self.mon_add_mine),
+                         ("Vérifier maintenant", lambda: [self.mon_check(s["url"]) for s in self.mon_streams]),
+                         ("Copier la liste des flux", self.mon_copy_list), ("Exporter la liste (page web, texte, CSV)…", self.mon_export),
+                         ("Réglages de vérification…", self.mon_settings)):
+            mm.addAction(txt, cmd)
+        more.setMenu(mm)
+        h.addWidget(more)
+        add.lay.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(lab("Écouter sur", "mut"))
+        self.cb_listen = QComboBox()
+        self.cb_listen.setMinimumWidth(280)
+        self.cb_listen.addItem(NODEV)
+        h.addWidget(self.cb_listen)
+        self.l_listen = lab("Clique « Écouter » sur un flux.", "mut")
+        h.addWidget(self.l_listen, 1)
+        self.btn_lstop = btn("Arrêter", "", self.mon_listen_stop)
+        h.addWidget(self.btn_lstop)
+        add.lay.addLayout(h)
+        v.addWidget(add)
+        self.listen_proc, self.listen_url, self.listen_mon, self.mon_listen_btns = None, None, None, {}
+        sf = Card("Flux surveillés", "État en temps réel · vert : audio présent")
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        self.mon_body = QWidget()
+        self.mon_body.setObjectName("page")
+        self.mon_grid = QGridLayout(self.mon_body)
+        self.mon_grid.setColumnStretch(2, 1)
+        self.mon_grid.setVerticalSpacing(6)
+        sa.setWidget(self.mon_body)
+        sf.lay.addWidget(sa, 1)
+        v.addWidget(sf, 1)
+        inc = Card("Journal des incidents")
+        self.mon_log = QTextEdit()
+        self.mon_log.setReadOnly(True)
+        self.mon_log.setMinimumHeight(48)
+        self.mon_log.setMaximumHeight(84)
+        inc.lay.addWidget(self.mon_log)
+        v.addWidget(inc)
+        self.mon_widgets = {}
+        self.rebuild_mon()
+        QTimer.singleShot(1500, self.listen_devices)
+        self.mon_timer = QTimer(self)
+        self.mon_timer.timeout.connect(self.mon_tick)
+        self.mon_timer.start(1000)
+        self.mon_anim_t = QTimer(self)
+        self.mon_anim_t.timeout.connect(self.mon_anim)
+        self.mon_anim_t.start(250 if SET.get("perf") else 90)
+        return w
+
+    def mon_settings(self):
+        d = QDialog(self)
+        d.setWindowTitle("Réglages de vérification")
+        f = QFormLayout(d)
+        a = QLineEdit(str(self.mon_iv))
+        b = QLineEdit(str(self.mon_thr))
+        a.setMaximumWidth(80)
+        b.setMaximumWidth(80)
+        f.addRow("Vérifier toutes les (secondes)", a)
+        f.addRow("Silence sous (dB)", b)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        bb.accepted.connect(d.accept)
+        f.addRow(bb)
+        d.exec()
+        try:
+            self.mon_iv = max(5, int(float(a.text())))
+        except ValueError:
+            self.mon_iv = 30
+        try:
+            self.mon_thr = float(b.text())
+        except ValueError:
+            self.mon_thr = -50.0
+        self.sync_alerts()
+
+    def mon_params(self):
+        return self.mon_iv, self.mon_thr
+
+    def sync_alerts(self):
+        self.data["monitor"].update(interval=self.mon_iv, threshold=self.mon_thr)
+
+    def mon_rows(self):
+        out = []
+        for s in self.mon_streams:
+            st, sx = self.mon_state.get(s["url"]), self.mon_stats.get(s["url"])
+            out.append((s["name"], s["url"], (st[1] if st else "pas encore vérifié"), (str(st[2]) if st and st[2] is not None else ""),
+                        (f"{100 * sx['ok'] // max(1, sx['n'])} %" if sx else "")))
+        return out
+
+    def mon_copy_list(self):
+        rows = self.mon_rows()
+        if not rows:
+            return info(self, "Monitoring", "Aucun flux dans la liste.")
+        self.copy_text("\n".join(f"{n} : {u}" for n, u, *_ in rows), f"Liste de {len(rows)} flux")
+
+    def mon_export(self):
+        rows = self.mon_rows()
+        if not rows:
+            return info(self, "Monitoring", "Aucun flux dans la liste.")
+        dst, _ = QFileDialog.getSaveFileName(self, "Exporter la liste des flux", time.strftime("flux_%Y-%m-%d.html"),
+                                             "Page web (à partager) (*.html);;Texte (*.txt);;CSV (Excel) (*.csv)")
+        if not dst:
+            return
+        low, now = dst.lower(), time.strftime("%d/%m/%Y à %H:%M")
+        station = (self.data.get("settings", {}).get("station") or "Ma radio")
+        if low.endswith(".csv"):
+            body = "Nom;Adresse;État;Auditeurs;Disponibilité\n" + "\n".join(";".join('"%s"' % c.replace('"', "'") for c in r) for r in rows)
+            enc = "utf-8-sig"
+        elif low.endswith(".txt"):
+            body = f"{station} : flux surveillés ({now})\n\n" + "\n".join(f"{n}\n  {u}\n  {s}" for n, u, s, *_ in rows)
+            enc = "utf-8"
+        else:
+            esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            tr = "".join(f"<tr><td><b>{esc(n)}</b></td><td><a href='{esc(u)}'>{esc(u)}</a></td><td>{esc(s)}</td><td>{esc(a)}</td><td>{esc(d)}</td></tr>"
+                         for n, u, s, a, d in rows)
+            body = ("<!doctype html><html lang='fr'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    f"<title>{esc(station)} · flux</title><style>body{{font:16px system-ui,sans-serif;background:#12151c;color:#eef1f6;margin:0;padding:24px}}"
+                    "h1{margin:0 0 4px}small{color:#8a93a6}table{border-collapse:collapse;width:100%;margin-top:18px}"
+                    "td,th{padding:10px 12px;border-bottom:1px solid #262c3a;text-align:left}th{color:#8a93a6;font-weight:600}"
+                    f"a{{color:#ffb347}}</style><h1>{esc(station)}</h1><small>Flux surveillés · {now}</small>"
+                    f"<table><tr><th>Flux</th><th>Adresse</th><th>État</th><th>Auditeurs</th><th>Dispo</th></tr>{tr}</table></html>")
+            enc = "utf-8"
+        with open(dst, "w", encoding=enc, newline="") as fh:
+            fh.write(body)
+        self.log(f"Liste de {len(rows)} flux exportée : {dst}")
+
+    def mon_rename(self, url):
+        s = next((x for x in self.mon_streams if x["url"] == url), None)
+        if s:
+            n = ask_text(self, "Renommer", "Nom du flux :", s["name"])
+            if n and n.strip():
+                s["name"] = n.strip()
+                self.rebuild_mon()
+
+    def mon_add(self, name=None, url=None):
+        url = (url or self.ed_mon_url.text()).strip()
+        if not url:
+            return
+        if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+            url = "http://" + url
+        if any(s["url"] == url for s in self.mon_streams):
+            return
+        name = (name or "").strip() or url.split("://", 1)[-1]
+        self.mon_streams.append({"name": name, "url": url})
+        self.ed_mon_url.clear()
+        self.rebuild_mon()
+        self.mon_check(url)
+
+    def mon_paste(self):
+        txt = QApplication.clipboard().text()
+        if not txt.strip():
+            return self.log("Presse-papiers vide.")
+        urls = [u.strip() for u in re.split(r"[\s,;]+", txt) if u.strip()]
+        urls = [u for u in urls if "." in u or "://" in u or "localhost" in u]
+        if not urls:
+            return self.log("Aucune adresse trouvée dans le presse-papiers.")
+        for u in urls:
+            self.mon_add(None, u)
+        self.log(f"{len(urls)} adresse(s) collée(s) dans le monitoring.")
+
+    def mon_add_mine(self):
+        n = 0
+        for c in self.outputs_cfg:
+            if c["type"] == "internet":
+                base = f"http://{c['host']}:{c['port']}"
+                self.mon_add(c["name"], base + ("/" + c["mount"].lstrip("/") if c["protocol"] == "Icecast" else "/;"))
+                n += 1
+        if not n:
+            info(self, "Monitoring", "Aucun flux Internet à ajouter.")
+
+    def mon_remove(self, url):
+        self.mon_streams[:] = [s for s in self.mon_streams if s["url"] != url]
+        self.mon_state.pop(url, None)
+        self.rebuild_mon()
+
+    def rebuild_mon(self):
+        g = self.mon_grid
+        while g.count():
+            it = g.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        self.mon_widgets, self.mon_listen_btns = {}, {}
+        if not self.mon_streams:
+            g.addWidget(lab("Aucun flux surveillé : colle une adresse ci-dessus, ou « Plus » > « Ajouter mes flux Internet ».", "mut"), 0, 0, 1, 5)
+        for r, s in enumerate(self.mon_streams):
+            dot = GaelHead(40)
+            g.addWidget(dot, r, 0)
+            nm = QWidget()
+            nv = QVBoxLayout(nm)
+            nv.setContentsMargins(0, 2, 10, 2)
+            nv.setSpacing(0)
+            nv.addWidget(lab(s["name"], "")).__class__
+            nm.findChildren(QLabel)[0].setStyleSheet("font-weight:700;")
+            ul = lab(s["url"] if len(s["url"]) < 44 else s["url"][:41] + "…", "mut")
+            ul.setStyleSheet("font-size:11px;")
+            ul.setCursor(Qt.CursorShape.PointingHandCursor)
+            ul.mouseReleaseEvent = lambda _e, u=s["url"]: self.copy_text(u)
+            nv.addWidget(ul)
+            g.addWidget(nm, r, 1)
+            st = QWidget()
+            sv = QVBoxLayout(st)
+            sv.setContentsMargins(0, 2, 0, 2)
+            sv.setSpacing(0)
+            lb = lab("En attente de vérification…", "")
+            dis = lab("", "mut")
+            dis.setStyleSheet("font-size:11px;")
+            sv.addWidget(lb)
+            sv.addWidget(dis)
+            wv = Wave(26, accent=OKC)
+            wv.setVisible(self.listen_url == s["url"])
+            sv.addWidget(wv)
+            if self.listen_url == s["url"]:
+                self.listen_wave = wv
+            g.addWidget(st, r, 2)
+            b = btn("Stop" if self.listen_url == s["url"] else "Écouter", "", lambda u=s["url"]: self.mon_listen(u))
+            g.addWidget(b, r, 3)
+            self.mon_listen_btns[s["url"]] = b
+            mb = btn("Plus")
+            mn = QMenu(mb)
+            mn.addAction("Copier l'adresse", lambda u=s["url"]: self.copy_text(u))
+            mn.addAction("Renommer…", lambda u=s["url"]: self.mon_rename(u))
+            mn.addAction("Retirer de la surveillance", lambda u=s["url"]: self.mon_remove(u))
+            mb.setMenu(mn)
+            g.addWidget(mb, r, 4)
+            self.mon_widgets[s["url"]] = (dot, lb, wv, dis)
+            if s["url"] in self.mon_state:
+                self.update_mon_row(s["url"])
+        g.setRowStretch(len(self.mon_streams) + 1, 1)
+
+    def listen_devices(self):
+        try:
+            devs = [d for d, _ in list_output_devices()]
+        except Exception:
+            devs = []
+        vals = [NODEV] + devs
+        cur = self.cb_listen.currentText()
+        self.cb_listen.clear()
+        self.cb_listen.addItems(vals)
+        if cur in vals:
+            self.cb_listen.setCurrentText(cur)
+        else:
+            cart = self.cb_cdev.currentText() if hasattr(self, "cb_cdev") else NODEV
+            self.cb_listen.setCurrentText(cart if cart in vals else NODEV)
+
+    def mon_listen(self, url):
+        if self.listen_url == url:
+            return self.mon_listen_stop()
+        self.mon_listen_stop()
+        dev = self.cb_listen.currentText()
+        name = next((s["name"] for s in self.mon_streams if s["url"] == url), url)
+        use_sd = dev != NODEV and have_module("sounddevice")
+        if not use_sd and not shutil.which("ffplay"):
+            return info(self, "Écouter", "Choisis une sortie audio dans la liste (module sounddevice requis), ou installe ffmpeg complet (ffplay).")
+        self.listen_url = url
+        flags = 0x08000000 if SYS == "Windows" else 0
+        if use_sd:
+            self.listen_mon = CartMonitor(lambda m: self.log(m.replace("Cartoucheur : carte son", "Écoute : carte son")))
+            self.listen_mon.set_device(dev)
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-re", "-i", url, "-vn", "-ac", "2", "-ar", str(SR), "-f", "s16le", "pipe:1"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags)
+            mon = self.listen_mon
+
+            def pump():
+                while proc.poll() is None:
+                    b = proc.stdout.read(CH)
+                    if not b:
+                        break
+                    mon.push(b)
+                    self.listen_level = pcm_peak_db(b)
+                self.bridge.call.emit(lambda: self.mon_listen_ended(proc))
+            threading.Thread(target=pump, daemon=True).start()
+        else:
+            proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", url], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+            # niveau pour la forme d'onde : petit décodage à part, en mono 8 kHz (très léger)
+            lv = subprocess.Popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-re", "-i", url, "-vn", "-ac", "1", "-ar", "8000",
+                                   "-f", "s16le", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags)
+            self.listen_lv = lv
+
+            def lvl():
+                while lv.poll() is None:
+                    b = lv.stdout.read(800)
+                    if not b:
+                        break
+                    self.listen_level = pcm_peak_db(b)
+            threading.Thread(target=lvl, daemon=True).start()
+        self.listen_proc = proc
+        self.listen_level = -90.0
+        self.listen_wave = self.mon_widgets.get(url, (None, None, None, None))[2]
+        for u, w in self.mon_widgets.items():
+            if w[2] is not None:
+                w[2].setVisible(u == url)
+                w[2].reset()
+        if not hasattr(self, "listen_tm"):
+            self.listen_tm = QTimer(self)
+            self.listen_tm.timeout.connect(self.listen_feed)
+        self.listen_tm.start(50)
+        self.l_listen.setText(f"● Écoute de « {name} »" + ("" if use_sd else "  (sortie par défaut de l'ordinateur)"))
+        self.l_listen.setStyleSheet(f"color:{OKC};")
+        self.refresh_listen_btns()
+
+    def mon_listen_ended(self, proc):
+        if proc is self.listen_proc:
+            self.l_listen.setText("Le flux s'est arrêté ou ne répond pas.")
+            self.l_listen.setStyleSheet(f"color:{BADC};")
+            self.mon_listen_stop(keep_msg=True)
+
+    def listen_feed(self):
+        w = getattr(self, "listen_wave", None)
+        if w is not None and self.listen_proc is not None:
+            try:
+                w.push(getattr(self, "listen_level", -90.0))
+            except RuntimeError:
+                pass
+
+    def mon_listen_stop(self, keep_msg=False):
+        p, self.listen_proc, self.listen_url = self.listen_proc, None, None
+        lv, self.listen_lv = getattr(self, "listen_lv", None), None
+        if lv and lv.poll() is None:
+            try:
+                lv.terminate()
+            except OSError:
+                pass
+        if hasattr(self, "listen_tm"):
+            self.listen_tm.stop()
+        for w in self.mon_widgets.values():
+            if w[2] is not None:
+                try:
+                    w[2].hide()
+                except RuntimeError:
+                    pass
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        if self.listen_mon:
+            self.listen_mon.close()
+            self.listen_mon = None
+        if not keep_msg:
+            self.l_listen.setText("Clique « Écouter » sur un flux ci-dessous.")
+            self.l_listen.setStyleSheet(f"color:{MUT};")
+        self.refresh_listen_btns()
+
+    def refresh_listen_btns(self):
+        for u, b in list(self.mon_listen_btns.items()):
+            try:
+                b.setText("Stop" if u == self.listen_url else "Écouter")
+            except RuntimeError:
+                pass
+
+    def mon_anim(self):
+        if ANIM and self.page_key == "mon" and not calm():
+            for w in self.mon_widgets.values():
+                try:
+                    w[0].tick()
+                except RuntimeError:
+                    pass
+
+    def mon_check(self, url):
+        if url in self.mon_running:
+            return
+        self.mon_running.add(url)
+        self.mon_started[url] = time.time()
+        thr = self.mon_params()[1]
+
+        def work():
+            with self.sem:
+                st, det = probe_stream(url, thr)
+                lis = fetch_listeners(url)
+            self.bridge.call.emit(lambda: self.mon_result(url, st, det, lis))
+        threading.Thread(target=work, daemon=True).start()
+
+    def mon_result(self, url, status, detail, lis):
+        self.mon_running.discard(url)
+        name = next((s["name"] for s in self.mon_streams if s["url"] == url), None)
+        if name is None:
+            return
+        stats = self.mon_stats.setdefault(url, {"n": 0, "ok": 0, "since": time.time()})
+        before = self.mon_state.get(url)
+        stats["n"] += 1
+        stats["ok"] += status == "ok"
+        if before and before[0] != status:
+            stats["since"] = time.time()
+            txt = f"« {name} » : " + ("audio rétabli" if status == "ok" else "INACTIF") + f" ({detail})"
+            self.mon_incident(txt)
+            self.alerts.send("Flux " + txt, "mon-" + url + status)
+        self.mon_state[url] = (status, detail, lis)
+        self.update_mon_row(url)
+
+    def mon_incident(self, txt):
+        self.mon_log.append(log_html(time.strftime("%d/%m %H:%M:%S"), txt))
+        self.log("Monitoring : " + txt)
+
+    def update_mon_row(self, url):
+        w = self.mon_widgets.get(url)
+        st = self.mon_state.get(url)
+        if not (w and st):
+            return
+        dot, lb, _, dis = w
+        dot.set_mood("ok" if st[0] == "ok" else ("warn" if "silence" in (st[1] or "") else "bad"))
+        m = re.search(r"cr[êe]te (-?\d+)", st[1] or "")
+        dot.set_level(float(m.group(1)) if m else None)
+        set_ss(lb, f"color:{OKC if st[0] == 'ok' else BADC};font-weight:600;")
+        lb.setText(f"{st[1]}  [{time.strftime('%H:%M:%S')}]")
+        s = self.mon_stats.get(url)
+        parts = ([f"{st[2]} auditeurs"] if st[2] is not None else []) + (
+            [f"dispo {100 * s['ok'] // max(1, s['n'])} % depuis {time.strftime('%H:%M', time.localtime(s['since']))}"] if s else [])
+        dis.setText(" · ".join(parts))
+
+    def mon_tick(self):
+        iv = self.mon_params()[0]
+        now = time.time()
+        for s in self.mon_streams:
+            if now - self.mon_started.get(s["url"], 0) >= iv:
+                self.mon_check(s["url"])
+
+# ------------------------------------------------------------------ Gaël : assistant qui comprend une demande et propose un réglage
+# Tout est local (aucune connexion, aucune clé) : Gaël repère l'intention dans la phrase, extrait les valeurs utiles
+# (serveur, port, mot de passe, débit…), demande ce qui manque, puis présente le réglage. Rien n'est modifié sans « Appliquer ».
+
+HOST_RE = re.compile(r"(?:(?:https?|icecast|http)://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}|localhost|\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?(/[\w./-]*)?", re.I)
+MAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+PHONE_RE = re.compile(r"(?:\+33\s?|0)[1-9](?:[\s.-]?\d{2}){4}")
+URL_RE = re.compile(r"https?://\S+", re.I)
+GAEL_FORMATS = {"mp3": "MP3", "aac": "AAC", "ogg": "OGG Vorbis", "vorbis": "OGG Vorbis", "opus": "Opus", "flac": "FLAC"}
+YES = ("oui", "ok", "d'accord", "dac", "vas-y", "vas y", "go", "valide", "applique", "parfait", "yes", "c'est bon", "carrement", "bien sur")
+NO = ("non", "annule", "laisse tomber", "stop", "pas maintenant", "plus tard", "abandonne")
+SKIP = ("par defaut", "defaut", "passe", "peu importe", "je sais pas", "je ne sais pas", "standard", "normal")
+
+
+class GaelBrain:
+    pending = None
+
+    # ---------------------------------------------------------- outils de lecture de phrase
+    @staticmethod
+    def has(n, *words):
+        return any(w in n for w in words)
+
+    @staticmethod
+    def num(n, pat):
+        m = re.search(pat, n)
+        if not m:
+            return None
+        try:
+            return float(m.group(1).replace(",", "."))
+        except (ValueError, IndexError):
+            return None
+
+    def extract_stream(self, q, n, slots):
+        """Remplit les champs d'un flux Internet à partir d'une phrase libre."""
+        url = None
+        for m in HOST_RE.finditer(q):
+            h = m.group(1)
+            if "@" in q[max(0, m.start() - 1):m.start()]:
+                continue
+            if h.lower() in ("mot.de", "e.g") or re.fullmatch(r"\d+(\.\d+)?", h):
+                continue
+            url = m
+            break
+        if url:
+            slots["host"] = url.group(1)
+            if url.group(2):
+                slots["port"] = url.group(2)
+            if url.group(3) and len(url.group(3)) > 1:
+                slots["mount"] = url.group(3)
+        m = re.search(r"\bport\s*:?\s*(\d{2,5})", n)
+        if m:
+            slots["port"] = m.group(1)
+        m = re.search(r"(?:point de montage|montage|mountpoint|mount)\s*:?\s*(/?[\w.-]+)", q, re.I)
+        if m:
+            slots["mount"] = "/" + m.group(1).lstrip("/")
+        m = re.search(r"(?:mot de passe|mdp|password|pass|passe)\s*(?:source)?\s*(?:est|:|=)?\s*[«\"']?([^\s«»\"']+)", q, re.I)
+        if m and norm_txt(m.group(1)) not in ("est", "source", "de", "du"):
+            slots["password"] = m.group(1)
+        for k, v in GAEL_FORMATS.items():
+            if re.search(r"\b" + k + r"\b", n):
+                slots["format"] = v
+        b = self.num(n, r"\b(\d{2,3})\s*(?:k\b|kb|kbps|kbit|kbits|kilo)")
+        if b:
+            slots["bitrate"] = str(int(b))
+        if "shoutcast" in n:
+            slots["protocol"] = "Shoutcast"
+        elif "icecast" in n:
+            slots["protocol"] = "Icecast"
+        m = re.search(r"(?:nomm[ée]e?|appel[ée]e?|appelle|intitul[ée]e?|nom)\s*:?\s*[«\"']\s*([^»\"']+?)\s*[»\"']", q, re.I) or \
+            re.search(r"(?:nomm[ée]e?|appel[ée]e?|intitul[ée]e?)\s+([\w' -]{2,30})$", q, re.I)
+        if m:
+            slots["name"] = m.group(1).strip()
+        return slots
+
+    # ---------------------------------------------------------- point d'entrée
+    def answer(self, q):
+        n = norm_txt(q).strip()
+        if self.pending:
+            r = self.continue_pending(q, n)
+            if r is not None:
+                return r
+        r = self.intent(q, n)
+        if r is not None:
+            return r
+        r = self.chat_reply(q, n)
+        if r is not None:
+            return r
+        r = AssistantKB.answer(self, q)
+        text, acts = r if isinstance(r, tuple) else (r, None)
+        if text.startswith("Je n'ai pas trouvé") or text.startswith("Je ne suis pas sûr"):
+            tip = "" if self.llm_on() or getattr(self, "_tip_ai", False) else \
+                "\n\nAstuce : avec la conversation avancée (Réglages > Gaël, le radio-bot), je comprends les phrases libres bien mieux."
+            self._tip_ai = True
+            text = random.choice(("Hmm, je ne suis pas sûr de te suivre.", "Pas sûr d'avoir compris, désolé.",
+                                  "Je sèche un peu là-dessus.")) + " Tu peux me le dire autrement ? Sinon, voici des sujets proches :" + tip
+        return (text, acts)
+
+    # ---------------------------------------------------------- petite conversation (hors technique)
+    def chat_reply(self, q, n):
+        words = re.findall(r"[a-z0-9']+", n)
+        if len(words) > 9:
+            return None
+        H = self.has
+        pick = random.choice
+        a = self.app
+        h = time.localtime().tm_hour
+        if re.match(r"^(bonjour|salut|coucou|hello|hey|yo|demat|bonsoir|bjr|slt|hi)\b", n) and len(words) <= 4:
+            hi = pick(("Demat !", "Salut !", "Bonjour !")) if h < 18 else pick(("Bonsoir !", "Noz vat !" if h >= 21 else "Bonsoir !"))
+            st = ("L'antenne tourne bien" if a.on_air else "On est hors antenne pour l'instant")
+            return f"{hi} {st}. Qu'est-ce que je peux faire pour toi ?"
+        if H(n, "ca va", "comment vas", "comment tu vas", "la forme", "tu vas bien", "quoi de neuf"):
+            if a.on_air and a.engine:
+                bad = [o.cfg["name"] for o in a.engine.outputs if o.cfg.get("enabled", True) and o.state == "error"]
+                if bad:
+                    return (f"Moi ça va, mais « {bad[0]} » fait des siennes. Tu veux que je regarde ?", [("Oui, regarde", lambda: self.ask("Flux en erreur"), "primary")])
+                return pick(("Ça roule ! L'antenne est stable et le son passe.", "Au top, l'antenne ronronne. Et toi ?", "Tranquille : tout est au vert de mon côté."))
+            return pick(("Très bien, merci ! Je surveille, prêt pour la prochaine émission.", "Ça va bien ! Hors antenne, je profite du calme. Et toi ?"))
+        if H(n, "merci", "trugarez", "thanks", "cool merci", "top merci", "c'est gentil"):
+            return pick(("Avec plaisir !", "Trugarez à toi !", "De rien, c'est pour ça que je suis là.", "Pas de quoi, bonne émission !"))
+        if H(n, "qui es-tu", "qui es tu", "t'es qui", "tu es qui", "ton nom", "tu t'appelles", "c'est qui gael", "qui est gael", "presente-toi"):
+            return ("Je suis Gaël, le radio-bot : un vieux poste de radio avec une coiffe bigoudène… enfin pourlet, et un casque sur les oreilles. "
+                    "Je veille sur l'antenne, j'explique les pannes et je prépare les réglages pour toi.")
+        if H(n, "que sais-tu", "tu sais faire quoi", "tu fais quoi", "a quoi tu sers", "tu peux faire quoi", "aide-moi", "aide moi") and len(words) <= 6:
+            return ("Je peux te dire comment va l'antenne, expliquer une erreur de flux, dépanner un souci de son ou de réseau, lancer un diagnostic, "
+                    "et préparer des réglages : créer un flux, activer le secours, régler le gain, prévenir quelqu'un en cas de panne…",
+                    [("Comment va l'antenne ?", lambda: self.ask("État"), "primary"), ("Créer un flux", lambda: self.ask("Crée un flux Internet"))])
+        if H(n, "blague", "raconte", "fais-moi rire", "drole"):
+            return pick(("Pourquoi les radios associatives n'ont jamais froid ? Parce qu'elles ont plein de bénévoles… et des tonnes de câbles pour se couvrir.",
+                         "Un auditeur appelle : « Vous émettez sur quelle fréquence ? » « Sur la bonne, j'espère ! »",
+                         "Mon rêve ? Une émission entière sans larsen. On peut toujours rêver, hein."))
+        if H(n, "au revoir", "kenavo", "a plus", "a+", "bonne nuit", "bye", "ciao", "a demain", "bonne soiree"):
+            return pick(("Kenavo ! Je garde un œil sur l'antenne.", "À plus ! Je reste de veille.", "Bonne soirée, et bonne émission !"))
+        if H(n, "bravo", "genial", "super", "parfait", "excellent", "trop bien", "nickel", "top") and len(words) <= 4:
+            return pick(("Merci ! On fait une bonne équipe.", "Ravi que ça marche !", "Nickel. Autre chose ?"))
+        if n in ("ok", "d'accord", "dac", "oui", "ouais", "non", "bon", "ah", "ah ok", "ok merci", "compris"):
+            return pick(("Très bien. Autre chose ?", "Ça marche. Je reste là si besoin.", "Entendu."))
+        if H(n, "t'es nul", "tu sers a rien", "idiot", "debile", "nul"):
+            return "Aïe, désolé de ne pas avoir aidé. Dis-moi ce qui coince avec d'autres mots, je vais faire mieux."
+        if H(n, "quelle heure", "on est quel jour", "quel jour"):
+            t = time.localtime()
+            return f"Il est {t.tm_hour} h {t.tm_min:02d}, on est {JOURS[t.tm_wday]} {t.tm_mday} {MOIS[t.tm_mon - 1]}."
+        return None
+
+    # ---------------------------------------------------------- intentions reconnues
+    def intent(self, q, n):
+        a = self.app
+        H = self.has
+        make = H(n, "cree", "creer", "ajoute", "ajouter", "nouveau", "nouvelle", "configure", "configurer", "monte", "monter", "mets en place",
+                 "installe", "prepare", "fais", "faire", "ajout", "je veux", "j'aimerais", "voudrais", "besoin d'un", "besoin d'une", "parametr")
+        # --- un nouveau flux
+        if (make or H(n, "enregistre")) and H(n, "enregistr", "pige", "archive") and not H(n, "internet", "icecast"):
+            QTimer.singleShot(400, lambda: a.go_tab("rec"))
+            return ("L'enregistrement de l'antenne se règle dans son onglet dédié : dossier, format, découpage et pige ARCOM. Je te l'ouvre.",
+                    [("Ouvrir Enregistrement", lambda: a.go_tab("rec"), "primary")])
+        if make and H(n, "flux", "stream", "sortie", "diffusion vers", "diffuser sur", "diffuser vers", "webradio", "icecast", "shoutcast", "emetteur"):
+            kind = "internet"
+            if H(n, " fm", "fm ", "emetteur", "rds") or n.endswith("fm"):
+                kind = "fm"
+            elif H(n, "dab"):
+                kind = "dab"
+            elif False:
+                kind = "record"
+            return self.start_stream(kind, q, n)
+        if make and H(n, "plateau", "direct exterieur", "duplex"):
+            return ("Un plateau extérieur reprend le serveur de ton flux Internet avec une nouvelle adresse d'écoute.",
+                    [("Créer un plateau", a.new_plateau, "primary")])
+        # --- secours
+        if H(n, "secours", "bascule auto", "playlist de secours") and H(n, "activ", "allume", "mets", "met ", "branche", "lance la bascule", "active", "desactiv", "coupe", "eteins", "enleve", "seuil", "delai", "apres"):
+            return self.p_fallback(q, n)
+        # --- gain d'entrée
+        if "gain" in n or (H(n, "monte", "baisse", "augmente", "diminue") and H(n, "entree", "micro", "niveau d'entree")):
+            return self.p_gain(n)
+        # --- retard de sécurité
+        if H(n, "retard de securite", "delai de securite", "retard securite") or (H(n, "retard") and self.num(n, r"(\d+)\s*s")):
+            v = self.num(n, r"(\d+)")
+            if v is not None:
+                v = int(_cl(v, 0, 40))
+                return self.propose("Retard de sécurité", [("Retard avant l'antenne", f"{v} s")],
+                                    lambda: (a.sp_delay.setValue(v), a.log(f"Gaël : retard de sécurité réglé à {v} s.")))
+        # --- alertes
+        if H(n, "previen", "prevenir", "alerte", "avertis", "avertir", "notifi", "sms", "texto", "mail", "courriel", "discord", "ntfy", "slack") and \
+                not H(n, "ne part pas", "marche pas", "fonctionne pas", "recois pas", "erreur"):
+            r = self.p_alerts(q, n)
+            if r is not None:
+                return r
+        # --- monitoring
+        if H(n, "surveill", "monitor") and URL_RE.search(q):
+            u = URL_RE.search(q).group(0).rstrip(".,;)")
+            return self.propose("Surveiller un flux", [("Adresse", u)], lambda: (a.mon_add(None, u), a.go_tab("mon")), "Ajouter au monitoring")
+        # --- débit des flux Internet
+        if H(n, "debit", "bitrate", "qualite") and self.num(n, r"(\d{2,3})"):
+            return self.p_bitrate(n)
+        # --- activer / désactiver un flux précis
+        m = re.search(r"\b(active|reactive|allume|desactive|coupe|eteins|arrete|suspend)s?\b.*\bflux\b\s*(.*)$", n)
+        if m and a.outputs_cfg:
+            on = m.group(1) in ("active", "reactive", "allume")
+            c = self.find_output(m.group(2))
+            if c:
+                return self.toggle_proposal(c, on)
+            verb = "activer" if on else "désactiver"
+            return (f"Quel flux veux-tu {verb} ?", [(c["name"][:30], (lambda c=c: self.say_reply(self.toggle_proposal(c, on))))
+                                                     for c in self.app.outputs_cfg[:6]])
+        # --- antenne
+        if H(n, "demarre", "lance", "commence", "on air", "prends l'antenne", "allume l'antenne") and H(n, "diffusion", "antenne", "emission", "on air", "direct") \
+                and not H(n, "secours"):
+            if a.on_air:
+                return "L'antenne tourne déjà. " + self.state().splitlines()[0]
+            return ("Je lance la diffusion avec les flux actifs ?", [("Démarrer la diffusion", a.start, "primary"), ("Pas maintenant", lambda: None)])
+        if H(n, "arrete", "coupe", "stoppe", "termine", "fin de") and H(n, "diffusion", "antenne", "emission") and not H(n, "secours", "flux "):
+            if not a.on_air:
+                return "Rien n'est à l'antenne pour l'instant."
+            return ("Tu veux vraiment arrêter la diffusion ?", [("Arrêter la diffusion", a.stop, "danger"), ("Non, on continue", lambda: None)])
+        # --- apparence
+        if H(n, "mode clair", "theme clair", "en clair", "fond blanc"):
+            return self.propose("Apparence", [("Mode", "clair"), ("Prise en compte", "au redémarrage")], lambda: self.set_setting("theme", "light"))
+        if H(n, "mode sombre", "theme sombre", "en sombre", "mode nuit", "fond noir"):
+            return self.propose("Apparence", [("Mode", "sombre"), ("Prise en compte", "au redémarrage")], lambda: self.set_setting("theme", "dark"))
+        if H(n, "reduis les animations", "reduire les animations", "moins d'animation", "sans animation", "arrete les animations", "coupe les animations"):
+            return self.propose("Animations", [("Réduire les animations", "oui"), ("Prise en compte", "au redémarrage")], lambda: self.set_setting("perf", True))
+        # --- navigation
+        m = re.search(r"\b(?:ouvre|va|aller|affiche|montre|emmene)\b.*\b(diffusion|traitement|cartoucheur|cartouches|enregistrement|monitoring|reseau|reglages|a propos)\b", n)
+        if m:
+            k = {"diffusion": "diff", "traitement": "son", "cartoucheur": "cart", "cartouches": "cart", "enregistrement": "rec", "monitoring": "mon",
+                 "reseau": "net", "reglages": "set", "a propos": "about"}[m.group(1)]
+            QTimer.singleShot(400, lambda: a.go_tab(k))
+            return f"J'ouvre l'onglet {PAGE_TITLES[k]}."
+        # --- pour le plaisir
+        for words, anim, txt in ((("danse", "gavotte", "fest-noz", "fest noz", "an dro"), "gavotte", "Hop ! Une gavotte, comme au fest-noz. Regarde à gauche, sous le menu."),
+                                 (("crepe", "galette", "bilig", "faim"), "crepes", "Une crêpe au beurre salé, ça arrive ! Regarde sous le menu."),
+                                 (("café", "cafe", "pause"), "cafe", "Une petite pause café, regarde sous le menu."),
+                                 (("pluie", "crachin", "meteo", "il pleut"), "crachin", "Le crachin, c'est que de l'eau ! Je sors le parapluie, regarde sous le menu."),
+                                 (("goeland", "mouette", "oiseau"), "goeland", "Attention, un goéland chapardeur ! Regarde sous le menu.")):
+            if H(n, *words) and len(n) < 60 and not H(n, "flux", "secours", "erreur"):
+                if hasattr(a.rail, "gael"):
+                    a.rail.gael.play(anim)
+                return txt
+        return None
+
+    # ---------------------------------------------------------- proposition de réglage (carte avec Appliquer)
+    def propose(self, title, rows, fn, ok="Appliquer", extra=None):
+        self.pending = None
+        lines = "\n".join(f"  {k} : {v}" for k, v in rows)
+        acts = [(ok, fn, "primary")] + list(extra or []) + [("Annuler", lambda: None)]
+        return (f"Réglage proposé · {title}\n{lines}", acts)
+
+    def set_setting(self, key, val):
+        a = self.app
+        a.data.setdefault("settings", {})[key] = val
+        a.save_settings()
+        a.log(f"Gaël : réglage « {key} » enregistré (actif au prochain démarrage).")
+        if hasattr(a, "l_restart"):
+            a.l_restart.setText("Redémarrage nécessaire")
+        QTimer.singleShot(300, lambda: self.say("C'est noté. Le changement sera visible au prochain démarrage de l'application.", "bot",
+                                                [("Redémarrer maintenant", a.restart_app)]))
+
+    def find_output(self, words):
+        w = norm_txt(words or "").strip(" .!?")
+        outs = self.app.outputs_cfg
+        if not w:
+            return outs[0] if len(outs) == 1 else None
+        for c in outs:
+            if norm_txt(c["name"]) in w or w in norm_txt(c["name"]):
+                return c
+        for c in outs:
+            if norm_txt(KINDS[c["type"]][1]) in w:
+                return c
+        toks = {t for t in re.findall(r"[a-z0-9]+", w) if len(t) >= 3}
+        best, score = None, 0
+        for c in outs:
+            ct = set(re.findall(r"[a-z0-9]+", norm_txt(c["name"] + " " + c.get("host", ""))))
+            sc = len(toks & ct)
+            if sc > score:
+                best, score = c, sc
+        return best
+
+    def toggle_proposal(self, c, on):
+        return self.propose(("Activer" if on else "Désactiver") + " un flux", [("Flux", c["name"]), ("Actif", "oui" if on else "non")],
+                            lambda: self.set_enabled(c, on))
+
+    def say_reply(self, r):
+        text, acts = r if isinstance(r, tuple) else (r, None)
+        self.say(text, "bot", acts)
+
+    def set_enabled(self, c, on):
+        c["enabled"] = on
+        self.app.refresh_outputs()
+        self.app.log(f"Gaël : flux « {c['name']} » {'activé' if on else 'désactivé'}.")
+
+    # ---------------------------------------------------------- création de flux (avec questions)
+    STREAM_ASK = {"host": "Quelle est l'adresse du serveur ? (par exemple radio.mon-asso.bzh:8000, ou l'adresse complète fournie par ton hébergeur)",
+                  "password": "Quel est le mot de passe SOURCE du serveur ? (celui de la source, pas celui de l'administrateur)"}
+
+    def start_stream(self, kind, q, n):
+        slots = {}
+        if kind == "internet":
+            self.extract_stream(q, n, slots)
+            if "radio king" in n or "radioking" in n:
+                slots.setdefault("port", "80")
+        self.pending = {"kind": kind, "slots": slots, "ask": None}
+        if kind == "fm":
+            try:
+                outs = [l for l, _ in list_output_devices()]
+            except Exception:
+                outs = []
+            if outs:
+                self.pending["ask"] = "device"
+                acts = [(o[:34], (lambda o=o: self.pick_slot("device", o))) for o in outs[:6]]
+                return ("Flux FM : quelle carte son alimente ton émetteur ?", acts + [("Je choisirai plus tard", lambda: self.pick_slot("device", ""))])
+        return self.next_question()
+
+    def pick_slot(self, key, val):
+        if not self.pending:
+            return
+        self.pending["slots"][key] = val
+        self.say(val or "(plus tard)", "me")
+        r = self.next_question()
+        text, acts = r if isinstance(r, tuple) else (r, None)
+        QTimer.singleShot(350, lambda: self.say(text, "bot", acts))
+
+    def next_question(self):
+        P = self.pending
+        k, s = P["kind"], P["slots"]
+        if k == "internet":
+            for need in ("host", "password"):
+                if not s.get(need):
+                    P["ask"] = need
+                    pre = "D'accord, je prépare un flux Internet. " if not P.get("asked") else ""
+                    P["asked"] = True
+                    return (pre + self.STREAM_ASK[need], [("Annuler", self.cancel_pending)])
+        return self.stream_proposal()
+
+    def continue_pending(self, q, n):
+        P = self.pending
+        if n in NO or any(n.startswith(w) for w in NO):
+            self.pending = None
+            return "Pas de souci, j'annule. Rien n'a été modifié."
+        ask = P.get("ask")
+        if not ask:
+            return None
+        s = P["slots"]
+        if P["kind"] == "internet":
+            before = dict(s)
+            self.extract_stream(q, n, s)
+            if ask == "password" and not s.get("password"):
+                tok = q.strip().strip("«»\"'")
+                if tok and " " not in tok:
+                    s["password"] = tok
+            if ask == "host" and not s.get("host") and n in SKIP:
+                s["host"] = "localhost"
+            if s == before and ask not in s:
+                # la réponse ne ressemble pas à ce qui était demandé : on laisse la base de connaissances répondre
+                if len(n.split()) > 4:
+                    self.pending = None
+                    return None
+                return ("Je n'ai pas reconnu " + ("d'adresse de serveur" if ask == "host" else "de mot de passe") + ". " + self.STREAM_ASK[ask],
+                        [("Annuler", self.cancel_pending)])
+            return self.next_question()
+        return None
+
+    def cancel_pending(self):
+        self.pending = None
+        self.say("C'est annulé, rien n'a été modifié.", "bot")
+
+    def stream_proposal(self):
+        P = self.pending
+        k, s = P["kind"], P["slots"]
+        c = new_output(k)
+        for key in ("protocol", "host", "port", "mount", "password", "format", "bitrate", "name", "device"):
+            if s.get(key) is not None and key in c or key == "name" and s.get("name"):
+                c[key] = s[key]
+        if k == "internet" and c["protocol"] == "Shoutcast":
+            c["mount"] = c.get("mount") or "/"
+        if k == "internet" and not s.get("name"):
+            h = c["host"]
+            short = c["protocol"] if re.fullmatch(r"[\d.]+", h) else (h.rsplit(".", 1)[0] if "." in h else h)
+            c["name"] = "Internet · " + short[:22]
+        if k == "internet" and c["format"] == "FLAC":
+            c["bitrate"] = c.get("bitrate") or "0"
+        rows = {"internet": lambda: [("Serveur", f"{c['protocol']} {c['host']}:{c['port']}" + (c["mount"] if c["protocol"] == "Icecast" else "")),
+                                     ("Mot de passe", "•" * min(10, len(c["password"]))), ("Format", f"{c['format']} {c['bitrate']} kbit/s"),
+                                     ("Nom", c["name"])],
+                "fm": lambda: [("Carte son", c.get("device") or "à choisir"), ("Traitement", c["processing"])],
+                "dab": lambda: [("Mode", c["mode"]), ("Destination", c["dest"]), ("Débit", c["bitrate"] + " kbit/s")],
+                "record": lambda: [("Dossier", c["folder"]), ("Format", f"{c['format']} {c['bitrate']} kbit/s"), ("Découpage", c["rotate"] + " min")]}[k]()
+        a = self.app
+
+        def apply():
+            a.outputs_cfg.append(c)
+            a.refresh_outputs()
+            a.select_output_id(c["id"])
+            a.note_restart()
+            a.save_all()
+            a.log(f"Gaël : flux « {c['name']} » créé.")
+            follow = [("Voir dans Diffusion", lambda: a.go_tab("diff"))]
+            if k == "internet":
+                follow.insert(0, ("Tester le serveur", lambda: self.test_server(c), "primary"))
+            QTimer.singleShot(300, lambda: self.say(f"C'est fait : « {c['name']} » est ajouté et actif. Il partira au prochain démarrage de la diffusion.", "bot", follow))
+
+        def adjust():
+            d = OutputDialog(a, c)
+            if d.exec() and d.result:
+                a.outputs_cfg.append(d.result)
+                a.refresh_outputs()
+                a.select_output_id(d.result["id"])
+                a.note_restart()
+                a.log(f"Gaël : flux « {d.result['name']} » créé.")
+                self.say(f"C'est fait : « {d.result['name']} » est ajouté.", "bot")
+        return self.propose("Nouveau flux " + KINDS[k][1], rows, apply, "Créer le flux", [("Ajuster avant…", adjust)])
+
+    def test_server(self, c):
+        self.say(f"Je teste {c['host']}:{c['port']}…", "bot")
+
+        def work():
+            t0 = time.time()
+            try:
+                socket.create_connection((c["host"], int(c["port"])), timeout=4).close()
+                msg = f"Le serveur {c['host']}:{c['port']} répond ({(time.time() - t0) * 1000:.0f} ms). Le mot de passe sera vérifié au démarrage du flux."
+            except Exception as e:
+                msg = f"Le serveur ne répond pas : {e}.\nVérifie l'adresse, le port et ta connexion Internet."
+            self.app.bridge.call.emit(lambda: self.say(msg, "bot"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------- secours, gain, débit, alertes
+    def p_fallback(self, q, n):
+        a = self.app
+        off = self.has(n, "desactiv", "coupe", "eteins", "enleve", "arrete la bascule", "pas de secours")
+        thr = self.num(n, r"seuil[^\d-]*(-?\d+)")
+        dly = self.num(n, r"(?:apres|delai|au bout de)[^\d]*(\d+)\s*(?:s|sec)")
+        rows, ops = [], []
+        if not off:
+            rows.append(("Lancer la playlist de secours si le signal disparaît", "oui"))
+            ops.append(lambda: a.sw_fb.setChecked(True))
+        else:
+            rows.append(("Lancer la playlist de secours si le signal disparaît", "non"))
+            ops.append(lambda: a.sw_fb.setChecked(False))
+        if thr is not None:
+            thr = -abs(thr)
+            rows.append(("Seuil de silence", f"{thr:.0f} dB"))
+            ops.append(lambda: a.fb_ed["threshold"].setText(f"{thr:.0f}"))
+        if dly is not None:
+            rows.append(("Délai avant bascule", f"{dly:.0f} s"))
+            ops.append(lambda: a.fb_ed["silence_s"].setText(f"{dly:.0f}"))
+        extra = []
+        if not off and not a.playlist:
+            rows.append(("Attention", "la playlist de secours est vide"))
+            extra.append(("Ajouter des morceaux…", a.pl_add))
+        return self.propose("Playlist de secours", rows, lambda: ([f() for f in ops], a.live_fb(), a.log("Gaël : réglages du secours appliqués.")), extra=extra)
+
+    def p_gain(self, n):
+        a = self.app
+        cur = a.sl_gain.value()
+        v = self.num(n, r"([+-]?\d+)\s*(?:db|decibel)?")
+        if self.has(n, "a zero", "a 0", "remet", "reinitialis"):
+            new = 0
+        elif v is not None and self.has(n, "monte", "augmente", "plus fort", "hausse"):
+            new = cur + abs(v)
+        elif v is not None and self.has(n, "baisse", "diminue", "moins fort"):
+            new = cur - abs(v)
+        elif v is not None:
+            new = v
+        elif self.has(n, "monte", "augmente", "plus fort"):
+            new = cur + 3
+        elif self.has(n, "baisse", "diminue", "moins fort"):
+            new = cur - 3
+        else:
+            return (f"Le gain d'entrée est à {cur:+d} dB. Dis-moi par exemple « monte le gain de 3 dB » ou « gain à -2 ».", None)
+        new = int(_cl(new, -12, 12))
+        return self.propose("Gain d'entrée", [("Actuel", f"{cur:+d} dB"), ("Nouveau", f"{new:+d} dB")],
+                            lambda: (a.sl_gain.setValue(new), a.log(f"Gaël : gain d'entrée réglé à {new:+d} dB.")))
+
+    def p_bitrate(self, n):
+        a = self.app
+        v = int(self.num(n, r"(\d{2,3})"))
+        outs = [c for c in a.outputs_cfg if c["type"] in ("internet", "record", "dab")]
+        if not outs:
+            return ("Il n'y a pas encore de flux dont on peut régler le débit. Tu veux que je crée un flux Internet ?",
+                    [("Créer un flux Internet", lambda: self.ask("Créer un flux Internet"), "primary")])
+        named = self.find_output(n.split("flux", 1)[1] if "flux" in n else "") if "flux" in n else None
+        tgt = [named] if named else [c for c in outs if c["type"] == "internet"] or outs
+        return self.propose("Débit", [("Flux", ", ".join(c["name"] for c in tgt)), ("Nouveau débit", f"{v} kbit/s")],
+                            lambda: ([c.__setitem__("bitrate", str(v)) for c in tgt], a.refresh_outputs(), a.note_restart(),
+                                     a.log(f"Gaël : débit réglé à {v} kbit/s.")))
+
+    def p_alerts(self, q, n):
+        a = self.app
+        c = a.data["alerts"]
+        mail = MAIL_RE.search(q)
+        phone = PHONE_RE.search(q)
+        url = URL_RE.search(q)
+        rows, ops = [], []
+        if mail:
+            rows.append(("Mail vers", mail.group(0)))
+            ops.append(lambda: c.update(mail_to=mail.group(0), mail_on=True))
+            if not c.get("mail_host"):
+                dom = mail.group(0).split("@")[1].lower()
+                host = {"gmail.com": "smtp.gmail.com", "outlook.fr": "smtp-mail.outlook.com", "outlook.com": "smtp-mail.outlook.com",
+                        "hotmail.fr": "smtp-mail.outlook.com", "hotmail.com": "smtp-mail.outlook.com", "orange.fr": "smtp.orange.fr",
+                        "free.fr": "smtp.free.fr", "laposte.net": "smtp.laposte.net", "yahoo.fr": "smtp.mail.yahoo.com"}.get(dom)
+                if host:
+                    rows.append(("Serveur d'envoi suggéré", f"{host} : 587"))
+                    ops.append(lambda: c.update(mail_host=host, mail_port=587, mail_tls=True, mail_from=c.get("mail_from") or mail.group(0),
+                                                mail_user=c.get("mail_user") or mail.group(0)))
+        if phone:
+            num = re.sub(r"[\s.-]", "", phone.group(0))
+            rows.append(("SMS vers", num))
+            ops.append(lambda: c.update(sms_to=num, sms_on=True))
+        if url and ("discord" in url.group(0) or "ntfy" in url.group(0) or "slack" in url.group(0)):
+            u = url.group(0).rstrip(".,;)")
+            kind = "Discord" if "discord" in u else ("ntfy" if "ntfy" in u else "Slack")
+            rows.append(("Message", f"{kind} · {u[:48]}…" if len(u) > 48 else f"{kind} · {u}"))
+            ops.append(lambda: c.update(kind=kind, url=u))
+        if not rows:
+            if self.has(n, "sms", "texto"):
+                return ("Pour les SMS, le plus simple est Free Mobile (gratuit pour les abonnés) : active « Notifications par SMS » dans ton espace abonné, "
+                        "puis donne-moi ton numéro, ou ouvre la fenêtre des alertes.",
+                        [("Configurer les alertes", a.alert_dialog, "primary")])
+            if self.has(n, "mail", "courriel"):
+                return ("Donne-moi l'adresse à prévenir (par exemple « préviens benevole@radio.bzh ») et je prépare le réglage.",
+                        [("Configurer les alertes", a.alert_dialog, "primary")])
+            return None
+        need = []
+        if mail and not (c.get("mail_pw") and c.get("mail_host")):
+            need.append("le mot de passe d'application du compte d'envoi")
+        if phone and not c.get("sms_key"):
+            need.append("l'identifiant et la clé SMS")
+
+        def apply():
+            for f in ops:
+                f()
+            a.save_all()
+            a.alert_summary()
+            a.log("Gaël : destinataires des alertes enregistrés.")
+            if need:
+                QTimer.singleShot(300, lambda: self.say("C'est noté. Il reste " + " et ".join(need) + " : je t'ouvre la fenêtre pour finir ?", "bot",
+                                                        [("Terminer la configuration", a.alert_dialog, "primary")]))
+            else:
+                QTimer.singleShot(300, lambda: self.say("C'est prêt. Envoie un test pour vérifier.", "bot", [("Envoyer un test", a.alert_test, "primary")]))
+        return self.propose("Prévenir en cas de panne", rows, apply)
+
+
+# ------------------------------------------------------------------ téléphone animé (module « Prévenir en cas de panne »)
+class PhoneAnim(QWidget):
+    """Smartphone qui vibre et reçoit une notification ; muet avec pastille rouge tant que personne n'est prévenu."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(130, 164)
+        self.ok, self.channels = False, []
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        Ticker.add(self, lambda t, dt: self.tick(), 60, always=True)
+
+    def set_small(self, on):
+        if on != getattr(self, "_small", False):
+            self._small = on
+            self.setFixedSize(*((104, 132) if on else (130, 164)))
+            self.update()
+
+    def set_state(self, ok, channels):
+        if (ok, channels) != (self.ok, channels):
+            self.ok, self.channels = ok, list(channels)
+            self.clock.restart()
+            self.update()
+
+    def tick(self):
+        """Ne repeint que quand quelque chose bouge : la vibration (60 i/s), la notification qui glisse et la pastille qui
+        pulse (30 i/s). Le reste du cycle de 4,2 s, le téléphone est immobile : une seule image (et une par minute pour l'heure)."""
+        if not self.isVisible() or calm() or (self.window() and self.window().isMinimized()):
+            return
+        mn = time.strftime("%H:%M")
+        if not ANIM:
+            if mn != getattr(self, "_mn", None):
+                self._mn = mn
+                self.update()
+            return
+        t = self.clock.elapsed() / 1000.0
+        cyc = t % 4.2
+        vib = .38 < cyc < 1.62
+        slide = .53 < cyc < .97 or 3.58 < cyc < 4.02 or not self.ok
+        self._n = getattr(self, "_n", 0) + 1
+        if vib or (slide and self._n % 2 == 0):
+            self._was = True
+            self.update()
+        elif (not vib and not slide and getattr(self, "_was", True)) or mn != getattr(self, "_mn", None):
+            self._was = False
+            self._mn = mn
+            self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        t = self.clock.elapsed() / 1000.0 if ANIM else 1.2
+        cyc = t % 4.2
+        ring = 0.0 if not ANIM else (1.0 if .4 < cyc < 1.6 else 0.0)
+        env = win(cyc, .4, .55) * (1 - win(cyc, 1.45, 1.6))
+        wob = math.sin(t * 52) * 3.2 * env
+        notif = win(cyc, .55, .95) * (1 - win(cyc, 3.6, 4.0))
+        if getattr(self, "_small", False):          # version réduite : même dessin, à l'échelle 0,8
+            p.scale(.8, .8)
+            W, H = 130, 164
+        cx, cy = W / 2, H / 2 + 4
+        col = QColor(OKC if self.ok else BADC)
+        # ondes de vibration
+        if env > 0:
+            for side in (-1, 1):
+                for k in range(2):
+                    c = QColor(col)
+                    c.setAlphaF(.55 * env * (1 - k * .45))
+                    p.setPen(QPen(c, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    r = 46 + k * 9 + math.sin(t * 20) * 1.5
+                    a0 = 150 if side < 0 else -30
+                    p.drawArc(QRectF(cx - r, cy - r - 6, 2 * r, 2 * r), int((a0) * 16), int(60 * 16))
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(wob)
+        pw, ph = 82, 132
+        body = QRectF(-pw / 2, -ph / 2, pw, ph)
+        scr = body.adjusted(4, 4, -4, -4)
+        if wob == 0.0:                               # téléphone immobile : corps recopié depuis une image pré-rendue
+            dpr = p.device().devicePixelRatioF() * (.8 if getattr(self, "_small", False) else 1.0)
+            key = (self.ok, time.strftime("%H:%M"), round(dpr, 3))
+            if getattr(self, "_bk", None) != key:
+                pm = QPixmap(int(math.ceil(100 * dpr)), int(math.ceil(150 * dpr)))
+                pm.setDevicePixelRatio(dpr)
+                pm.fill(Qt.GlobalColor.transparent)
+                q = new_painter(pm)
+                q.translate(50, 70)
+                self._body(q, body)
+                q.end()
+                self._bpm, self._bk = pm, key
+            p.drawPixmap(QPointF(-50, -70), self._bpm)
+        else:
+            self._body(p, body)
+        # notification qui glisse
+        if notif > 0:
+            nr = QRectF(scr.left() + 4, scr.top() + 44 - (1 - notif) * 14, scr.width() - 8, 38)
+            p.setOpacity(notif)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 235))
+            p.drawRoundedRect(nr, 9, 9)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(nr.left() + 5, nr.top() + 6, 12, 12), 4, 4)
+            f2 = QFont(self.font())
+            f2.setPointSizeF(6.6)
+            f2.setBold(True)
+            p.setFont(f2)
+            p.setPen(QColor("#10131b"))
+            p.drawText(QRectF(nr.left() + 21, nr.top() + 5, nr.width() - 23, 14), Qt.AlignmentFlag.AlignVCenter, "Studio" if self.ok else "Alertes")
+            f2.setBold(False)
+            p.setFont(f2)
+            p.setPen(QColor("#4a5266"))
+            txt = ("Je veille" if self.ok else "désactivées")
+            p.drawText(QRectF(nr.left() + 6, nr.top() + 20, nr.width() - 10, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
+            p.setOpacity(1)
+        p.restore()
+        # pastille d'état
+        bc = QPointF(cx + 34, cy - 58)
+        pulse = (math.sin(t * 4) + 1) / 2 if (ANIM and not self.ok) else 0
+        if pulse:
+            c = QColor(col)
+            c.setAlphaF(.35 * (1 - pulse))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawEllipse(bc, 10 + 5 * pulse, 10 + 5 * pulse)
+        p.setPen(QPen(QColor(PANEL), 2.5))
+        p.setBrush(col)
+        p.drawEllipse(bc, 10, 10)
+        p.setPen(ppen("#ffffff", 2.2))
+        if self.ok:
+            p.drawPolyline([QPointF(bc.x() - 4, bc.y()), QPointF(bc.x() - 1, bc.y() + 3), QPointF(bc.x() + 4.5, bc.y() - 3.5)])
+        else:
+            p.drawLine(QPointF(bc.x(), bc.y() - 5), QPointF(bc.x(), bc.y() + 1))
+            p.drawPoint(QPointF(bc.x(), bc.y() + 4.5))
+
+    def _body(self, p, body):
+        """Corps du téléphone (ombre, écran, heure, cloche), dans le repère centré du téléphone."""
+        # ombre douce
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(4):
+            p.setBrush(QColor(0, 0, 0, 16))
+            p.drawRoundedRect(body.adjusted(-i, 2 + i, i, 3 + i), 16, 16)
+        g = QLinearGradient(body.topLeft(), body.bottomRight())
+        g.setColorAt(0, QColor("#3a4152"))
+        g.setColorAt(1, QColor("#1d2230"))
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(body, 16, 16)
+        scr = body.adjusted(4, 4, -4, -4)
+        sg = QLinearGradient(scr.topLeft(), scr.bottomRight())
+        if self.ok:
+            sg.setColorAt(0, mixc("#0b1020", ACC, .35))
+            sg.setColorAt(1, mixc("#0b1020", "#a76bff" if PSYCHE else ACC2, .30))
+        else:
+            sg.setColorAt(0, QColor("#141824"))
+            sg.setColorAt(1, QColor("#0d1018"))
+        p.setBrush(QBrush(sg))
+        p.drawRoundedRect(scr, 13, 13)
+        p.setBrush(QColor("#0b0e15"))
+        p.drawRoundedRect(QRectF(-11, scr.top() + 4, 22, 6), 3, 3)
+        # heure
+        f = QFont(self.font())
+        f.setPointSizeF(13)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 220))
+        p.drawText(QRectF(scr.left(), scr.top() + 14, scr.width(), 22), Qt.AlignmentFlag.AlignCenter, time.strftime("%H:%M"))
+        # cloche (barrée si personne n'est prévenu)
+        bx, by = 0, scr.bottom() - 22
+        p.setPen(ppen(QColor(255, 255, 255, 150), 1.8))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        bell = QPainterPath(QPointF(bx - 7, by + 4))
+        bell.cubicTo(QPointF(bx - 6, by - 8), QPointF(bx + 6, by - 8), QPointF(bx + 7, by + 4))
+        bell.closeSubpath()
+        p.drawPath(bell)
+        p.drawLine(QPointF(bx - 2, by + 7), QPointF(bx + 2, by + 7))
+        if not self.ok:
+            p.setPen(ppen(BADC, 2))
+            p.drawLine(QPointF(bx - 9, by - 8), QPointF(bx + 9, by + 8))
+
+
+class HeroCard(Card):
+    """Carte mise en avant : halo coloré selon l'état (vert = protégé, rouge = personne n'est prévenu)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.col = BADC
+
+    def set_color(self, c):
+        if c != self.col:
+            self.col = c
+            self.update()
+
+    def paintEvent(self, e):
+        # fond dégradé mis en cache à la taille de la carte : le téléphone animé posé dessus ne fait plus retracer la carte
+        dpr = self.devicePixelRatioF()
+        key = (self.width(), self.height(), dpr, self.col)
+        if getattr(self, "_bgk", None) != key:
+            pm = QPixmap(max(1, int(math.ceil(self.width() * dpr))), max(1, int(math.ceil(self.height() * dpr))))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(self.rect()).adjusted(1, 1, -1, -2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc("#000000", 18 if not LIGHT else 10))
+            p.drawRoundedRect(r.translated(0, 2), 18, 18)
+            g = QLinearGradient(r.topLeft(), r.topRight())
+            g.setColorAt(0, mixc(PANEL, self.col, .13))
+            g.setColorAt(.55, QColor(PANEL))
+            g.setColorAt(1, mixc(PANEL, ACC, .05))
+            p.setBrush(QBrush(g))
+            p.setPen(QPen(mixc(LINE, self.col, .55), 1.2))
+            p.drawRoundedRect(r, 18, 18)
+            p.end()
+            self._bgpm, self._bgk = pm, key
+        er = e.rect()
+        p = QPainter(self)
+        p.drawPixmap(QRectF(er), self._bgpm, QRectF(er.x() * dpr, er.y() * dpr, er.width() * dpr, er.height() * dpr))
+
+# ------------------------------------------------------------------ Gaël : conversation avancée (optionnelle) via l'API Claude
+# Activée seulement si une clé API est saisie dans Réglages. Gaël parle alors librement, en français, et peut utiliser
+# des « outils » : lire l'état de l'antenne, lancer un diagnostic, et PROPOSER des réglages (toujours validés par un clic).
+# Aucun mot de passe ni clé n'est envoyé : l'état transmis est nettoyé. Sans clé ou sans Internet, Gaël répond en local.
+API_URL = "https://api.anthropic.com/v1/messages"
+LLM_MODELS = (("claude-haiku-5-5", "Rapide (Claude Haiku)"), ("claude-sonnet-5-5", "Plus fin (Claude Sonnet)"))
+
+GAEL_SYSTEM = """Tu es Gaël, le radio-bot de l'application de diffusion radio « {app} », portée par des radios associatives de Bretagne.
+Tu as l'apparence d'un petit poste de radio d'autrefois coiffé d'une haute coiffe bretonne, avec un casque.
+Tu parles en français, tu tutoies, chaleureux et direct, avec à l'occasion un mot de breton (demat, trugarez, kenavo) sans en abuser.
+Tu réponds comme dans une vraie conversation : phrases courtes, pas de listes à rallonge, pas de titres markdown, pas de gras.
+Les utilisateurs sont souvent bénévoles et pas techniciens : explique simplement, sans jargon inutile.
+Tu peux aider sur tout ce qui touche la radio, le streaming (Icecast, Shoutcast), la FM, le DAB+, le son, l'enregistrement, le réseau,
+et bavarder un peu ; si on te demande autre chose, réponds brièvement puis reviens gentiment à l'antenne.
+Pour modifier un réglage, utilise toujours l'outil adapté : il affiche une carte « Réglage proposé » avec un bouton que l'utilisateur
+doit cliquer ; ne prétends jamais avoir modifié quelque chose toi-même. S'il manque une information indispensable
+(adresse du serveur, mot de passe source…), demande-la d'abord. Ne demande jamais de mot de passe d'administration.
+Quand tu as besoin de connaître la situation, appelle get_state ; pour un problème, run_diagnostic.
+Onglets de l'application : Diffusion (source audio, flux, secours, à l'antenne), Traitement son (bêta), Cartoucheur, Enregistrement (dont la pige ARCOM),
+Monitoring (surveillance de flux), Réseau (liens Internet et bascule), SOS (toi, alertes de panne, journal), Réglages, À propos.
+État actuel au moment du message :
+{state}"""
+
+
+def _tool(name, desc, props=None, req=()):
+    return {"name": name, "description": desc,
+            "input_schema": {"type": "object", "properties": props or {}, "required": list(req)}}
+
+
+GAEL_TOOLS = [
+    _tool("get_state", "État détaillé de l'antenne : diffusion, flux et leur état, secours, entrée audio, réseau, alertes, monitoring."),
+    _tool("run_diagnostic", "Lance le diagnostic complet (ffmpeg, encodeurs, entrées audio, serveurs des flux, disques) ; le rapport s'affiche dans la discussion."),
+    _tool("read_journal", "Dernières lignes du journal d'antenne (erreurs comprises).", {"n": {"type": "integer", "description": "nombre de lignes (max 80)"}}),
+    _tool("propose_internet_stream", "Propose de créer un flux Internet (Icecast ou Shoutcast). Demande d'abord le serveur et le mot de passe source s'ils manquent.",
+          {"host": {"type": "string"}, "port": {"type": "string"}, "mount": {"type": "string", "description": "point de montage Icecast, ex. /live"},
+           "password": {"type": "string", "description": "mot de passe SOURCE"}, "protocol": {"type": "string", "enum": ["Icecast", "Shoutcast"]},
+           "format": {"type": "string", "enum": ["MP3", "AAC", "OGG Vorbis", "Opus", "FLAC"]}, "bitrate": {"type": "string"}, "name": {"type": "string"}},
+          ("host", "password")),
+    _tool("propose_fm_or_dab_stream", "Propose de créer une sortie FM (carte son vers l'émetteur) ou DAB+.", {"kind": {"type": "string", "enum": ["fm", "dab"]}}, ("kind",)),
+    _tool("propose_fallback", "Propose d'activer ou désactiver le secours automatique, avec seuil de silence (dB, négatif) et délai (s).",
+          {"enabled": {"type": "boolean"}, "threshold_db": {"type": "number"}, "delay_s": {"type": "number"}}, ("enabled",)),
+    _tool("propose_gain", "Propose un nouveau gain d'entrée en dB (-12 à +12).", {"db": {"type": "number"}}, ("db",)),
+    _tool("propose_delay", "Propose le retard de sécurité avant l'antenne, en secondes (0 à 40).", {"seconds": {"type": "number"}}, ("seconds",)),
+    _tool("propose_bitrate", "Propose un débit (kbit/s) pour les flux Internet, ou pour un flux précis.", {"kbps": {"type": "integer"}, "stream": {"type": "string"}}, ("kbps",)),
+    _tool("propose_toggle_stream", "Propose d'activer ou désactiver un flux existant.", {"stream": {"type": "string"}, "enabled": {"type": "boolean"}}, ("stream", "enabled")),
+    _tool("propose_alerts", "Propose de prévenir quelqu'un en cas de panne (mail, numéro de mobile pour SMS, lien Discord / ntfy / Slack).",
+          {"email": {"type": "string"}, "phone": {"type": "string"}, "webhook": {"type": "string"}}),
+    _tool("propose_monitor", "Propose d'ajouter une adresse de flux au monitoring.", {"url": {"type": "string"}}, ("url",)),
+    _tool("propose_broadcast", "Propose de démarrer ou d'arrêter la diffusion.", {"action": {"type": "string", "enum": ["start", "stop"]}}, ("action",)),
+    _tool("open_tab", "Ouvre un onglet de l'application.", {"tab": {"type": "string", "enum": ["diff", "son", "cart", "rec", "mon", "net", "sos", "set", "about"]}}, ("tab",)),
+    _tool("play_animation", "Gaël fait une petite animation sous le menu (pour le plaisir).", {"name": {"type": "string", "enum": ["gavotte", "crepes", "crachin", "goeland", "cafe", "casque", "etire", "hoquet"]}}, ("name",)),
+]
+
+
+class GaelLLM:
+    history = None
+
+    def llm_cfg(self):
+        S = self.app.data.get("settings", {})
+        return (S.get("gael_key") or "").strip(), S.get("gael_model") or LLM_MODELS[0][0], bool(S.get("gael_ai", True))
+
+    def llm_on(self):
+        key, _, on = self.llm_cfg()
+        return bool(key) and on
+
+    # --- état transmis (sans aucun secret)
+    def llm_state(self):
+        a, e = self.app, self.app.engine
+        L = []
+        L.append("Diffusion : " + (self.state().replace("\n", " ") if a.on_air else ("contrôle d'entrée / cartoucheur seul" if a.preview else "arrêtée")))
+        L.append(f"Entrée audio : {a.cur_device or 'aucune'} ; gain {a.sl_gain.value():+d} dB")
+        for c in a.outputs_cfg:
+            o = e.output(c["id"]) if (e and not a.preview) else None
+            d = a.describe(c)
+            L.append(f"Flux « {c['name']} » ({KINDS[c['type']][1]}, {d}, {'actif' if c.get('enabled', True) else 'désactivé'}"
+                     + (f", {c.get('format', '')} {c.get('bitrate', '')} kbit/s" if c["type"] == "internet" else "")
+                     + (f", état : {o.status_text()}" if o else "") + ")")
+        if not a.outputs_cfg:
+            L.append("Aucun flux configuré.")
+        L.append(f"Secours : {'activé' if a.sw_fb.isChecked() else 'désactivé'}, seuil {a.fb_ed['threshold'].text()} dB, délai {a.fb_ed['silence_s'].text()} s, "
+                 f"{len(a.playlist)} titres dans la playlist")
+        L.append(f"Retard de sécurité : {a.sp_delay.value()} s")
+        ch = a.alerts.channels()
+        L.append("Alertes de panne : " + (", ".join(ch) if ch else "personne n'est prévenu"))
+        act = getattr(a, "net_active", None)
+        if act:
+            st = a.net_stats.get(act) or {}
+            L.append(f"Internet : {a.net_label(act)} ({a.net_kind(act)})" + (f", {st.get('lat', 0):.0f} ms" if st.get("lat") is not None else ""))
+        if a.mon_streams:
+            L.append("Monitoring : " + ", ".join(f"{s['name']} ({(a.mon_state.get(s['url']) or ('?', 'pas encore vérifié'))[1]})" for s in a.mon_streams[:6]))
+        t = time.localtime()
+        L.append(f"Date et heure : {JOURS[t.tm_wday]} {t.tm_mday} {MOIS[t.tm_mon - 1]} {t.tm_year}, {t.tm_hour} h {t.tm_min:02d}")
+        return "\n".join(L)
+
+    # --- exécution des outils (dans le fil de l'interface)
+    def llm_tool(self, name, inp):
+        a = self.app
+        show = lambda r: (self.say_reply(r), "Carte « Réglage proposé » affichée : l'utilisateur doit cliquer pour appliquer.")[1]
+        if name == "get_state":
+            return self.llm_state()
+        if name == "run_diagnostic":
+            a.run_diag()
+            return "Diagnostic lancé : son rapport va s'afficher dans la discussion d'ici quelques secondes."
+        if name == "read_journal":
+            n = max(5, min(80, int(inp.get("n") or 30)))
+            return "\n".join(a.log_lines[-n:]) or "(journal vide)"
+        if name == "propose_internet_stream":
+            self.pending = {"kind": "internet", "slots": {k: str(v) for k, v in inp.items() if v not in (None, "")}, "ask": None}
+            return show(self.stream_proposal())
+        if name == "propose_fm_or_dab_stream":
+            self.pending = {"kind": inp.get("kind", "fm"), "slots": {}, "ask": None}
+            return show(self.stream_proposal())
+        if name == "propose_fallback":
+            txt = ("active" if inp.get("enabled", True) else "desactive") + " le secours"
+            if inp.get("threshold_db") is not None:
+                txt += f" seuil {abs(float(inp['threshold_db'])):.0f}"
+            if inp.get("delay_s") is not None:
+                txt += f" apres {float(inp['delay_s']):.0f} s"
+            return show(self.p_fallback(txt, txt))
+        if name == "propose_gain":
+            return show(self.p_gain(f"gain a {int(round(float(inp.get('db', 0))))}"))
+        if name == "propose_delay":
+            v = int(_cl(float(inp.get("seconds", 0)), 0, 40))
+            return show(self.propose("Retard de sécurité", [("Retard avant l'antenne", f"{v} s")],
+                                     lambda: (a.sp_delay.setValue(v), a.log(f"Gaël : retard de sécurité réglé à {v} s."))))
+        if name == "propose_bitrate":
+            return show(self.p_bitrate(f"debit {int(inp.get('kbps', 128))} " + (f"flux {inp['stream']}" if inp.get("stream") else "")))
+        if name == "propose_toggle_stream":
+            c = self.find_output(norm_txt(inp.get("stream", "")))
+            if not c:
+                return "Aucun flux ne correspond à ce nom. Flux existants : " + ", ".join(x["name"] for x in a.outputs_cfg)
+            return show(self.toggle_proposal(c, bool(inp.get("enabled"))))
+        if name == "propose_alerts":
+            q = " ".join(str(inp.get(k) or "") for k in ("email", "phone", "webhook"))
+            r = self.p_alerts(q, norm_txt(q))
+            return show(r) if r else "Il me faut une adresse mail, un numéro de mobile ou un lien de webhook."
+        if name == "propose_monitor":
+            u = inp.get("url", "")
+            return show(self.propose("Surveiller un flux", [("Adresse", u)], lambda: (a.mon_add(None, u), a.go_tab("mon")), "Ajouter au monitoring"))
+        if name == "propose_broadcast":
+            if inp.get("action") == "stop":
+                if not a.on_air:
+                    return "Rien n'est à l'antenne."
+                self.say("Tu confirmes l'arrêt de la diffusion ?", "bot", [("Arrêter la diffusion", a.stop, "danger"), ("Non, on continue", lambda: None)])
+            else:
+                if a.on_air:
+                    return "La diffusion tourne déjà."
+                self.say("On lance la diffusion avec les flux actifs ?", "bot", [("Démarrer la diffusion", a.start, "primary"), ("Pas maintenant", lambda: None)])
+            return "Bouton de confirmation affiché."
+        if name == "open_tab":
+            k = inp.get("tab", "diff")
+            QTimer.singleShot(300, lambda: a.go_tab(k))
+            return f"Onglet {PAGE_TITLES.get(k, k)} ouvert."
+        if name == "play_animation":
+            if hasattr(a.rail, "gael"):
+                a.rail.gael.play(inp.get("name", "gavotte"))
+            return "Animation lancée sous le menu."
+        return "Outil inconnu."
+
+    def on_ui(self, fn):
+        """Exécute fn dans le fil de l'interface et attend son résultat (appelé depuis le fil réseau)."""
+        box, ev = {}, threading.Event()
+
+        def run():
+            try:
+                box["r"] = fn()
+            except Exception as ex:
+                box["r"] = f"Erreur : {ex}"
+            ev.set()
+        self.app.bridge.call.emit(run)
+        ev.wait(20)
+        return box.get("r", "Pas de réponse de l'interface.")
+
+    # --- conversation
+    def llm_ask(self, q):
+        key, model, _ = self.llm_cfg()
+        if self.history is None:
+            self.history = []
+        self.history.append({"role": "user", "content": q})
+        self.history = self.history[-24:]
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+        state = self.llm_state()
+        sysmsg = GAEL_SYSTEM.format(app=APP, state=state)
+        box = {"b": self.stream_bubble()}
+
+        def work():
+            try:
+                for _ in range(4):
+                    content, stop = self.llm_call(key, model, sysmsg, box["b"])
+                    self.history.append({"role": "assistant", "content": content})
+                    if stop != "tool_use":
+                        break
+                    results = []
+                    for b in content:
+                        if b.get("type") == "tool_use":
+                            r = self.on_ui(lambda b=b: self.llm_tool(b["name"], b.get("input") or {}))
+                            results.append({"type": "tool_result", "tool_use_id": b["id"], "content": str(r)[:6000]})
+                    self.history.append({"role": "user", "content": results})
+                    box["b"] = self.on_ui(self.stream_bubble)
+                self.app.bridge.call.emit(lambda: self.llm_done(box["b"]))
+            except Exception as ex:
+                msg = str(ex)
+                self.app.bridge.call.emit(lambda: self.llm_fail(q, msg, box["b"]))
+        threading.Thread(target=work, daemon=True).start()
+
+    def llm_call(self, key, model, sysmsg, bubble):
+        import urllib.request
+        body = json.dumps({"model": model, "max_tokens": 900, "system": sysmsg, "tools": GAEL_TOOLS,
+                           "messages": self.history, "stream": True}).encode("utf-8")
+        req = urllib.request.Request(API_URL, data=body, method="POST", headers={
+            "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        blocks, cur, stop, text_acc, last = [], None, None, "", 0.0
+        try:
+            resp = urllib.request.urlopen(req, timeout=45)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise RuntimeError({401: "clé API refusée", 403: "accès refusé", 429: "trop de demandes, réessaie dans un instant",
+                                529: "service surchargé"}.get(e.code, f"erreur {e.code}") + (f" ({detail})" if e.code not in (401, 429) else ""))
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                t = ev.get("type")
+                if t == "content_block_start":
+                    cb = dict(ev["content_block"])
+                    if cb.get("type") == "tool_use":
+                        cb["_json"] = ""
+                    blocks.append(cb)
+                    cur = cb
+                elif t == "content_block_delta" and cur is not None:
+                    d = ev["delta"]
+                    if d.get("type") == "text_delta":
+                        cur["text"] = cur.get("text", "") + d["text"]
+                        text_acc += d["text"]
+                        if bubble is not None and time.time() - last > .04:
+                            last = time.time()
+                            txt = text_acc
+                            self.app.bridge.call.emit(lambda txt=txt: self.stream_update(bubble, txt))
+                    elif d.get("type") == "input_json_delta":
+                        cur["_json"] += d.get("partial_json", "")
+                elif t == "content_block_stop" and cur is not None:
+                    if cur.get("type") == "tool_use":
+                        try:
+                            cur["input"] = json.loads(cur.pop("_json") or "{}")
+                        except ValueError:
+                            cur["input"] = {}
+                    cur = None
+                elif t == "message_delta":
+                    stop = ev.get("delta", {}).get("stop_reason", stop)
+                elif t == "error":
+                    raise RuntimeError(ev.get("error", {}).get("message", "erreur du service"))
+        if bubble is not None:
+            self.app.bridge.call.emit(lambda: self.stream_update(bubble, text_acc, final=True))
+        content = [{k: v for k, v in b.items() if not k.startswith("_")} for b in blocks]
+        content = [b for b in content if not (b.get("type") == "text" and not b.get("text"))]
+        return content or [{"type": "text", "text": "…"}], stop
+
+    def llm_done(self, bubble):
+        self.bot.think = False
+        self.set_status()
+        if bubble is not None and not bubble.property("txt"):
+            bubble.parentWidget().hide()
+
+    def llm_fail(self, q, msg, bubble):
+        self.bot.think = False
+        if bubble is not None and not bubble.property("txt"):
+            bubble.parentWidget().hide()
+        if self.history and self.history[-1].get("role") == "user":
+            self.history.pop()
+        self.l_st.setText("en local (IA indisponible)")
+        r = self.answer(q)
+        text, acts = r if isinstance(r, tuple) else (r, None)
+        self.say(text + f"\n\n(Conversation avancée indisponible : {msg}. J'ai répondu en local.)", "bot", acts)
+
+# ------------------------------------------------------------------ SOS : ressources consommées et performances
+class ResourceStrip(QWidget):
+    """Bande de six indicateurs (processeur, mémoire, moteur audio, fluidité, réseau, disque) avec courbe des 60 dernières
+    secondes. Mesures une fois par seconde ; dessin entièrement à la main, un seul widget : coût négligeable."""
+    N = 60
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.setFixedHeight(74)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.keys = ("cpu", "ram", "audio", "ui", "net", "disk")
+        self.title = {"cpu": "PROCESSEUR", "ram": "MÉMOIRE", "audio": "MOTEUR AUDIO", "ui": "FLUIDITÉ", "net": "RÉSEAU", "disk": "DISQUE"}
+        self.hist = {k: [] for k in self.keys}
+        self.val = {k: "—" for k in self.keys}
+        self.sub = {k: "" for k in self.keys}
+        self.state = {k: "ok" for k in self.keys}
+        self.ps, self.proc = None, None
+        try:
+            import psutil
+            self.ps = psutil
+            self.proc = psutil.Process()
+            self.proc.cpu_percent(None)
+            psutil.cpu_percent(None)
+        except Exception:
+            pass
+        self.t_cpu, self.t_wall = time.process_time(), time.time()
+        self.frames, self.t_fr = 0, time.time()
+        self.tm = QTimer(self)
+        self.tm.timeout.connect(self.measure)
+        self.tm.start(1000)
+        self.setToolTip("Mesuré chaque seconde. Courbes : les 60 dernières secondes.")
+
+    def frame(self):
+        """Appelé par la boucle d'affichage (30 i/s visés) pour mesurer la fluidité réelle de l'interface."""
+        self.frames += 1
+
+    def push(self, k, v, val, sub="", state="ok"):
+        h = self.hist[k]
+        h.append(v)
+        del h[:-self.N]
+        self.val[k], self.sub[k], self.state[k] = val, sub, state
+
+    def measure(self):
+        a, e, now = self.app, self.app.engine, time.time()
+        ncpu = os.cpu_count() or 1
+        # processeur
+        if self.proc is not None:
+            try:
+                me = self.proc.cpu_percent(None) / ncpu
+                kids = self.proc.children(recursive=True)
+                for c in kids:
+                    try:
+                        me += c.cpu_percent(None) / ncpu
+                    except Exception:
+                        pass
+                sysc = self.ps.cpu_percent(None)
+                self.push("cpu", me, f"{me:.0f} %", f"ordinateur {sysc:.0f} %", "bad" if sysc > 90 else ("warn" if sysc > 70 else "ok"))
+            except Exception:
+                pass
+        else:
+            pt = time.process_time()
+            me = 100 * (pt - self.t_cpu) / max(.001, now - self.t_wall) / ncpu
+            self.t_cpu, self.t_wall = pt, now
+            self.push("cpu", me, f"{me:.0f} %", "application", "warn" if me > 60 else "ok")
+        # mémoire
+        mb = None
+        try:
+            if self.proc is not None:
+                mb = self.proc.memory_info().rss / 1e6
+                wp = a.worker_pids() if hasattr(a, "worker_pids") else set()
+                n = 0
+                for c in self.proc.children(recursive=True):
+                    if c.pid in wp:
+                        try:
+                            mb += c.memory_info().rss / 1e6
+                        except Exception:
+                            pass
+                    else:
+                        n += 1
+                sub = f"{n} processus ffmpeg" if n else "sans encodeur actif"
+            else:
+                import resource
+                mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1e3 if SYS != "Darwin" else 1e6)
+                sub = "application"
+        except Exception:
+            sub = "installe psutil pour le détail"
+        if mb is not None:
+            self.push("ram", mb, f"{mb:.0f} Mo", sub, "warn" if mb > 1500 else "ok")
+        # moteur audio
+        if e:
+            load = 100 * e.proc_ms / 20.0
+            late = e.late
+            self.push("audio", load, f"{e.proc_ms:.1f} ms", f"{load:.0f} % du temps · {late} retard{'s' if late > 1 else ''}",
+                      "bad" if load > 80 or e.slow_now() else ("warn" if load > 50 else "ok"))
+        else:
+            self.push("audio", 0, "arrêté", "démarre la diffusion", "idle")
+        # fluidité de l'interface
+        dt = max(.001, now - self.t_fr)
+        fps = self.frames / dt
+        self.frames, self.t_fr = 0, now
+        self.push("ui", fps, f"{fps:.0f} i/s", "objectif 30 images/s", "ok" if fps >= 27 else ("warn" if fps >= 20 else "bad"))
+        # réseau (lien actif)
+        act = getattr(a, "net_active", None)
+        rt = a.net_rate.get(act) if act else None
+        if rt:
+            self.push("net", rt[1], f"↑ {rt[1]:.0f} ko/s", f"↓ {rt[0]:.0f} ko/s · {a.net_label(act)}", "ok")
+        else:
+            self.push("net", 0, "—", "lien non mesuré", "idle")
+        # disque des enregistrements
+        try:
+            d = a.rec_dir() or os.path.expanduser("~")
+            free = shutil.disk_usage(d if os.path.isdir(d) else os.path.expanduser("~")).free / 1e9
+            self.push("disk", free, f"{free:.0f} Go", "libres (enregistrements)", "bad" if free < 2 else ("warn" if free < 10 else "ok"))
+        except OSError:
+            pass
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, ev):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        n = len(self.keys)
+        gap = 10
+        tw = (W - gap * (n - 1)) / n
+        cols = {"ok": OKC, "warn": "#ffb347", "bad": BADC, "idle": MUT}
+        f1 = QFont(self.font())
+        f1.setPointSizeF(7)
+        f1.setBold(True)
+        f1.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
+        f2 = QFont(self.font())
+        f2.setPixelSize(17)
+        f2.setBold(True)
+        try:
+            f2.setFeature(QFont.Tag("tnum"), 1)
+        except Exception:
+            pass
+        f3 = QFont(self.font())
+        f3.setPointSizeF(8)
+        for i, k in enumerate(self.keys):
+            x = i * (tw + gap)
+            r = QRectF(x, 0, tw, H)
+            col = QColor(cols.get(self.state[k], MUT))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(mixc(PANEL, TXT, .035))
+            p.drawRoundedRect(r, 12, 12)
+            # courbe
+            h = self.hist[k]
+            if len(h) >= 2:
+                top = max(max(h) * 1.15, {"cpu": 25, "audio": 50, "ui": 70}.get(k, 1e-9))
+                lo = min(h) * .9 if k in ("disk", "ram") else 0
+                span = max(1e-9, top - lo)
+                path = QPainterPath()
+                for j, v in enumerate(h):
+                    px = r.left() + 8 + (r.width() - 16) * (j + self.N - len(h)) / (self.N - 1)
+                    py = r.bottom() - 6 - (r.height() * .42) * _cl((v - lo) / span)
+                    path.moveTo(px, py) if j == 0 else path.lineTo(px, py)
+                area = QPainterPath(path)
+                area.lineTo(path.currentPosition().x(), r.bottom() - 4)
+                area.lineTo(r.left() + 8 + (r.width() - 16) * (self.N - len(h)) / (self.N - 1), r.bottom() - 4)
+                area.closeSubpath()
+                g = QLinearGradient(0, r.center().y(), 0, r.bottom())
+                g.setColorAt(0, qc(col.name(), 60))
+                g.setColorAt(1, qc(col.name(), 0))
+                p.setBrush(QBrush(g))
+                p.drawPath(area)
+                p.setPen(QPen(qc(col.name(), 200), 1.4))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
+                p.setPen(Qt.PenStyle.NoPen)
+            p.setFont(f1)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(r.left() + 12, 6, tw - 30, 14), Qt.AlignmentFlag.AlignVCenter, self.title[k])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(QPointF(r.right() - 12, 13), 3.2, 3.2)
+            p.setFont(f2)
+            p.setPen(QColor(TXT))
+            p.drawText(QRectF(r.left() + 12, 19, tw - 18, 22), Qt.AlignmentFlag.AlignVCenter, self.val[k])
+            p.setFont(f3)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(r.left() + 12, 40, tw - 18, 14), Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetrics(f3).elidedText(self.sub[k], Qt.TextElideMode.ElideRight, int(tw - 20)))
+
+# ------------------------------------------------------------------ Réseau + SOS + Radiobot
+class Radar(QWidget):
+    """Qualité du lien (onglet Réseau) : anneau de score, latence en grand, courbe des dernières mesures.
+    Aucune animation permanente : un fondu de 400 ms quand une mesure arrive, un fin arc qui tourne seulement pendant un test."""
+
+    def __init__(self, size=112):
+        super().__init__()
+        self.setFixedSize(300, 112)
+        self.score, self.shown, self.lat, self.jit, self.loss = None, 0.0, None, None, None
+        self.label, self.col, self.hist, self.scan, self.txt, self.name = "—", MUT, [], False, "", ""
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(420)
+        self.an.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.an.valueChanged.connect(lambda v: (setattr(self, "shown", float(v)), self.update()))
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.tm = QTimer(self)
+        self.tm.timeout.connect(lambda: self.update() if self.isVisible() and not calm() else None)
+
+    def set_scan(self, on, txt=""):
+        on = bool(on)
+        if on != self.scan:
+            self.scan, self.txt = on, txt
+            if on and ANIM:
+                self.tm.start(Gov.ivl(16))
+                Gov.reg(self.tm, 16)
+            else:
+                self.tm.stop()
+            self.update()
+
+    @staticmethod
+    def score_of(st):
+        if not st or st.get("lat") is None:
+            return 0.0
+        return _cl(100 - max(0, st["lat"] - 20) / 4.0 - st.get("jit", 0) * .6 - st.get("loss", 0) * 2.5, 0, 100)
+
+    def set_link(self, name, st, hist):
+        q, col, _ = quality(st) if st else ("—", MUT, False)
+        sc = self.score_of(st) if st else None
+        self.name, self.label, self.col = name or "", q, QUAL_COL.get(q, col)
+        self.lat = st.get("lat") if st else None
+        self.jit = st.get("jit") if st else None
+        self.loss = st.get("loss") if st else None
+        self.hist = list(hist or [])[-40:]
+        if sc != self.score:
+            self.score = sc
+            self.an.stop()
+            self.an.setStartValue(self.shown)
+            self.an.setEndValue(float(sc or 0))
+            self.an.start() if ANIM else setattr(self, "shown", float(sc or 0))
+        self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        R = QRectF(8, 8, 96, 96)
+        col = QColor(self.col)
+        p.setPen(QPen(mixc(PANEL, TXT, .08), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(R, 225 * 16, -270 * 16)
+        if self.shown > .5:
+            g = QLinearGradient(R.bottomLeft(), R.topRight())
+            g.setColorAt(0, mixc(col, PANEL, .35))
+            g.setColorAt(1, col)
+            p.setPen(QPen(QBrush(g), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(R, 225 * 16, int(-270 * 16 * self.shown / 100))
+        if self.scan:
+            a = (self.clock.elapsed() / 1000.0 * 300) % 360
+            c = QColor(ACC2)
+            c.setAlphaF(.8)
+            p.setPen(QPen(c, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(R.adjusted(-6, -6, 6, 6), int(-a * 16), 50 * 16)
+        f = QFont(self.font())
+        f.setPixelSize(22)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(TXT))
+        p.drawText(QRectF(R.left(), R.top() + 26, R.width(), 30), Qt.AlignmentFlag.AlignCenter, f"{self.lat:.0f}" if self.lat is not None else "—")
+        f2 = QFont(self.font())
+        f2.setPixelSize(10)
+        p.setFont(f2)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(R.left(), R.top() + 54, R.width(), 14), Qt.AlignmentFlag.AlignCenter, "ms")
+        # colonne de droite
+        x0 = 122
+        f3 = QFont(self.font())
+        f3.setPixelSize(15)
+        f3.setBold(True)
+        p.setFont(f3)
+        p.setPen(col)
+        p.drawText(QRectF(x0, 8, 180, 20), Qt.AlignmentFlag.AlignVCenter, self.label if not self.scan else "Mesure en cours…")
+        p.setFont(f2)
+        p.setPen(QColor(MUT))
+        det = []
+        if self.jit is not None:
+            det.append(f"gigue {self.jit:.0f} ms")
+        if self.loss is not None:
+            det.append(f"perte {self.loss:.0f} %")
+        p.drawText(QRectF(x0, 28, 180, 14), Qt.AlignmentFlag.AlignVCenter, (self.name + "  ·  " if self.name else "") + " · ".join(det))
+        # courbe de latence (40 dernières mesures)
+        G = QRectF(x0, 50, 170, 50)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mixc(PANEL, TXT, .035))
+        p.drawRoundedRect(G, 10, 10)
+        vals = [v for v in self.hist if v is not None]
+        if len(vals) >= 2:
+            top = max(60.0, max(vals) * 1.15)
+            n = len(self.hist)
+            path, area = QPainterPath(), QPainterPath()
+            first = True
+            for k, v in enumerate(self.hist):
+                if v is None:
+                    continue
+                x = G.left() + 8 + (G.width() - 16) * (k / max(1, n - 1))
+                y = G.bottom() - 6 - (G.height() - 12) * min(1.0, v / top)
+                if first:
+                    path.moveTo(x, y)
+                    area.moveTo(x, G.bottom() - 4)
+                    area.lineTo(x, y)
+                    first = False
+                else:
+                    path.lineTo(x, y)
+                    area.lineTo(x, y)
+            area.lineTo(path.currentPosition().x(), G.bottom() - 4)
+            area.closeSubpath()
+            ag = QLinearGradient(0, G.top(), 0, G.bottom())
+            ag.setColorAt(0, qc(col.name(), 70))
+            ag.setColorAt(1, qc(col.name(), 0))
+            p.setBrush(QBrush(ag))
+            p.drawPath(area)
+            p.setPen(QPen(col, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            lp = path.currentPosition()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(lp, 3, 3)
+        else:
+            p.setPen(QColor(MUT))
+            p.drawText(G, Qt.AlignmentFlag.AlignCenter, "historique de latence")
+
+
+QUAL_COL = {"Excellente": OKC, "Bonne": "#27ae60", "Moyenne": "#f26a35", "Mauvaise": "#e5485a", "Coupée": "#e5485a"}
+
+
+class PagesMixin4:
+    # ------------------------------------------------------------ Réseau
+    def _page_net(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 4, 0)
+        v.setSpacing(10)
+        n = self.data.setdefault("net", {})
+        n.setdefault("links", [])
+        n.setdefault("auto", False)
+        n.setdefault("interval", 10)
+        n.setdefault("back_s", 90)
+        n.setdefault("targets", "1.1.1.1:443, 8.8.8.8:443")
+        self.net_links, self.net_stats, self.net_speed, self.net_rate, self.net_io = [], {}, {}, {}, {}
+        self.net_busy, self.net_last, self.net_active, self.net_last_switch = False, 0.0, None, 0.0
+        self.net_bad, self.net_good_since, self.net_info, self.net_scan_until, self.net_scan_who = {}, {}, {}, 0.0, ""
+        bar = QHBoxLayout()
+        for txt, cmd in (("↻ Détecter", self.net_refresh), ("Tester le débit", self.net_speedtest), ("Monter", lambda: self.net_move(-1)),
+                         ("Descendre", lambda: self.net_move(1)), ("Nommer", self.net_rename), ("↪ Utiliser celle-ci maintenant", self.net_use_now)):
+            b = btn(txt, "", cmd)
+            if txt in ("Monter", "Descendre", "Nommer", "↪ Utiliser celle-ci maintenant", "Tester le débit"):
+                self.gray_net = getattr(self, "gray_net", []) + [b]
+            bar.addWidget(b)
+        bar.addStretch(1)
+        self.sw_net_auto = Switch("Bascule automatique")
+        self.sw_net_auto.setChecked(bool(n["auto"]))
+        bar.addWidget(self.sw_net_auto)
+        v.addLayout(bar)
+        self.l_netact = lab("", "")
+        self.l_netact.setMinimumHeight(40)
+        v.addWidget(self.l_netact)
+        c = Card()
+        cols = ("#", "SUIVI", "CONNEXION", "TYPE", "ADRESSE", "ÉTAT", "LATENCE", "GIGUE", "PERTE", "DÉBIT MESURÉ", "TRAFIC", "QUALITÉ")
+        self.tb_net = QTableWidget(0, len(cols))
+        self.tb_net.setHorizontalHeaderLabels(cols)
+        style_table(self.tb_net, check_col=1)
+        hh = self.tb_net.horizontalHeader()
+        # largeurs fixes : les chiffres qui changent (latence, débit, trafic) ne font plus bouger les colonnes
+        for col, wd in enumerate((36, 58, 0, 74, 124, 96, 74, 66, 60, 150, 146, 96)):
+            if wd:
+                hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+                self.tb_net.setColumnWidth(col, wd)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tb_net.verticalHeader().hide()
+        self.tb_net.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tb_net.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tb_net.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tb_net.setShowGrid(False)
+        self.tb_net.setMinimumHeight(84)
+        self.tb_net.verticalHeader().setDefaultSectionSize(46)
+        self.tb_net.cellClicked.connect(self.net_click)
+        self.tb_net.itemSelectionChanged.connect(lambda: self.net_details())
+        c.lay.addWidget(self.tb_net)
+        v.addWidget(c)
+        h = QHBoxLayout()
+        h.addWidget(lab("Mesure toutes les", "mut"))
+        self.ed_net_iv = QLineEdit(str(n["interval"]))
+        self.ed_net_iv.setFixedWidth(60)
+        h.addWidget(self.ed_net_iv)
+        h.addWidget(lab("s     Retour au lien principal après", "mut"))
+        self.ed_net_back = QLineEdit(str(n["back_s"]))
+        self.ed_net_back.setFixedWidth(60)
+        h.addWidget(self.ed_net_back)
+        h.addWidget(lab("s de stabilité", "mut"))
+        h.addStretch(1)
+        v.addLayout(h)
+        self.l_netinfo = lab("Détection des connexions...", "mut")
+        v.addWidget(self.l_netinfo)
+        dc = Card("Détails de la connexion", "Sélectionner un lien pour l'afficher")
+        hh2 = QHBoxLayout()
+        gd = QGridLayout()
+        self.net_det = {}
+        fields = (("name", "Nom"), ("kind", "Type"), ("ip", "Adresse IP"), ("mask", "Masque"), ("mac", "Adresse MAC"), ("speed", "Débit du lien"),
+                  ("ssid", "Réseau Wi-Fi"), ("signal", "Signal"), ("pub", "IP publique"), ("org", "Opérateur"), ("place", "Lieu"), ("mtu", "MTU · IPv6"))
+        for i, (k, l) in enumerate(fields):
+            r, cc = i // 4, i % 4
+            cell = QHBoxLayout()
+            lb = lab(l, "mut")
+            lb.setFixedWidth(88)
+            cell.addWidget(lb)
+            self.net_det[k] = lab("-", "")
+            cell.addWidget(self.net_det[k], 1)
+            gd.addLayout(cell, r, cc)
+            gd.setColumnStretch(cc, 1)
+        left = QVBoxLayout()
+        left.addLayout(gd)
+        left.addWidget(btn("Actualiser les détails", "", lambda: self.net_details(True)), 0, Qt.AlignmentFlag.AlignLeft)
+        hh2.addLayout(left, 1)
+        self.radar = Radar()
+        hh2.addWidget(self.radar)
+        dc.lay.addLayout(hh2)
+        v.addWidget(dc)
+        lf = Card("Incidents réseau")
+        self.net_logbox = QPlainTextEdit()
+        self.net_logbox.setReadOnly(True)
+        self.net_logbox.setMinimumHeight(44)
+        self.net_logbox.setMaximumHeight(80)
+        lf.lay.addWidget(self.net_logbox)
+        v.addWidget(lf, 1)
+        QTimer.singleShot(800, self.net_refresh)
+        self.net_timer = QTimer(self)
+        self.net_timer.timeout.connect(self.net_tick)
+        self.net_timer.start(1000)
+        return w
+
+    def net_cfg(self, name):
+        for c in self.data["net"]["links"]:
+            if c["name"] == name:
+                return c
+        c = {"name": name, "label": "", "enabled": True}
+        self.data["net"]["links"].append(c)
+        return c
+
+    def net_kind(self, name):
+        l = next((x for x in self.net_links if x["name"] == name), None)
+        return KIND_TXT[l["kind"]] if l else "?"
+
+    def net_label(self, name):
+        return self.net_cfg(name).get("label") or name
+
+    def sync_net(self):
+        n = self.data.get("net")
+        if n is None or not hasattr(self, "sw_net_auto"):
+            return
+        n["auto"] = self.sw_net_auto.isChecked()
+        try:
+            n["interval"] = max(5, int(float(self.ed_net_iv.text())))
+        except ValueError:
+            n["interval"] = 10
+        try:
+            n["back_s"] = max(10, int(float(self.ed_net_back.text())))
+        except ValueError:
+            n["back_s"] = 90
+
+    def net_log(self, msg):
+        self.net_logbox.appendPlainText(f"{time.strftime('%d/%m %H:%M:%S')}  {msg}")
+        self.log("Réseau : " + msg)
+
+    def net_refresh(self):
+        def work():
+            if not have_module("psutil"):
+                return self.bridge.call.emit(self.net_nopsutil)
+            try:
+                links = list_links()
+                self.bridge.call.emit(lambda: self.net_apply_links(links))
+            except Exception as e:
+                msg = str(e)
+                self.bridge.call.emit(lambda: self.l_netinfo.setText(f"Détection impossible : {msg}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def net_nopsutil(self):
+        self.l_netinfo.setText("Le module « psutil » est nécessaire pour détecter les connexions : clique ici pour l'installer (puis relance l'appli).")
+        set_ss(self.l_netinfo, "color:#e5485a;")
+        self.l_netinfo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.l_netinfo.mouseReleaseEvent = lambda _e: self.install("psutil")
+
+    def net_apply_links(self, links):
+        by = {l["name"]: l for l in links}
+        order = [c["name"] for c in self.data["net"]["links"] if c["name"] in by]
+        order += [l["name"] for l in links if l["name"] not in order]
+        for nm in order:
+            self.net_cfg(nm)
+        self.net_links = [by[nm] for nm in order]
+        self.data["net"]["links"].sort(key=lambda c: order.index(c["name"]) if c["name"] in order else 999)
+        self.l_netinfo.setText(f"{len(links)} connexion(s) détectée(s)")
+        set_ss(self.l_netinfo, f"color:{MUT};")
+        self.net_render(rebuild=True)
+        self.net_last = 0.0
+        if self.net_links and not self.net_sel():
+            first = next((i for i, l in enumerate(self.net_links) if l["name"] == self.net_active), 0)
+            self.tb_net.selectRow(first)
+
+    def install(self, pkg, done=None):
+        if getattr(sys, "frozen", False):
+            return self.log(f"{pkg} : module non disponible dans cette version de l'application.")
+        self.log(f"Installation de {pkg}...")
+
+        def work():
+            for extra in ([], ["--break-system-packages"]):
+                r = subprocess.run([sys.executable, "-m", "pip", "install", pkg] + extra, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                   creationflags=0x08000000 if SYS == "Windows" else 0)
+                if r.returncode == 0:
+                    importlib.invalidate_caches()
+                    if done:
+                        self.log(f"{pkg} installé et activé.")
+                        return self.bridge.call.emit(done)
+                    return self.log(f"{pkg} installé. Relance l'application pour l'activer.")
+            self.log(f"Échec de l'installation de {pkg} : " + (r.stdout + r.stderr)[-400:])
+        threading.Thread(target=work, daemon=True).start()
+
+    def net_render(self, rebuild=False):
+        tb = self.tb_net
+        sel = self.net_sel()
+        if tb.rowCount() != len(self.net_links):
+            tb.setRowCount(len(self.net_links))
+        for i, l in enumerate(self.net_links):
+            nm, st = l["name"], self.net_stats.get(l["name"])
+            c = self.net_cfg(nm)
+            q = quality(st)[0] if (st and c["enabled"] and l["up"]) else ""
+            if not l["up"]:
+                q = "Coupée"
+            sp, rt = self.net_speed.get(nm), self.net_rate.get(nm)
+            vals = (i + 1, "", self.net_label(nm), KIND_TXT[l["kind"]], l["ip"],
+                    "● ACTIF" if nm == self.net_active else ("en veille" if l["up"] else "○ coupée"),
+                    f"{st['lat']:.0f} ms" if st and st.get("lat") is not None else ("-" if not st else "×"),
+                    f"{st['jit']:.0f} ms" if st and st.get("lat") is not None else "-", f"{st['loss']:.0f} %" if st else "-",
+                    (f"↓ {sp[0]:.0f} / ↑ {sp[1]:.0f} Mb/s" if sp and sp != "..." and sp[0] is not None and sp[1] is not None
+                     else ("test..." if sp == "..." else "-")),
+                    f"↓ {rt[0]:.0f} / ↑ {rt[1]:.0f} ko/s" if rt else "-", q or "-")
+            for k, t in enumerate(vals):
+                it = tb.item(i, k)
+                if it is None:
+                    it = QTableWidgetItem()
+                    tb.setItem(i, k, it)
+                    if k in (0, 1, 6, 7, 8, 11):
+                        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if it.text() != str(t):
+                    it.setText(str(t))
+                it.setData(Qt.ItemDataRole.UserRole, nm)
+                if k == 1:
+                    it.setData(CHECK_ROLE, bool(c["enabled"]))
+                act = nm == self.net_active
+                it.setData(TINT_ROLE, OKC if act else None)
+                if act:
+                    it.setForeground(QColor(OKC) if k in (2, 5) else QColor(TXT))
+                    f = it.font()
+                    f.setBold(k in (2, 5))
+                    it.setFont(f)
+                else:
+                    it.setForeground(QColor(MUT if not l["up"] else TXT))
+                    f = it.font()
+                    f.setBold(False)
+                    it.setFont(f)
+                if k == 11 and q:
+                    it.setForeground(QColor(QUAL_COL.get(q, TXT)))
+        a = next((l for l in self.net_links if l["name"] == self.net_active), None)
+        if a:
+            st = self.net_stats.get(a["name"]) or {}
+            qq = quality(st)[0] if st else ""
+            lat = f" · {st['lat']:.0f} ms" if st.get("lat") is not None else ""
+            self.l_netact.setText(f"●  Internet passe par  {self.net_label(a['name'])}  ({KIND_TXT[a['kind']]}){lat}" + (f" · {qq}" if qq else ""))
+            set_ss(self.l_netact, f"background:{mixc(PANEL, OKC, .18).name()};color:{OKC};font-weight:800;font-size:15px;border-radius:12px;padding:6px 16px;border-left:5px solid {OKC};")
+        else:
+            self.l_netact.setText("Aucune connexion active détectée")
+            set_ss(self.l_netact, f"background:{FIELD};color:{MUT};font-weight:700;border-radius:12px;padding:6px 16px;")
+
+    def net_sel(self):
+        r = self.tb_net.currentRow() if hasattr(self, "tb_net") else -1
+        if 0 <= r < len(self.net_links):
+            return self.net_links[r]["name"]
+        return None
+
+    def net_click(self, r, col):
+        if col == 1 and 0 <= r < len(self.net_links):
+            c = self.net_cfg(self.net_links[r]["name"])
+            c["enabled"] = not c["enabled"]
+            self.net_render()
+
+    def net_details(self, fetch=False):
+        nm = self.net_sel()
+        l = next((x for x in self.net_links if x["name"] == nm), None)
+        if not l:
+            return
+        inf = self.net_info.setdefault(nm, {})
+        if fetch or "pub" not in inf:
+            inf.setdefault("pub", "…")
+            self.net_scan(4, l["ip"])
+
+            def work():
+                d = {}
+                if l["up"]:
+                    d.update(public_info(l["ip"]))
+                    if l["kind"] == "wifi":
+                        d.update(wifi_info(nm))
+                d.setdefault("pub", "indisponible")
+
+                def done():
+                    self.net_info.setdefault(nm, {}).update(d)
+                    self.net_details_show(nm)
+                self.bridge.call.emit(done)
+            threading.Thread(target=work, daemon=True).start()
+        self.net_details_show(nm)
+
+    def net_details_show(self, nm):
+        self.net_gauge()
+        l = next((x for x in self.net_links if x["name"] == nm), None)
+        if not l or nm != self.net_sel():
+            return
+        i = self.net_info.get(nm, {})
+        place = ", ".join(x for x in (i.get("city", ""), i.get("country", "")) if x)
+        vals = {"name": self.net_label(nm), "kind": KIND_TXT[l["kind"]] + (" · actif" if nm == self.net_active else ""),
+                "ip": l["ip"], "mask": l.get("mask") or "-", "mac": l.get("mac") or "-", "speed": f"{l['speed']} Mb/s" if l.get("speed") else "-",
+                "ssid": i.get("ssid") or ("-" if l["kind"] != "wifi" else "…"), "signal": i.get("signal") or "-", "pub": i.get("pub", "-"),
+                "org": i.get("org") or "-", "place": place or "-", "mtu": f"{l.get('mtu', 0) or '-'} · {l.get('v6', 0)} adresse(s)"}
+        for k, v in vals.items():
+            self.net_det[k].setText(str(v))
+
+    def net_move(self, d):
+        nm = self.net_sel()
+        names = [l["name"] for l in self.net_links]
+        if not nm or nm not in names:
+            return
+        i, j = names.index(nm), names.index(nm) + d
+        if 0 <= j < len(names):
+            self.net_links[i], self.net_links[j] = self.net_links[j], self.net_links[i]
+            order = [l["name"] for l in self.net_links]
+            self.data["net"]["links"].sort(key=lambda c: order.index(c["name"]) if c["name"] in order else 999)
+            self.net_render(rebuild=True)
+            self.tb_net.selectRow(j)
+
+    def net_rename(self):
+        nm = self.net_sel()
+        if nm:
+            v = ask_text(self, "Nom de la connexion", f"Nom affiché pour « {nm} » (ex. Fibre RJ45, Clé 4G) :", self.net_cfg(nm).get("label", ""))
+            if v is not None:
+                self.net_cfg(nm)["label"] = v.strip()
+                self.net_render()
+
+    def net_use_now(self):
+        nm = self.net_sel()
+        if nm:
+            self.net_switch(nm, "choix manuel")
+
+    def net_speedtest(self):
+        self.net_scan(6, "speed.cloudflare.com")
+        for l in self.net_links:
+            if l["up"] and self.net_cfg(l["name"])["enabled"]:
+                self.net_speed[l["name"]] = "..."
+
+                def work(l=l):
+                    d, u = speed_test(l["ip"])
+                    self.bridge.call.emit(lambda: self.net_speed_done(l["name"], (d, u)))
+                threading.Thread(target=work, daemon=True).start()
+        self.net_render()
+
+    def net_speed_done(self, name, res):
+        self.net_speed[name] = res if res[0] is not None or res[1] is not None else None
+        if res[0] is None and res[1] is None:
+            self.net_log(f"Test de débit impossible sur « {self.net_label(name)} » (pas d'accès à speed.cloudflare.com depuis ce lien).")
+        self.net_render()
+
+    def net_tick(self):
+        try:
+            now = time.time()
+            if have_module("psutil") and self.net_links:
+                import psutil
+                io = psutil.net_io_counters(pernic=True)
+                for l in self.net_links:
+                    c = io.get(l["name"])
+                    if c:
+                        old = self.net_io.get(l["name"])
+                        if old and now > old[2]:
+                            dt = now - old[2]
+                            self.net_rate[l["name"]] = ((c.bytes_recv - old[0]) / 1000 / dt, (c.bytes_sent - old[1]) / 1000 / dt)
+                        self.net_io[l["name"]] = (c.bytes_recv, c.bytes_sent, now)
+            self.sync_net()
+            self.net_radar_update()
+            if self.net_links and not self.net_busy and now - self.net_last >= self.data["net"]["interval"]:
+                self.net_cycle()
+            if self.net_links and self.page_key == "net":
+                self.net_render()
+        except Exception as e:
+            self.log(f"(erreur réseau : {e})")
+
+    def net_scan(self, secs, who=""):
+        self.net_scan_until = max(self.net_scan_until, time.time() + secs)
+        if who:
+            self.net_scan_who = who
+        self.net_radar_update()
+
+    def net_radar_update(self):
+        on = time.time() < self.net_scan_until or any(v == "..." for v in self.net_speed.values())
+        self.radar.set_scan(on, "SCAN " + self.net_scan_who)
+
+    def net_cycle(self):
+        self.net_busy, self.net_last = True, time.time()
+        targets = parse_targets(self.data["net"]["targets"])
+        self.net_scan(2.5, f"{targets[0][0]}")
+        todo = [l for l in self.net_links if l["up"] and self.net_cfg(l["name"])["enabled"]]
+        res = {}
+
+        def one(l):
+            res[l["name"]] = probe_link(l["name"], l["ip"], targets)
+
+        def work():
+            ths = [threading.Thread(target=one, args=(l,), daemon=True) for l in todo]
+            for th in ths:
+                th.start()
+            for th in ths:
+                th.join(20)
+            self.bridge.call.emit(lambda: self.net_after_cycle(res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_net_label(self, text, color):
+        self.l_net.setText(text)
+        set_ss(self.l_net, f"color:{color};")
+
+    def net_after_cycle(self, res):
+        self.net_busy = False
+        now = time.time()
+        self.net_stats.update(res)
+        self.net_hist = getattr(self, "net_hist", {})
+        for nm, st in res.items():
+            h = self.net_hist.setdefault(nm, [])
+            h.append(st.get("lat") if st else None)
+            del h[:-40]
+        ip = default_route_ip()
+        self.net_active = next((l["name"] for l in self.net_links if l["ip"] == ip), None)
+        order = [l["name"] for l in self.net_links if l["up"] and self.net_cfg(l["name"])["enabled"]]
+        usable = {nm: quality(self.net_stats.get(nm))[2] for nm in order}
+        for nm in order:
+            if usable[nm]:
+                self.net_good_since.setdefault(nm, now)
+                self.net_bad[nm] = 0
+            else:
+                self.net_good_since.pop(nm, None)
+                self.net_bad[nm] = self.net_bad.get(nm, 0) + 1
+        act = self.net_active
+        if act and self.net_stats.get(act):
+            q, col, _ = quality(self.net_stats[act])
+            lat = self.net_stats[act].get("lat")
+            kd, lb = self.net_kind(act), self.net_label(act)
+            who = kd if (lb == kd or lb.lower() == act.lower() and kd.lower() in lb.lower()) else f"{kd} · {lb}"
+            self.set_net_label(f"{who} · " + (f"{lat:.0f} ms · {q}" if lat is not None else q), col)
+        else:
+            self.set_net_label("Internet : lien actif inconnu", MUT)
+        main = order[0] if order else None
+        target, reason = None, ""
+        n = self.data["net"]
+        if act in order and self.net_bad.get(act, 0) >= 2:
+            alt = next((x for x in order if x != act and usable[x]), None)
+            qa = quality(self.net_stats.get(act))[0]
+            if alt:
+                target, reason = alt, f"« {self.net_label(act)} » {qa.lower()}"
+            else:
+                self.net_log(f"« {self.net_label(act)} » {qa.lower()} et aucune connexion de secours disponible.")
+                self.alerts.send(f"Internet : « {self.net_label(act)} » {qa.lower()}, pas de lien de secours.", "out-net-down")
+        elif main and act and act != main and usable.get(main) and now - self.net_good_since.get(main, now) >= n["back_s"]:
+            target, reason = main, "retour au lien principal (stable)"
+        if target and now - self.net_last_switch > 60:
+            if self.sw_net_auto.isChecked():
+                self.net_switch(target, reason)
+            else:
+                self.net_log(f"Conseil : {reason} → utiliser « {self.net_label(target)} » (sélectionne-la puis « Utiliser celle-ci maintenant »).")
+                self.alerts.send(f"Internet : {reason}. Lien conseillé : {self.net_label(target)}.", "out-net-advice")
+        self.net_render()
+        self.net_gauge()
+
+    def net_gauge(self):
+        nm = None
+        try:
+            sel = self.net_sel()
+            nm = sel["name"] if isinstance(sel, dict) else sel
+        except Exception:
+            nm = None
+        nm = nm or self.net_active
+        if nm:
+            self.radar.set_link(self.net_label(nm), self.net_stats.get(nm), getattr(self, "net_hist", {}).get(nm))
+
+    def net_switch(self, name, reason):
+        self.net_last_switch = time.time()
+        self.net_log(f"Bascule vers « {self.net_label(name)} » ({reason})...")
+
+        def work():
+            ok, msg = prefer_link(name)
+            self.bridge.call.emit(lambda: self.net_switched(name, ok, msg, reason))
+        threading.Thread(target=work, daemon=True).start()
+
+    def net_switched(self, name, ok, msg, reason):
+        if not ok:
+            self.net_log(f"Bascule impossible : {msg}")
+            self.alerts.send(f"Internet : bascule vers {self.net_label(name)} impossible ({msg}).", "out-net-fail")
+            return
+        self.net_log(f"Internet passe par « {self.net_label(name)} ».")
+        self.alerts.send(f"Internet : bascule sur {self.net_label(name)} ({reason}).", "out-net-switch")
+        self.net_last = 0.0
+        if self.on_air:
+            outs = [o for o in self.engine.outputs if o.cfg["type"] == "internet"]
+            for o in outs:
+                o.stop()
+            QTimer.singleShot(2500, lambda: [o.start() for o in outs if self.on_air and o.cfg.get("enabled", True)])
+
+    # ------------------------------------------------------------ SOS
+    def _page_sos(self):
+        pg = Page()
+        g = pg.grid
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
+        # --- module mis en avant : prévenir en cas de panne
+        al = self.al_card = HeroCard()
+        al.lay.setContentsMargins(18, 10, 20, 10)
+        h = QHBoxLayout()
+        h.setSpacing(22)
+        self.al_phone = PhoneAnim()
+        h.addWidget(self.al_phone, 0, Qt.AlignmentFlag.AlignVCenter)
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        tt = lab("Prévenir en cas de panne", "")
+        tt.setStyleSheet("font-size:19px;font-weight:800;")
+        left.addWidget(tt)
+        st = self.al_sub = lab(f"Notification par SMS, mail ou messagerie dès qu'une panne dure plus de {Alerts.OUTAGE_S} s.", "")
+        st.setStyleSheet(f"color:{MUT};font-size:12px;")
+        left.addWidget(st)
+        left.addSpacing(4)
+        self.al_head = lab("", "")
+        self.al_head.setStyleSheet(f"font-size:16px;font-weight:700;color:{OKC};")
+        left.addWidget(self.al_head)
+        ch = QHBoxLayout()
+        ch.setSpacing(8)
+        self.al_chan = {}
+        for key in ("mail", "sms", "msg"):
+            l = lab("", "")
+            l.setCursor(Qt.CursorShape.PointingHandCursor)
+            l.mouseReleaseEvent = lambda _e: self.alert_dialog()
+            self.al_chan[key] = l
+            ch.addWidget(l)
+        ch.addStretch(1)
+        left.addLayout(ch)
+        self.l_alert = lab("", "mut")
+        self.l_alert.hide()
+        left.addSpacing(2)
+        k0 = lab("ME PRÉVENIR QUAND", "")
+        k0.setStyleSheet(f"color:{MUT};font-size:10px;font-weight:700;letter-spacing:1px;")
+        left.addWidget(k0)
+        trg = QHBoxLayout()
+        trg.setSpacing(16)
+        self.al_sw = {}
+        for key, l in (("on_output", "un flux tombe"), ("on_fallback", "la playlist de secours démarre"), ("on_monitor", "un flux surveillé est inactif")):
+            sw = Switch(l)
+            sw.setChecked(bool(self.data["alerts"].get(key, True)))
+            sw.toggled.connect(lambda on, k=key: self.data["alerts"].__setitem__(k, bool(on)))
+            self.al_sw[key] = sw
+            trg.addWidget(sw)
+        trg.addStretch(1)
+        left.addLayout(trg)
+        left.addStretch(1)
+        h.addLayout(left, 1)
+        bt = QVBoxLayout()
+        bt.setSpacing(8)
+        bt.addStretch(1)
+        self.al_cfg = btn("Configurer SMS / mail…", "primary", self.alert_dialog)
+        self.al_cfg.setMinimumSize(196, 44)
+        self.al_cfg.setStyleSheet("font-size:14px;")
+        bt.addWidget(self.al_cfg)
+        self.al_testb = btn("Envoyer un test", "", self.alert_test)
+        bt.addWidget(self.al_testb)
+        bt.addWidget(btn("Demander à Gaël", "", lambda: (self.assistant.ed.setFocus(), self.assistant.ask("Préviens-moi en cas de panne"))))
+        bt.addStretch(1)
+        h.addLayout(bt)
+        al.lay.addLayout(h)
+        g.addWidget(al, 0, 0, 1, 2)
+        # --- ressources et performances (+ retard de sécurité)
+        rc = Card()
+        rc.lay.setContentsMargins(14, 10, 14, 10)
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        self.res = ResourceStrip(self)
+        top.addWidget(self.res, 1)
+        dv = QVBoxLayout()
+        dv.setSpacing(4)
+        k0 = lab("RETARD DE SÉCURITÉ", "")
+        k0.setStyleSheet(f"color:{MUT};font-size:9px;font-weight:700;letter-spacing:1px;")
+        dv.addWidget(k0)
+        dr = QHBoxLayout()
+        self.sp_delay = QSpinBox()
+        self.sp_delay.setRange(0, 40)
+        self.sp_delay.setSuffix(" s")
+        self.sp_delay.setMinimumWidth(78)
+        self.sp_delay.valueChanged.connect(self.sos_delay_changed)
+        dr.addWidget(self.sp_delay)
+        dv.addLayout(dr)
+        dv.addStretch(1)
+        top.addLayout(dv)
+        rc.lay.addLayout(top)
+        self.l_health = lab("", "mut")
+        self.l_health.hide()
+        g.addWidget(rc, 1, 0, 1, 2)
+        faq = Card()
+        self.assistant = Assistant(self)
+        faq.lay.addWidget(self.assistant, 1)
+        g.addWidget(faq, 2, 0)
+        jl = Card("Journal", "Historique des événements d'antenne")
+        tb = QHBoxLayout()
+        self.seg_jf = Segmented(["Tout", "Problèmes", "Secours"], 74, 26)
+        self.seg_jf.changed.connect(lambda *_: self.journal_render())
+        tb.addWidget(self.seg_jf)
+        self.ed_jq = QLineEdit()
+        self.ed_jq.setPlaceholderText("Chercher…")
+        self.ed_jq.setMaximumWidth(140)
+        self.ed_jq.setMinimumWidth(80)
+        self.ed_jq.textChanged.connect(lambda *_: self.journal_render())
+        tb.addWidget(self.ed_jq)
+        tb.addStretch(1)
+        self.l_jcount = lab("", "")
+        self.l_jcount.setStyleSheet(f"color:{BADC};")
+        tb.addWidget(self.l_jcount)
+        tb.addWidget(btn("Effacer", "", self.journal_clear))
+        tb.addWidget(btn("Exporter", "", self.journal_export))
+        jl.lay.addLayout(tb)
+        self.logbox2 = QTextEdit()
+        self.logbox2.setReadOnly(True)
+        self.logbox2.setMinimumHeight(100)
+        jl.lay.addWidget(self.logbox2, 1)
+        g.addWidget(jl, 2, 1)
+        g.setRowStretch(2, 1)
+        self.alert_summary()
+        return pg
+
+    def sos_delay_changed(self, v):
+        if self.engine:
+            try:
+                self.engine.set_delay(float(v))
+            except ValueError:
+                pass
+        self.prof["delay"] = str(v)
+        if hasattr(self, "ed_delay") and self.ed_delay.text() != str(v):
+            self.ed_delay.setText(str(v))
+
+    def journal_pass(self, ts, msg, cls):
+        f = self.seg_jf.val
+        if f == 1 and cls != "bad":
+            return False
+        if f == 2 and cls not in ("warn",) and "secours" not in norm_txt(msg):
+            return False
+        q = norm_txt(self.ed_jq.text().strip())
+        return not q or q in norm_txt(msg) or q in ts
+
+    def journal_render(self, *_):
+        self.logbox2.clear()
+        html = []
+        for ts, msg, cls in self.log_rec[-600:]:
+            if self.journal_pass(ts, msg, cls):
+                html.append(log_html(ts, msg))
+        self.logbox2.setHtml("<br>".join(html))
+        self.logbox2.verticalScrollBar().setValue(self.logbox2.verticalScrollBar().maximum())
+        bad = sum(1 for r in self.log_rec if r[2] == "bad")
+        self.l_jcount.setText(f"{bad} ⚠" if bad else "")
+
+    def journal_clear(self):
+        self.log_rec.clear()
+        self.log_lines.clear()
+        self.journal_render()
+
+    def journal_export(self):
+        dst, _ = QFileDialog.getSaveFileName(self, "Exporter le journal", time.strftime("journal_%Y-%m-%d.txt"), "Texte (*.txt);;CSV (Excel) (*.csv)")
+        if not dst:
+            return
+        csvm = dst.lower().endswith(".csv")
+        with open(dst, "w", encoding="utf-8-sig" if csvm else "utf-8", newline="") as fh:
+            for ts, msg, cls in self.log_rec:
+                fh.write((f'"{ts}";"{cls}";"{msg}"' if csvm else f"{ts}  {msg}") + "\n")
+        self.log("Journal exporté : " + dst)
+
+    def export_history(self):
+        p = hist_path()
+        if not os.path.exists(p):
+            return info(self, "Historique", "Rien n'a encore été diffusé : l'historique se remplit pendant l'antenne (cartouches, jingles et titres du secours).")
+        dst, _ = QFileDialog.getSaveFileName(self, "Enregistrer l'historique", "historique_diffusions.csv", "CSV (Excel) (*.csv)")
+        if dst:
+            shutil.copyfile(p, dst)
+            self.log("Historique enregistré : " + dst)
+
+    def need_engine(self):
+        if self.on_air:
+            return True
+        info(self, "SOS", "Cette commande agit pendant la diffusion.")
+        return False
+
+    def sos_mute(self):
+        if self.need_engine():
+            self.engine.mute = not self.engine.mute
+            self.log("ANTENNE COUPÉE (mute)." if self.engine.mute else "Son rétabli.")
+
+    def sos_tone(self):
+        if self.need_engine():
+            self.engine.tone = not self.engine.tone
+            self.log("Tonalité de test à l'antenne." if self.engine.tone else "Tonalité arrêtée.")
+
+    def sos_restart(self):
+        if self.need_engine():
+            outs = list(self.engine.outputs)
+            for o in outs:
+                o.stop()
+            self.log("Redémarrage des flux...")
+            QTimer.singleShot(2000, lambda: [o.start() for o in outs if self.on_air and o.cfg.get("enabled", True)])
+
+    def dump(self):
+        if self.engine:
+            self.engine.dump_delay()
+        else:
+            info(self, "Retard", "Le DUMP n'agit que pendant la diffusion.")
+
+    def run_diag(self):
+        self.diag_lines = []
+        outs = json.loads(json.dumps(self.outputs_cfg))
+
+        def work():
+            lines = []
+            L = lines.append
+            L(f"{APP} v2 · Python {platform.python_version()} · {platform.platform()}")
+            if shutil.which("ffmpeg"):
+                L("OK · " + run(["ffmpeg", "-version"]).strip().splitlines()[0][:90])
+                enc = run(["ffmpeg", "-hide_banner", "-encoders"])
+                for n in ("libmp3lame", "libopus", "libvorbis", "flac", "aac"):
+                    L(("OK" if n in enc else "Manque") + f" encodeur {n}")
+                L(("OK" if "libfdk_aac" in enc else "Info") + " libfdk_aac (HE-AAC pour DAB+ via ffmpeg)" + ("" if "libfdk_aac" in enc else " : absent, utilise ODR-AudioEnc"))
+            else:
+                L("Manque · ffmpeg introuvable : installe-le (winget install Gyan.FFmpeg) puis rouvre le terminal.")
+            L(("OK" if shutil.which("ffprobe") else "Info") + " ffprobe (titres des pistes)")
+            L(("OK" if have_module("sounddevice") else "Info") + " module sounddevice (sortie FM sur carte son)")
+            if SYS == "Windows":
+                L(("OK" if have_loopback() else "Info") + " module PyAudioWPatch (son de l'ordinateur)")
+            try:
+                devs, _ = list_devices()
+                L(f"OK · {len(devs)} entrée(s) audio détectée(s)" if devs else "Manque · Aucune entrée audio détectée (autorisations micro ?)")
+            except Exception as e:
+                L(f"Manque · Détection des entrées impossible : {e}")
+            for c in outs:
+                tag = f"[{c['name']}]"
+                try:
+                    if c["type"] == "internet":
+                        port = int(c["sc_port"] or int(c["port"]) + 1) if c["protocol"] == "Shoutcast" else int(c["port"])
+                        socket.create_connection((c["host"], port), timeout=3).close()
+                        L(f"OK · {tag} serveur {c['host']}:{port} joignable")
+                    elif c["type"] == "dab" and c.get("mode", "").startswith("ODR"):
+                        exe = c.get("odr_path") or "odr-audioenc"
+                        L(("OK" if (shutil.which(exe) or os.path.isfile(exe)) else "Manque") + f" {tag} odr-audioenc")
+                    elif c["type"] == "record":
+                        os.makedirs(c["folder"], exist_ok=True)
+                        L(f"OK · {tag} dossier OK, {shutil.disk_usage(c['folder']).free / 1e9:.1f} Go libres")
+                    elif c["type"] == "fm":
+                        L(("OK" if c.get("device") else "Manque") + f" {tag} carte son " + ("choisie" if c.get("device") else "non choisie"))
+                except Exception as e:
+                    L(f"Manque · {tag} {e}")
+            L(f"Info · Réglages : {CONF}")
+            L("Diagnostic terminé.")
+            self.bridge.call.emit(lambda: self.assistant.say("\n".join(lines), "bot", [("Copier le rapport", self.copy_report)]))
+        threading.Thread(target=work, daemon=True).start()
+
+    def copy_report(self):
+        lines = [f"{APP} v2 · Python {platform.python_version()} · {platform.platform()}", f"ffmpeg : {shutil.which('ffmpeg') or 'introuvable'}", "Flux :"]
+        for c in self.outputs_cfg:
+            lines.append(f"  - {c['type']} « {c['name']} » {self.describe(c)} actif={c.get('enabled', True)}")
+        lines += ["", "Journal :"] + self.log_lines[-100:]
+        QApplication.clipboard().setText("\n".join(lines))
+        self.log("Rapport copié dans le presse-papiers (sans mots de passe).")
+
+    def reset_settings(self):
+        if self.engine or not yes(self, "Réinitialiser", "Remettre le profil actuel à zéro ? (une copie est gardée)"):
+            return
+        try:
+            shutil.copy(CONF, CONF + ".sauvegarde")
+        except OSError:
+            pass
+        self.data["profiles"][self.data["last"]] = default_profile()
+        self.save_all_raw()
+        self.log("Profil réinitialisé (copie : .sauvegarde). Redémarrage…")
+        self.restart_app()
+
+    @staticmethod
+    def describe(c):
+        k = c["type"]
+        if k == "internet":
+            d = f"{c['protocol']} {c['host']}:{c['port']}"
+            return d + c["mount"] if c["protocol"] == "Icecast" else d
+        if k == "fm":
+            return c.get("device") or "(carte son à choisir)"
+        if k == "dab":
+            return c["dest"] if c.get("mode", "").startswith("ODR") else c.get("net_url", "")
+        return c.get("folder", "")
+
+    # --- alertes
+    def alert_dialog(self):
+        AlertDialog(self).exec()
+        self.alert_summary()
+
+    def alert_test(self):
+        if not self.alerts.channels():
+            return self.alert_dialog()
+        self.alerts.send("Test d'alerte : si tu reçois ce message, les alertes fonctionnent.", force=True, urgent=True)
+        self.log("Alerte de test envoyée.")
+
+    def alert_card_update(self):
+        c = self.data["alerts"]
+        ch = self.alerts.channels()
+        if ch:
+            self.al_head.setText("Tu seras prévenu en cas de panne")
+        else:
+            self.al_head.setText("Personne ne sera prévenu en cas de panne !")
+        col = OKC if ch else BADC
+        set_ss(self.al_head, f"font-size:16px;font-weight:700;color:{col};")
+        self.al_card.set_color(col)
+        self.al_phone.set_state(bool(ch), ch)
+        self.al_cfg.setText("Modifier les alertes…" if ch else "Configurer SMS / mail…")
+        if hasattr(self.rail, "set_badge"):
+            self.rail.set_badge("sos", None if ch else BADC)
+        mail = bool(c.get("mail_on") and c.get("mail_to"))
+        sms = bool(c.get("sms_on") and c.get("sms_to"))
+        msg = bool((c.get("url") or "").strip())
+        for key, ok, l, det in (("mail", mail, "Mail", c.get("mail_to", "")), ("sms", sms, "SMS", c.get("sms_to", "")),
+                                ("msg", msg, c.get("kind", "Message"), "")):
+            w = self.al_chan[key]
+            w.setText(f"{'●' if ok else '○'}  {l}" + (f"  ·  {det}" if ok and det else ("  ·  non configuré" if not ok else "")))
+            bg = mixc(PANEL, OKC, .16).name() if ok else FIELD
+            set_ss(w, f"background:{bg};color:{OKC if ok else MUT};font-weight:700;border-radius:13px;padding:6px 13px;")
+
+    def alert_summary(self):
+        self.alert_card_update()
+        ch = self.alerts.channels()
+        self.l_alert.setText(("Alertes de panne vers : " + ", ".join(ch)) if ch else "Aucune alerte de panne configurée.")
+        set_ss(self.l_alert, f"color:{OKC if ch else MUT};")
+
+    def update_health(self, e):
+        if not e:
+            self.l_health.setText("Moteur audio : arrêté")
+            set_ss(self.l_health, f"color:{MUT};")
+            return
+        slow = e.slow_now()
+        self.l_health.setText(f"Moteur audio : {e.proc_ms:.1f} ms de calcul par bloc de 20 ms · blocs en retard : {e.late} · "
+                              + ("calcul rapide (numpy)" if np is not None else "calcul standard (installe numpy pour plus de fluidité)"))
+        set_ss(self.l_health, f"color:{'#b0391f' if slow else MUT};")
+
+    def check_outages(self, e):
+        """Panne > 1 min (sortie en erreur, plus de signal sans secours) : alerte mail / SMS / message."""
+        now = time.time()
+        probs = {}
+        if self.on_air and not self.preview:
+            if not e.backup and not e.mute and e.silent_ms >= 1000:
+                probs["sig"] = "plus aucun signal à l'antenne et pas de secours"
+            for o in e.outputs:
+                if o.cfg.get("enabled", True) and o.state in ("error", "connecting"):
+                    probs["out-" + o.cfg["id"]] = f"flux « {o.cfg['name']} » hors service"
+        self.prob_since = getattr(self, "prob_since", {})
+        self.prob_sent = getattr(self, "prob_sent", {})
+        due = []
+        for k, txt in probs.items():
+            t0 = self.prob_since.setdefault(k, now)
+            if now - t0 >= Alerts.OUTAGE_S and k not in self.prob_sent:
+                self.prob_sent[k] = txt
+                due.append(txt)
+        if due:
+            self.alerts.send(f"PANNE depuis {Alerts.OUTAGE_S} s : " + " ; ".join(due) + ".", force=True, urgent=True)
+        for k in list(self.prob_since):
+            if k not in probs:
+                self.prob_since.pop(k)
+                txt = self.prob_sent.pop(k, None)
+                if txt:
+                    self.alerts.send(f"Rétabli : {txt}.", force=True, urgent=True)
+
+
+class AlertDialog(QDialog):
+    """Où envoyer les alertes de panne : un onglet par moyen (mail, SMS, message), fenêtre de taille raisonnable."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.setWindowTitle("Alertes de panne")
+        self.app = app
+        c = app.data["alerts"]
+        self.w = {}
+        self.setMinimumWidth(540)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(12)
+        t = lab("Prévenir en cas de panne", "")
+        t.setStyleSheet("font-size:18px;font-weight:800;")
+        v.addWidget(t)
+        v.addWidget(lab(f"Une panne = plus de {Alerts.OUTAGE_S} s sans antenne correcte (flux en erreur, ou plus de signal sans secours).", "mut", True))
+        mail_on = bool(c.get("mail_on") and c.get("mail_to"))
+        sms_on = bool(c.get("sms_on") and c.get("sms_to"))
+        msg_on = bool((c.get("url") or "").strip())
+        tabs = ["Mail" + (" ●" if mail_on else ""), "SMS" + (" ●" if sms_on else ""), "Message" + (" ●" if msg_on else ""), "Options"]
+        self.seg = Segmented(tabs, 112, 30)
+        v.addWidget(self.seg, 0, Qt.AlignmentFlag.AlignLeft)
+        self.stack = QStackedWidget()
+        v.addWidget(self.stack, 1)
+
+        def page(onkey, rows, note=""):
+            pg = QWidget()
+            pv = QVBoxLayout(pg)
+            pv.setContentsMargins(2, 6, 2, 2)
+            pv.setSpacing(8)
+            if onkey:
+                self.sw(onkey, "Activer", c.get(onkey, False), pv)
+            f = QFormLayout()
+            f.setHorizontalSpacing(14)
+            f.setVerticalSpacing(8)
+            for key, label, kw in rows:
+                if kw.get("values"):
+                    w = QComboBox()
+                    w.addItems(kw["values"])
+                    w.setCurrentText(str(c.get(key, kw["values"][0])))
+                else:
+                    w = QLineEdit(str(c.get(key, kw.get("default", ""))))
+                    if kw.get("pw"):
+                        w.setEchoMode(QLineEdit.EchoMode.Password)
+                    if kw.get("narrow"):
+                        w.setMaximumWidth(90)
+                    if kw.get("ph"):
+                        w.setPlaceholderText(kw["ph"])
+                self.w[key] = w
+                f.addRow(label, w)
+            pv.addLayout(f)
+            if note:
+                pv.addWidget(lab(note, "mut", True))
+            pv.addStretch(1)
+            self.stack.addWidget(pg)
+            return pv
+        mv = page("mail_on", [("mail_to", "Destinataire(s)", {"ph": "benevole@radio.bzh, autre@…"}), ("mail_host", "Serveur SMTP", {"ph": "smtp.gmail.com"}),
+                              ("mail_port", "Port", {"default": 587, "narrow": 1}), ("mail_user", "Identifiant", {}),
+                              ("mail_pw", "Mot de passe", {"pw": 1}), ("mail_from", "Expéditeur", {})],
+                  "Gmail : active la validation en 2 étapes et crée un « mot de passe d'application ».")
+        self.sw("mail_tls", "Connexion sécurisée (STARTTLS)", c.get("mail_tls", True), mv)
+        page("sms_on", [("sms_to", "Numéro destinataire", {"ph": "06…"}), ("sms_provider", "Service", {"values": Alerts.SMS}),
+                        ("sms_user", "Identifiant / SID", {}), ("sms_key", "Clé / jeton", {"pw": 1}), ("sms_from", "Numéro expéditeur (Twilio)", {})],
+             "Free Mobile : active « Notifications par SMS » dans ton espace abonné, puis copie l'identifiant et la clé.")
+        self.w["kind"] = QComboBox()
+        self.w["kind"].addItems(Alerts.KINDS)
+        self.w["kind"].setCurrentText(c.get("kind", "Discord"))
+        self.w["url"] = QLineEdit(c.get("url", ""))
+        self.w["url"].setPlaceholderText("https://discord.com/api/webhooks/…  ou  https://ntfy.sh/ma-radio")
+        pgm = QWidget()
+        pm = QVBoxLayout(pgm)
+        pm.setContentsMargins(2, 6, 2, 2)
+        fm = QFormLayout()
+        fm.setHorizontalSpacing(14)
+        fm.addRow("Service", self.w["kind"])
+        fm.addRow("Adresse (webhook / ntfy)", self.w["url"])
+        pm.addLayout(fm)
+        pm.addWidget(lab("Le message part dès que l'adresse est remplie.", "mut", True))
+        pm.addStretch(1)
+        self.stack.addWidget(pgm)
+        po = QWidget()
+        pov = QVBoxLayout(po)
+        pov.setContentsMargins(2, 6, 2, 2)
+        pov.setSpacing(8)
+        self.sw("sound", "Bip sonore sur cet ordinateur", c.get("sound", True), pov)
+        for k, l in (("on_output", "Prévenir quand un flux tombe"), ("on_fallback", "Prévenir quand la playlist de secours démarre"),
+                     ("on_monitor", "Prévenir quand un flux surveillé est inactif")):
+            self.sw(k, l, c.get(k, True), pov)
+        pov.addWidget(lab("Les identifiants sont enregistrés en clair dans le fichier de réglages de cet ordinateur.", "mut", True))
+        pov.addStretch(1)
+        self.stack.addWidget(po)
+        self.seg.changed.connect(self.stack.setCurrentIndex)
+        first = 0 if mail_on or not (sms_on or msg_on) else (1 if sms_on else 2)
+        self.seg.setValue(first)
+        self.stack.setCurrentIndex(first)
+        h = QHBoxLayout()
+        h.addWidget(btn("Envoyer un test", "", self.test))
+        h.addStretch(1)
+        h.addWidget(btn("Annuler", "", self.reject))
+        h.addWidget(btn("Enregistrer", "primary", self.ok))
+        v.addLayout(h)
+        scr = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
+        self.resize(580, min(470, (scr.height() - 80) if scr else 470))
+
+    def sw(self, key, text, val, lay):
+        s = Switch(text)
+        s.setChecked(bool(val))
+        self.w[key] = s
+        lay.addWidget(s)
+
+    def store(self):
+        c = self.app.data["alerts"]
+        for k, w in self.w.items():
+            if isinstance(w, Switch):
+                c[k] = w.isChecked()
+            elif isinstance(w, QComboBox):
+                c[k] = w.currentText()
+            else:
+                c[k] = w.text().strip()
+        try:
+            c["mail_port"] = int(c["mail_port"])
+        except (ValueError, TypeError):
+            c["mail_port"] = 587
+
+    def test(self):
+        self.store()
+        self.app.alerts.send("Test d'alerte : tout fonctionne.", force=True, urgent=True)
+
+    def ok(self):
+        self.store()
+        self.app.save_all()
+        self.accept()
+
+
+class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
+    """Gaël, le radio-bot : discussion épurée façon Messages. Répond en local, ou en conversation avancée (IA) si une clé est réglée."""
+    CHIPS = (("État de l'antenne", "Comment va l'antenne ?"), ("Plus de son", "Je n'ai plus de son"), ("Flux Internet", "Crée un flux Internet"),
+             ("Playlist de secours", "Active la playlist de secours"), ("Alerte SMS", "Préviens-moi par SMS"), ("Diagnostic", "Lance un diagnostic"))
+
+    def __init__(self, app):
+        super().__init__()
+        self.app, self.t, self.talk, self.blink, self.typing = app, 0, 0, 0, False
+        self.last = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        # en-tête : tête de Gaël, nom, état
+        hd = QHBoxLayout()
+        hd.setSpacing(10)
+        self.bot = GaelView("head", app=app)
+        self.bot.setFixedSize(46, 62)
+        hd.addWidget(self.bot)
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        n = lab("Gaël, le radio-bot", "")
+        n.setStyleSheet("font-weight:800;font-size:15px;")
+        col.addWidget(n)
+        self.l_st = lab("", "")
+        col.addWidget(self.l_st)
+        hd.addLayout(col, 1)
+        self.b_set = btn("Réglages", "", lambda: self.app.gael_settings())
+        self.b_set.setStyleSheet("padding:5px 12px;font-size:12px;")
+        self.b_set.setToolTip("Clé API et modèle pour la conversation avancée")
+        hd.addWidget(self.b_set, 0, Qt.AlignmentFlag.AlignTop)
+        self.b_clear = btn("Effacer", "", self.clear)
+        self.b_clear.setStyleSheet("padding:5px 12px;font-size:12px;")
+        hd.addWidget(self.b_clear, 0, Qt.AlignmentFlag.AlignTop)
+        v.addLayout(hd)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background:{LINE};")
+        v.addWidget(line)
+        # fil de discussion
+        self.sa = QScrollArea()
+        self.sa.setWidgetResizable(True)
+        self.sa.setFrameShape(QFrame.Shape.NoFrame)
+        self.sa.setMinimumHeight(100)
+        self.sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body = QWidget()
+        self.body.setObjectName("page")
+        self.body.setStyleSheet(f"#page{{background:{PANEL};}}")
+        self.bl = QVBoxLayout(self.body)
+        self.bl.setContentsMargins(2, 6, 6, 6)
+        self.bl.setSpacing(6)
+        self.bl.addStretch(1)
+        self.sa.setWidget(self.body)
+        v.addWidget(self.sa, 1)
+        # suggestions (pastilles discrètes)
+        cs = QWidget()
+        cl = QGridLayout(cs)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(6)
+        for i, (c, qq) in enumerate(self.CHIPS):
+            b = QPushButton(c)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(qq)
+            b.setMinimumWidth(0)
+            b.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {LINE};border-radius:12px;padding:4px 8px;font-size:12px;"
+                            f"font-weight:500;color:{MUT};}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
+            b.clicked.connect(lambda _=False, x=qq: self.ask(x))
+            cl.addWidget(b, i // 3, i % 3)
+        self.chips_sa = cs
+        v.addWidget(cs)
+        # saisie : champ arrondi + bouton envoyer
+        box = QFrame()
+        box.setObjectName("inbox")
+        box.setStyleSheet(f"#inbox{{background:{FIELD};border:1px solid {LINE};border-radius:20px;}}")
+        r = QHBoxLayout(box)
+        r.setContentsMargins(14, 3, 4, 3)
+        self.ed = QLineEdit()
+        self.ed.setPlaceholderText("Écris à Gaël comme à un collègue…")
+        self.ed.setStyleSheet("background:transparent;border:none;padding:6px 0;font-size:13px;")
+        self.ed.returnPressed.connect(self.ask)
+        r.addWidget(self.ed, 1)
+        sb = QPushButton("↑")
+        sb.setProperty("kind", "primary")
+        sb.setFixedSize(32, 32)
+        sb.setCursor(Qt.CursorShape.PointingHandCursor)
+        sb.setStyleSheet("border-radius:16px;font-size:16px;font-weight:800;padding:0;")
+        sb.clicked.connect(lambda: self.ask())
+        r.addWidget(sb)
+        v.addWidget(box)
+        self.set_status()
+        self.greet()
+
+    def chips_compact(self, on):
+        self._chips_hidden = on
+        if on:
+            self.chips_sa.hide()
+
+    def greet(self):
+        h = time.localtime().tm_hour
+        hi = "Noz vat" if h >= 21 or h < 5 else ("Demat" if h < 18 else "Bonsoir")
+        self.say(f"{hi} ! Moi c'est Gaël, le radio-bot. Dis-moi ce qui se passe, comme tu le dirais à un collègue : "
+                 "un souci de son, un flux qui coupe, un réglage à faire… Je te propose la solution, tu valides d'un clic.")
+
+    def set_status(self):
+        on = self.llm_on()
+        self.l_st.setText(("● en ligne · conversation avancée" if on else "● en ligne · réponses en local"))
+        self.l_st.setStyleSheet(f"color:{OKC};font-size:11px;")
+        self.l_st.setToolTip("Conversation avancée : réglable avec le bouton « Réglages » ci-contre.")
+
+    def clear(self):
+        while self.bl.count() > 1:
+            it = self.bl.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        self.history, self.pending, self.last = [], None, None
+        self.chips_sa.show()
+        self.greet()
+
+    # --- bulles
+    def bubble(self, text, me, acts):
+        w = QWidget()
+        h = QVBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        prop = (not me) and text.startswith("Réglage proposé")
+        if prop:
+            head, _, rest = text.partition("\n")
+            card = QFrame()
+            card.setObjectName("prop")
+            card.setStyleSheet(f"#prop{{background:{mixc(PANEL, ACC, .08).name()};border:1px solid {mixc(LINE, ACC, .45).name()};border-radius:16px;}}")
+            card.setMaximumWidth(460)
+            card.setMinimumWidth(min(340, max(220, self.sa.viewport().width() - 40)))
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(14, 10, 14, 12)
+            cv.setSpacing(4)
+            k0 = lab("RÉGLAGE PROPOSÉ", "")
+            k0.setStyleSheet(f"color:{MUT};font-size:10px;font-weight:700;letter-spacing:1px;")
+            cv.addWidget(k0)
+            t = lab(head.replace("Réglage proposé · ", ""), "")
+            t.setStyleSheet(f"font-weight:800;color:{ACCT};font-size:13px;")
+            cv.addWidget(t)
+            for line in rest.splitlines():
+                k, _, v_ = line.strip().partition(" : ")
+                rr = QHBoxLayout()
+                a1 = lab(k, "", True)
+                a1.setStyleSheet(f"color:{MUT};")
+                a2 = lab(v_, "", True)
+                a2.setStyleSheet("font-weight:600;")
+                a2.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                rr.addWidget(a1, 1)
+                rr.addWidget(a2, 1)
+                cv.addLayout(rr)
+            row = QHBoxLayout()
+            row.addWidget(card)
+            row.addStretch(1)
+            h.addLayout(row)
+        else:
+            l = QLabel(text.strip())
+            l.setWordWrap(True)
+            l.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            l.setMaximumWidth(470)
+            if me:
+                l.setStyleSheet(f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {ACC},stop:1 {'#ff5fa2' if PSYCHE else ACC2});"
+                                f"color:{ONACC};border-radius:18px;border-bottom-right-radius:6px;padding:8px 14px;font-size:13px;")
+            else:
+                l.setStyleSheet(f"background:{mixc(PANEL, TXT, .07).name()};color:{TXT};border-radius:18px;border-bottom-left-radius:6px;"
+                                "padding:8px 14px;font-size:13px;")
+            row = QHBoxLayout()
+            if me:
+                row.addStretch(1)
+            row.addWidget(l)
+            if not me:
+                row.addStretch(1)
+            h.addLayout(row)
+            w.lbl = l
+        if acts:
+            ar = QHBoxLayout()
+            ar.setSpacing(6)
+            bts = []
+
+            def run(fn, b):
+                for x in bts:
+                    x.setEnabled(False)
+                if b.property("kind") in ("primary", "danger"):
+                    b.setText("✓ " + b.text())
+                try:
+                    fn()
+                except Exception as ex:
+                    self.say(f"Oups, ça n'a pas marché ({ex}).", "bot")
+            for act in acts:
+                lb, fn = act[0], act[1]
+                kind = act[2] if len(act) > 2 else ""
+                b = btn(lb, kind)
+                b.clicked.connect(lambda _=False, f=fn, bb=b: run(f, bb))
+                b.setStyleSheet("padding:5px 12px;font-size:12px;border-radius:11px;" + ("" if kind else f"color:{ACCT};"))
+                b.setMinimumWidth(0)
+                bts.append(b)
+                ar.addWidget(b)
+            ar.addStretch(1)
+            h.addLayout(ar)
+        return w
+
+    def scroll_end(self):
+        for ms in (20, 120):
+            QTimer.singleShot(ms, lambda: self.sa.verticalScrollBar().setValue(self.sa.verticalScrollBar().maximum()))
+
+    def say(self, text, who="bot", actions=None):
+        if self._typing_w is not None:
+            self._typing_w.deleteLater()
+            self._typing_w = None
+        self.bl.insertWidget(self.bl.count() - 1, self.bubble(text, who == "me", actions))
+        while self.bl.count() > 61:
+            it = self.bl.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        if who == "bot":
+            self.bot.say(min(4.0, .5 + len(text) / 70.0))
+        self.scroll_end()
+
+    def stream_bubble(self):
+        """Bulle vide que la réponse remplit au fil de l'eau (conversation avancée)."""
+        if self._typing_w is not None:
+            self._typing_w.deleteLater()
+            self._typing_w = None
+        w = self.bubble("· · ·", False, None)
+        self.bl.insertWidget(self.bl.count() - 1, w)
+        self.scroll_end()
+        w.lbl.setProperty("txt", "")
+        return w.lbl
+
+    def stream_update(self, lbl, txt, final=False):
+        try:
+            if txt:
+                lbl.setText(txt.strip())
+                lbl.setProperty("txt", txt)
+                self.bot.say(.6)
+            self.scroll_end()
+        except RuntimeError:
+            pass
+
+    _typing_w = None
+
+    def ask(self, q=None):
+        q = (q if isinstance(q, str) else self.ed.text()).strip()
+        if not q:
+            return
+        self.ed.clear()
+        self.say(q, "me")
+        self.chips_sa.setVisible(self.bl.count() < 8 and not getattr(self, "_chips_hidden", False))
+        self.bot.think = True
+        if self.llm_on() and not (self.pending and self.pending.get("ask")):
+            return self.llm_ask(q)
+        self._typing_w = self.bubble("· · ·", False, None)
+        self.bl.insertWidget(self.bl.count() - 1, self._typing_w)
+
+        def reply():
+            try:
+                a = self.answer(q)
+                text, acts = a if isinstance(a, tuple) else (a, None)
+            except Exception as ex:
+                text, acts = f"Oups, je n'ai pas pu répondre ({ex}).", None
+            self.bot.think = False
+            self.say(text, "bot", acts)
+        QTimer.singleShot(220, reply)
+
+# ------------------------------------------------------------------ Annuler / rétablir (Ctrl+Z / Ctrl+Y)
+# L'historique suit la configuration (flux, playlist et dossiers du secours, cartoucheur, alertes, monitoring…) :
+# toutes les 0,6 s on compare un instantané léger ; chaque changement devient une étape annulable.
+# Les opérations sur les fichiers d'enregistrement (corbeille, déplacement, renommage) sont aussi annulables.
+class Toast(QLabel):
+    """Petit message flottant en bas de la fenêtre (« Annulé : … »)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{mixc(PANEL, TXT, .12).name()};color:{TXT};border:1px solid {LINE};border-radius:16px;"
+                           "padding:9px 18px;font-weight:600;")
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        self.fx = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.fx)
+        self.an = QVariantAnimation(self)
+        self.an.setDuration(260)
+        self.an.valueChanged.connect(lambda v: self.fx.setOpacity(float(v)))
+        self.an.finished.connect(lambda: self.hide() if self.fx.opacity() < .05 else None)
+        self.tm = QTimer(self)
+        self.tm.setSingleShot(True)
+        self.tm.timeout.connect(self.fade_out)
+        self.hide()
+
+    def show_msg(self, text, ms=3200):
+        self.setText(text)
+        self.adjustSize()
+        p = self.parentWidget()
+        self.move((p.width() - self.width()) // 2, p.height() - self.height() - 26)
+        self.show()
+        self.raise_()
+        self.an.stop()
+        self.an.setStartValue(self.fx.opacity() if self.isVisible() else 0.0)
+        self.an.setEndValue(1.0)
+        self.an.start()
+        self.tm.start(ms)
+
+    def fade_out(self):
+        self.an.stop()
+        self.an.setStartValue(1.0)
+        self.an.setEndValue(0.0)
+        self.an.start()
+
+
+class UndoMixin:
+    UNDO_MAX = 80
+
+    def undo_init(self):
+        from PySide6.QtGui import QShortcut
+        self.undo_stack, self.redo_stack, self._undoing = [], [], False
+        self.toast_w = Toast(self.centralWidget())
+        self._snap = self.undo_snapshot()
+        self._undo_tm = QTimer(self)
+        self._undo_tm.timeout.connect(self.undo_watch)
+        self._undo_tm.start(600)
+        for seq, fn in ((QKeySequence.StandardKey.Undo, self.undo), (QKeySequence.StandardKey.Redo, self.redo), (QKeySequence("Ctrl+Y"), self.redo)):
+            sc = QShortcut(seq, self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(fn)
+
+    def toast(self, text, ms=3200):
+        try:
+            self.toast_w.show_msg(text, ms)
+        except Exception:
+            pass
+
+    # --- instantanés
+    def undo_snapshot(self):
+        try:
+            p = json.loads(json.dumps(self.collect_profile()))
+        except Exception:
+            return getattr(self, "_snap", "{}")
+        p.get("fallback", {}).pop("counts", None)
+        return json.dumps({"prof": p, "alerts": self.data.get("alerts", {}), "mon": self.data.get("monitor", {}).get("streams", [])},
+                          sort_keys=True, ensure_ascii=False)
+
+    @staticmethod
+    def undo_label(a, b):
+        try:
+            A, B = json.loads(a), json.loads(b)
+        except ValueError:
+            return "modification"
+        pa, pb = A["prof"], B["prof"]
+        oa, ob = pa.get("outputs", []), pb.get("outputs", [])
+        if len(ob) < len(oa):
+            gone = [o["name"] for o in oa if o["id"] not in {x["id"] for x in ob}]
+            return "suppression du flux « " + ", ".join(gone) + " »" if gone else "suppression de flux"
+        if len(ob) > len(oa):
+            return "ajout d'un flux"
+        if oa != ob:
+            return "modification d'un flux"
+        fa, fb = pa.get("fallback", {}), pb.get("fallback", {})
+        if fa.get("playlist") != fb.get("playlist"):
+            d = len(fb.get("playlist", [])) - len(fa.get("playlist", []))
+            return f"retrait de {-d} titre(s) de la playlist de secours" if d < 0 else (f"ajout de {d} titre(s) à la playlist de secours" if d > 0 else "ordre de la playlist de secours")
+        if fa.get("folders") != fb.get("folders") or fa.get("folder_of") != fb.get("folder_of"):
+            return "dossiers de la playlist de secours"
+        if fa.get("off") != fb.get("off"):
+            return "rotation de la playlist de secours"
+        if fa != fb:
+            return "réglages de la playlist de secours"
+        if pa.get("carts") != pb.get("carts"):
+            return "cartoucheur"
+        for k, lb in (("meta", "titre affiché"), ("gain", "gain d'entrée"), ("delay", "retard de sécurité"), ("source", "entrée audio"), ("cover", "pochette")):
+            if pa.get(k) != pb.get(k):
+                return lb
+        if A.get("alerts") != B.get("alerts"):
+            return "alertes de panne"
+        if A.get("mon") != B.get("mon"):
+            return "monitoring"
+        return "modification"
+
+    def undo_watch(self):
+        if self._undoing or not self.isVisible():
+            return
+        snap = self.undo_snapshot()
+        if snap != self._snap:
+            self.undo_stack.append(("state", self._snap, self.undo_label(self._snap, snap)))
+            del self.undo_stack[:-self.UNDO_MAX]
+            self.redo_stack.clear()
+            self._snap = snap
+
+    def undo_push_files(self, moves, label):
+        """moves : [(chemin actuel, chemin d'origine)] pour pouvoir remettre les fichiers en place."""
+        if moves:
+            self.undo_watch()                  # d'abord les réglages en attente, pour que l'opération fichiers soit bien la dernière
+            self.undo_stack.append(("files", moves, label))
+            del self.undo_stack[:-self.UNDO_MAX]
+            self.redo_stack.clear()
+
+    # --- application
+    def undo_restore(self, snap):
+        self._undoing = True
+        try:
+            d = json.loads(snap)
+            before = {c["id"]: c for c in self.outputs_cfg}
+            self.apply_profile(d["prof"])
+            self.data["alerts"].clear()
+            self.data["alerts"].update(d.get("alerts", {}))
+            ms = self.data.setdefault("monitor", {}).setdefault("streams", [])
+            ms[:] = d.get("mon", [])
+            self.mon_streams = ms
+            self.rebuild_mon()
+            self.alert_summary()
+            if self.on_air:                    # garder l'antenne en phase : flux retirés / ajoutés / modifiés
+                after = {c["id"]: c for c in self.outputs_cfg}
+                for oid in before:
+                    if oid not in after:
+                        self.live_remove(oid)
+                for oid, c in after.items():
+                    if before.get(oid) != c:
+                        self.apply_live(c) if c.get("enabled", True) else self.live_remove(oid)
+            self._snap = self.undo_snapshot()
+        finally:
+            self._undoing = False
+
+    def undo_files(self, moves):
+        back, errs = [], 0
+        for cur, orig in moves:
+            try:
+                os.makedirs(os.path.dirname(orig), exist_ok=True)
+                shutil.move(cur, orig)
+                back.append((orig, cur))
+            except OSError:
+                errs += 1
+        if hasattr(self, "rec_files"):
+            self.rec_files()
+        return back, errs
+
+    def undo(self):
+        self.undo_watch()
+        if not self.undo_stack:
+            return self.toast("Rien à annuler")
+        kind, data, label = self.undo_stack.pop()
+        if kind == "state":
+            cur = self.undo_snapshot()
+            self.undo_restore(data)
+            self.redo_stack.append(("state", cur, label))
+        else:
+            back, errs = self.undo_files(data)
+            self.redo_stack.append(("files", back, label))
+            if errs:
+                label += f" ({errs} fichier(s) introuvable(s))"
+        self.toast(f"Annulé : {label}   ·   Ctrl+Y pour rétablir")
+        self.log(f"Annulé : {label}")
+
+    def redo(self):
+        if not self.redo_stack:
+            return self.toast("Rien à rétablir")
+        kind, data, label = self.redo_stack.pop()
+        if kind == "state":
+            cur = self.undo_snapshot()
+            self.undo_restore(data)
+            self.undo_stack.append(("state", cur, label))
+        else:
+            back, _ = self.undo_files(data)
+            self.undo_stack.append(("files", back, label))
+        self.toast(f"Rétabli : {label}")
+        self.log(f"Rétabli : {label}")
+
+# ------------------------------------------------------------------ fenêtre principale
+PAGE_KEYS = ["diff", "son", "cart", "rec", "mon", "net", "sos", "set", "about"]
+PAGE_TITLES = {"diff": "Diffusion", "son": "Traitement son", "cart": "Cartoucheur", "rec": "Enregistrement", "mon": "Monitoring",
+               "net": "Réseau", "sos": "SOS", "set": "Réglages", "about": "À propos"}
+AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac")
+JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre")
+MINI_W = 176
+
+
+def default_cover_pm(size=96):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHints(QPainter.RenderHint.Antialiasing)
+    g = QLinearGradient(0, 0, size, size)
+    g.setColorAt(0, QColor(mixc(PANEL, ACC, .25)))
+    g.setColorAt(1, QColor(mixc(PANEL, "#a76bff" if PSYCHE else ACC2, .25)))
+    p.setBrush(QBrush(g))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(QRectF(0, 0, size, size), size * .16, size * .16)
+    draw_logo(p, size / 2, size / 2, size * .36, None, 3, 0.0, tile=False, sea=False)
+    p.end()
+    return pm
+
+
+class FitPage(QWidget):
+    pass
+
+
+
+
+class BotButton(QWidget):
+    """Gaël (petit format) cliquable dans la barre du haut."""
+    clicked = Signal()
+
+    def __init__(self, w=34, h=44):
+        super().__init__()
+        self.setFixedSize(w, h)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Gaël · ton assistant d'antenne (onglet SOS)")
+        self.blink, self.talk, self.air = False, 0, False
+
+    def mouseReleaseEvent(self, e):
+        self.clicked.emit()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        paint_bot(p, 4, 6, 26, self.blink, self.talk, self.air)
+
+
+class CLabel(QLabel):
+    """Étiquette dont la couleur change souvent (état d'antenne, signal…) : la couleur est appliquée au dessin, sans
+    feuille de style (changer une feuille de style recalcule le style et la mise en page du widget à chaque fois)."""
+
+    def __init__(self, text="", name="", wrap=False, color=None):
+        super().__init__(text)
+        if name:
+            self.setObjectName(name)
+        self.setWordWrap(wrap)
+        self._col = color
+
+    def set_color(self, c):
+        if c != self._col:
+            self._col = c
+            self.update()
+
+    def paintEvent(self, e):
+        if self._col is None:
+            return super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setFont(self.font())
+        p.setPen(QColor(self._col))
+        fl = int(self.alignment().value if hasattr(self.alignment(), "value") else self.alignment())
+        if self.wordWrap():
+            fl |= int(Qt.TextFlag.TextWordWrap.value if hasattr(Qt.TextFlag.TextWordWrap, "value") else Qt.TextFlag.TextWordWrap)
+        p.drawText(self.contentsRect(), fl, self.text())
+
+
+class Banner(QLabel):
+    """Bandeau d'alerte (rupture de flux…) : la couleur qui pulse est peinte directement, sans feuille de style."""
+
+    def __init__(self):
+        super().__init__("")
+        self.setStyleSheet("font-weight:800;font-size:14px;")
+        self.bg, self.fg = QColor("#c4263a"), QColor("white")
+
+    def set_colors(self, bg, fg):
+        bg, fg = QColor(bg), QColor(fg)
+        if (bg.rgb(), fg.rgb()) != (self.bg.rgb(), self.fg.rgb()):
+            self.bg, self.fg = bg, fg
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.bg)
+        p.drawRoundedRect(QRectF(self.rect()), 10, 10)
+        p.setFont(self.font())
+        p.setPen(self.fg)
+        p.drawText(QRectF(self.rect()).adjusted(8, 0, -8, 0), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class RootWidget(QWidget):
+    """Fond de la fenêtre. En cas de rupture, un cadre coloré est peint ici : avant, une feuille de style posée sur la
+    fenêtre entière forçait Qt à recalculer le style de TOUS les widgets (gel visible au début et à la fin d'une alerte)."""
+
+    def __init__(self):
+        super().__init__()
+        self.border = None
+
+    def set_border(self, col):
+        if col != self.border:
+            self.border = col
+            self.update()
+
+    def paintEvent(self, e):
+        if not self.border:
+            return
+        p = QPainter(self)
+        p.fillRect(e.rect(), mixc(PAGE, self.border, .08))
+        p.setPen(QPen(QColor(self.border), 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5))
+
+
+class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, PagesMixin4, QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.root = self
+        self.data = load_data()
+        S = self.data.setdefault("settings", {})
+        st = (S.get("station") or "").strip()
+        self.setWindowTitle((st + " · " if st else "") + APP)
+        self.resize(1360, 880)
+        self.setMinimumSize(1100 if NAVTOP else 1240, 680)   # en dessous, certaines pages devraient défiler
+        self.cur = self.data["last"]
+        self.prof = upgrade(json.loads(json.dumps(self.data["profiles"][self.cur])))
+        norm_carts(self.prof["carts"])
+        self.engine, self.preview = None, False
+        self.bridge = Bridge()
+        self.bridge.logged.connect(self.add_log)
+        self.bridge.call.connect(lambda fn: fn())
+        self.alerts = Alerts(self)
+        self.log_lines, self.log_rec = [], []
+        self.waves = WaveLoader()
+        self.waves.done.connect(self.wave_ready)
+        self.cur_set = 0
+        self.tiles = []
+        self.cart_flash = {}
+        self.page_key = "diff"
+        self.mon_state, self.mon_stats, self.mon_started = {}, {}, {}
+        self.mon_running = set()
+        self.sem = threading.Semaphore(4)
+        self.cover_cache, self.cover_shown, self.cover_pm = {}, "?", None
+        self.pl_info, self.pl_cov, self.pl_cov_raw = {}, {}, {}
+        self.playlist, self.pl_off, self.pl_folders, self.pl_folder, self.pl_view, self.jingles = [], set(), [], {}, None, []
+        self.dev_map, self.cover_path = {}, ""
+        self.bot_t, self.bot_talk, self.upd_info, self.upd_bubble = 0, 0, None, None
+        self._closing = False
+        self._proc_off, self.slot = False, None
+        self._build()
+        self.apply_profile(self.prof)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.timer.start(Gov.ivl(16))           # 30 i/s visés ; si la machine ne suit pas, le régulateur (Gov) allège les décors
+        Gov.reg(self.timer, 16)
+        Ticker.drive()
+        self._live_any, self._pk = False, ([-90.0, -90.0], [-90.0, -90.0], 0.0)
+        self.slow_n = 0
+        self.bot_timer = QTimer(self)
+        self.bot_timer.timeout.connect(self.bot_tick)
+        self.bot_timer.start(140)
+        self.setAcceptDrops(True)
+        self.add_log("Mat eo ! Bienvenue.")
+        self.go_tab(S.get("start_tab", "diff") if S.get("start_tab") in PAGE_KEYS else "diff")
+        self.apply_settings(first=True)
+        self.undo_init()
+        self.props_init()
+        QTimer.singleShot(0, self.apply_compact)
+        self.midi, self.midi_learn = None, None
+        QTimer.singleShot(1500, lambda: (self.midi_start(), self.midi_label_update()))
+        QTimer.singleShot(400, self.refresh_devices)
+        QTimer.singleShot(0, self.prewarm)                 # processus moteur prêt avant le premier « Démarrer »
+        if self.data.get("autostart"):
+            QTimer.singleShot(2000, lambda: None if self.engine else self.start())
+        if (UPDATE_REPO or S.get("update_repo")) and S.get("update_check", True):
+            QTimer.singleShot(4000, lambda: self.update_start(False))
+        if not self.data.get("np_tried") and np is None:
+            self.data["np_tried"] = True
+            QTimer.singleShot(4000, lambda: self.install("numpy"))
+
+    # ------------------------------------------------------------ construction
+    def _build(self):
+        root = RootWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        S = self.data.get("settings", {})
+        if NAVTOP:
+            outer = QVBoxLayout(root)
+        else:
+            outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.rail = TopNav() if NAVTOP else Rail()
+        self.nav_w = self.rail
+        self.rail.selected.connect(self.go_tab)
+        self.rail.set_title(S.get("station", ""))
+        self.bot_btn = None
+        if NAVTOP:
+            nb = QWidget()
+            nb.setStyleSheet(f"background:{RAIL};")
+            nh = QHBoxLayout(nb)
+            nh.setContentsMargins(0, 0, 10, 0)
+            nh.setSpacing(6)
+            nh.addWidget(self.rail, 1)
+            self.bot_btn = BotButton()
+            self.bot_btn.clicked.connect(lambda: self.go_tab("sos"))
+            nh.addWidget(self.bot_btn)
+            ck = QVBoxLayout()
+            ck.setSpacing(0)
+            ck.setContentsMargins(0, 3, 0, 2)
+            self.l_clock = lab("", "")
+            self.l_clock.setStyleSheet("font-size:19px;font-weight:700;")
+            self.l_clock.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.l_date = lab("", "mut")
+            self.l_date.setStyleSheet(f"font-size:11px;color:{MUT};")
+            self.l_date.setAlignment(Qt.AlignmentFlag.AlignRight)
+            ck.addWidget(self.l_clock)
+            ck.addWidget(self.l_date)
+            nh.addLayout(ck)
+            outer.addWidget(nb)
+        else:
+            self.rail.bot_clicked.connect(lambda: self.go_tab("sos"))
+            outer.addWidget(self.rail)
+        shell = QVBoxLayout()
+        shell.setContentsMargins(22, 4 if NAVTOP else 10, 18, 8)
+        shell.setSpacing(8)
+        outer.addLayout(shell, 1)
+        self.banner = Banner()
+        self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.banner.setMinimumHeight(34)
+        self.banner.hide()
+        shell.addWidget(self.banner)
+        self.alert_on = False
+        # ---- en-tête
+        hd = QHBoxLayout()
+        hd.setSpacing(8)
+        tl = QVBoxLayout()
+        tl.setSpacing(0)
+        self.l_title = lab("Diffusion", "")
+        self.l_title.setStyleSheet("font-size:24px;font-weight:800;")
+        self.l_beta = lab("BÊTA", "")
+        self.l_beta.setStyleSheet(f"background:{qc(HUE['son'] if PSYCHE else ACC, 46).name(QColor.NameFormat.HexArgb)};color:{HUE['son'] if PSYCHE else ACCT};"
+                                  "font-size:10px;font-weight:800;letter-spacing:1px;border-radius:9px;padding:2px 8px;")
+        self.l_beta.setToolTip("Fonction en cours de mise au point : tes retours sont les bienvenus.")
+        self.l_beta.hide()
+        if not NAVTOP:
+            trow = QHBoxLayout()
+            trow.setSpacing(10)
+            trow.addWidget(self.l_title)
+            trow.addWidget(self.l_beta, 0, Qt.AlignmentFlag.AlignVCenter)
+            trow.addStretch(1)
+            tl.addLayout(trow)
+            if PSYCHE:
+                tl.addWidget(AuroraBar())
+            elif OCEAN:
+                tl.addWidget(WaveBar(120, 8))
+            hd.addLayout(tl)
+        hd.addSpacing(10)
+        self.cb_prof = QComboBox()                       # liste réelle des profils (cachée) : le bouton ci-dessous la présente en menu
+        self.cb_prof.addItems(list(self.data["profiles"]))
+        self.cb_prof.setCurrentText(self.cur)
+        self.cb_prof.hide()
+        self.btn_prof = btn("")
+        self.btn_prof.setMinimumWidth(130)
+        self.btn_prof.setMaximumWidth(230)
+        self.m_prof = QMenu(self.btn_prof)
+        self.m_prof.aboutToShow.connect(self.prof_menu)
+        self.btn_prof.setMenu(self.m_prof)
+        hd.addWidget(self.btn_prof)
+        self.prof_label()
+        hd.addStretch(1)
+
+        if not NAVTOP:
+            ck = QVBoxLayout()
+            ck.setSpacing(0)
+            self.l_clock = lab("", "")
+            self.l_clock.setStyleSheet("font-size:24px;font-weight:700;")
+            self.l_clock.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.l_date = lab("", "mut")
+            self.l_date.setStyleSheet(f"font-size:12px;color:{MUT};")
+            self.l_date.setAlignment(Qt.AlignmentFlag.AlignRight)
+            ck.addWidget(self.l_clock)
+            ck.addWidget(self.l_date)
+            hd.addLayout(ck)
+        self.steady_labels()
+        QTimer.singleShot(0, self.fit_air_label)
+        self.air_fx = AirWaves()
+        hd.addWidget(self.air_fx)
+        self.l_air = CLabel("○ Hors antenne", color=MUT)
+        self.l_air.setStyleSheet("font-weight:700;")
+        self.l_air.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.fit_air_label()
+        hd.addWidget(self.l_air)
+        self.steady_labels()
+        self.btn_full = btn("Plein écran", "", self.toggle_fullscreen)
+        hd.addWidget(self.btn_full)
+        self.btn_start = btn("Démarrer", "primary", self.toggle)
+        self.btn_start.setMinimumSize(130, 40)
+        self.btn_start.setStyleSheet("font-size:14px;")
+        hd.addWidget(self.btn_start)
+        shell.addLayout(hd)
+        # ---- bandeau « en lecture »
+        bar = Card()
+        bar.lay.setContentsMargins(10, 5, 14, 5)
+        bh = QHBoxLayout()
+        bh.setSpacing(12)
+        self.mini_lbl = QLabel("♪")
+        self.mini_lbl.setFixedSize(38, 38)
+        self.mini_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mini_lbl.setStyleSheet("background:#1a1f2b;color:#566074;font-size:18px;border-radius:8px;")
+        bh.addWidget(self.mini_lbl)
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        self.now_main = CLabel("○ Rien en lecture", color=MUT)
+        self.now_main.setStyleSheet("font-weight:700;")
+        self.now_sub = lab("", "")
+        self.now_sub.setStyleSheet(f"color:{ACCT};")
+        col.addWidget(self.now_main)
+        col.addWidget(self.now_sub)
+        bh.addLayout(col, 1)
+        self.cart_now = CartNow()
+        self.cart_now.clicked.connect(lambda: self.engine and self.engine.stop_cart())
+        bh.addWidget(self.cart_now)
+        self.l_net = lab("Réseau : détection…", "")
+        self.l_net.setStyleSheet(f"background:{FIELD};color:{MUT};font-weight:700;border-radius:12px;padding:4px 14px;")
+        self.l_net.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.l_net.setMinimumWidth(250)
+        self.l_net.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.l_net.mouseReleaseEvent = lambda _e: self.go_tab("net")
+        bh.addWidget(self.l_net)
+        self.mini_in = MiniMeter(MINI_W, "ENTRÉE")
+        self.mini_out = MiniMeter(MINI_W, "ANTENNE")
+        bh.addWidget(self.mini_in)
+        bh.addWidget(self.mini_out)
+        bar.lay.addLayout(bh)
+        shell.addWidget(bar)
+        # ---- pages
+        self.stack = QStackedWidget()
+        shell.addWidget(self.stack, 1)
+        builders = {"diff": self._page_diffusion, "son": self._page_son, "cart": self._page_cart, "rec": self._page_record,
+                    "mon": self._page_mon, "net": self._page_net, "sos": self._page_sos, "set": self._page_settings, "about": self._page_about}
+        for k in PAGE_KEYS:
+            self.stack.addWidget(builders[k]())
+        for v in self.findChildren(QTableWidget) + self.findChildren(QListWidget):   # même surbrillance de ligne partout
+            style_table(v)
+        if hasattr(self.rail, "gael"):
+            self.rail.gael.app = self
+
+    def go_tab(self, key):
+        if key not in PAGE_KEYS:
+            return
+        self.page_key = key
+        self.stack.setCurrentIndex(PAGE_KEYS.index(key))
+        self.rail.select(key)
+        self.l_title.setText({"son": "Traitement", "mon": "Monitoring"}.get(key, PAGE_TITLES[key]) if NAVTOP else PAGE_TITLES[key])
+        self.compact_header()
+        self.l_title.setMinimumWidth(self.l_title.fontMetrics().horizontalAdvance(self.l_title.text()) + 6)
+        if key == "rec":
+            self.rec_visit = time.time()
+            self.rec_sig = None
+            QTimer.singleShot(0, self.rec_tick)
+        if key == "cart":
+            QTimer.singleShot(0, self.resize_tiles)
+
+    # ------------------------------------------------------------ utilitaires
+    def log(self, msg):
+        self.bridge.logged.emit(msg)
+
+    def ui(self, fn, *args):
+        self.bridge.call.emit(lambda: fn(*args))
+
+    def add_log(self, msg):
+        line = f"{time.strftime('%H:%M:%S')}  {msg}"
+        if self.data.get("settings", {}).get("daily_log"):
+            self.daily_log(line)
+        self.log_lines.append(line)
+        del self.log_lines[:-2000]
+        ts, cls = time.strftime("%H:%M:%S"), log_class(msg)
+        self.log_rec.append((ts, msg, cls))
+        del self.log_rec[:-2000]
+        if hasattr(self, "logbox2"):
+            if self.journal_pass(ts, msg, cls):
+                self.logbox2.append(log_html(ts, msg))
+            if cls == "bad":
+                self.l_jcount.setText("⚠")
+        if hasattr(self, "l_last"):
+            self.l_last.setText(msg[:140])
+
+    @property
+    def on_air(self):
+        return bool(self.engine and self.engine.running and not self.preview)
+
+    @property
+    def standalone(self):
+        return bool(self.engine and self.engine.standalone)
+
+    def device_name(self):
+        return self.cur_device
+
+    # ------------------------------------------------------------ horloge, Radiobot
+    def clock_tick(self):
+        t = time.localtime()
+        s = time.strftime("%H:%M:%S", t)
+        if s != getattr(self, "_clk", ""):
+            self._clk = s
+            self.l_clock.setText(s)
+            hi = "Noz vat" if (t.tm_hour >= 22 or t.tm_hour < 5) else "Demat"
+            self.l_date.setText(f"{hi} · {JOURS[t.tm_wday]} {t.tm_mday} {MOIS[t.tm_mon - 1]}")
+
+    def bot_tick(self):
+        self.bot_t += 1
+        if self.bot_talk > 0:
+            self.bot_talk -= 1
+        if calm() or not self.isVisible():
+            return
+        blink = self.bot_t % 22 in (0, 1)
+        air = bool(self.on_air)
+        for w in (self.nav_w, self.bot_btn):
+            if w is None:
+                continue
+            if (w.bot_blink if hasattr(w, "bot_blink") else w.blink, w.air) != (blink, air) or getattr(w, "talk", None) != self.bot_talk:
+                if hasattr(w, "bot_blink"):
+                    w.bot_blink = blink                  # le menu ne dessine pas le petit robot : pas de repeint pour un clin d'œil
+                    if w.air == air:
+                        continue
+                    w.air = air
+                else:
+                    w.blink, w.air, w.talk = blink, air, self.bot_talk
+                w.update()
+
+    def fit_air_label(self, text=""):
+        """Largeur de « EN ANTENNE 00:00:00 » mesurée avec la vraie police (après feuille de style, mise à l'échelle Windows
+        comprise) ; elle ne fait que grandir si besoin, jamais rétrécir : le texte n'est plus coupé et la ligne ne bouge pas."""
+        l = self.l_air
+        l.ensurePolished()
+        fm = l.fontMetrics()
+        f = QFont(l.font())
+        f.setBold(True)
+        fmb = QFontMetrics(f)
+        need = max(max(fm.horizontalAdvance(t), fmb.horizontalAdvance(t)) for t in
+                   ("●  EN ANTENNE  00:00:00", "●  EN ANTENNE  88:88:88", "Cartoucheur hors antenne", "Contrôle d'entrée",
+                    "◌  Connexion des flux…", "✕  Aucun flux en ligne", text)) + 22
+        if need > l.minimumWidth():
+            l.setFixedWidth(need)
+
+    def steady_labels(self):
+        """Horloge, date et état d'antenne à largeur fixe et chiffres tabulaires : plus rien ne bouge à chaque seconde."""
+        for l in (self.l_clock, self.l_date, getattr(self, "l_air", None)):
+            if l is None:
+                continue
+            f = l.font()
+            try:
+                f.setFeature(QFont.Tag("tnum"), 1)
+            except Exception:
+                pass
+            l.setFont(f)
+        fm = QFontMetrics(QFont(self.l_clock.font().family(), 1))
+        big = QFont(self.l_clock.font())
+        big.setPixelSize(24 if not NAVTOP else 19)
+        big.setBold(True)
+        self.l_clock.setFixedWidth(QFontMetrics(big).horizontalAdvance("00:00:00") + 10)
+        small = QFont(self.l_date.font())
+        small.setPixelSize(12 if not NAVTOP else 11)
+        self.l_date.setFixedWidth(QFontMetrics(small).horizontalAdvance("Noz vat · mercredi 30 septembre") + 8)
+
+    def toggle_fullscreen(self):
+        full = not self.isFullScreen()
+        self.showFullScreen() if full else self.showNormal()
+        self.btn_full.setText("Quitter le plein écran" if full else "Plein écran")
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_F11:
+            return self.toggle_fullscreen()
+        if e.key() == Qt.Key.Key_Escape:
+            if self.isFullScreen():
+                return self.toggle_fullscreen()
+            if self.engine:
+                self.engine.stop_cart()
+            return
+        if hasattr(self, "cart_key") and self.cart_key(e):
+            return
+        super().keyPressEvent(e)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        RZ[0] = time.time() + .3
+        if hasattr(self, "l_beta"):
+            self.compact_header()
+        QTimer.singleShot(0, self.apply_compact)
+
+    def apply_compact(self):
+        """Adapte toutes les pages à la hauteur disponible : en dessous de 720 px de page, cartes plus serrées et
+        sous-titres masqués ; en dessous de 600 px, on range aussi les éléments décoratifs (anecdote, forme d'onde…)."""
+        if not hasattr(self, "stack"):
+            return
+        avail = self.stack.height()
+        lvl = 0 if avail >= 720 else (1 if avail >= 600 else 2)
+        if lvl == getattr(self, "_compact_lvl", -1):
+            return
+        self._compact_lvl = lvl
+        for c in self.findChildren(Card):
+            c.set_compact(lvl >= 1)
+        if getattr(self, "facts", None) is not None:
+            self.facts.set_mini(lvl >= 1)
+            self.facts.setVisible(not MINI)
+        if hasattr(self, "wave"):
+            self.wave.setVisible(lvl < 2 and not MINI)
+        if hasattr(self, "al_phone"):
+            self.al_phone.set_small(lvl >= 1)
+            self.al_sub.setVisible(lvl < 1)
+        if hasattr(self, "assistant"):
+            self.assistant.chips_compact(lvl >= 1)
+        if hasattr(self, "eqc"):
+            self.eqc.setMinimumHeight(110 if lvl < 1 else 76)
+            self.eqc.setMaximumHeight(16777215 if lvl < 1 else 96)
+
+    def compact_header(self):
+        """Fenêtre étroite : on replie l'antenne décorative et « Plein écran » (F11 reste dispo) pour que l'en-tête ne se chevauche jamais."""
+        wide = self.width() >= 1320
+        self.l_beta.setVisible(self.page_key == "son" and not NAVTOP and wide)
+        self.air_fx.setVisible(wide)
+        self.btn_full.setVisible(wide or self.isFullScreen())
+        if hasattr(self, "sa") and self.page_key == "cart":
+            QTimer.singleShot(0, self.resize_tiles)
+
+    # ------------------------------------------------------------ profils
+    def collect_profile(self):
+        fb = self.prof["fallback"]
+        e = self.fb_ed
+        self.prof.update({
+            "source": {"device": self.cur_device.strip()},
+            "fallback": {"enabled": self.sw_fb.isChecked(), "shuffle": self.sw_shuf.isChecked(), "threshold": e["threshold"].text().strip(),
+                         "silence_s": e["silence_s"].text().strip(), "recover_s": e["recover_s"].text().strip(), "fade_in": e["fade_in"].text().strip(),
+                         "fade_out": e["fade_out"].text().strip(), "playlist": list(self.playlist), "off": sorted(self.pl_off),
+                         "folders": list(self.pl_folders), "folder_of": dict(self.pl_folder), "counts": self.data.setdefault("counts", {}),
+                         "jingle": {"enabled": self.sw_jingle.isChecked(), "every": str(self.sp_jevery.value()), "files": list(self.jingles)}},
+            "meta": {"text": self.ed_meta.text(), "follow": self.sw_follow.isChecked()},
+            "delay": str(self.sp_delay.value()), "gain": str(self.sl_gain.value()), "cover": self.cover_path})
+        c = self.prof["carts"]
+        c.update(duck=int(self.sl_duck.value()), fade_click=self.sl_fc.value() / 10, device="" if self.cb_cdev.currentText() == NODEV else self.cb_cdev.currentText(),
+                 route=ROUTES[0], solo=self.sw_solo.isChecked())
+        return self.prof
+
+    def apply_profile(self, p):
+        p = upgrade(json.loads(json.dumps(p)))
+        self.prof = p
+        norm_carts(p["carts"])
+        fb = p["fallback"]
+        self._loading = True
+        try:
+            self.cur_device = p["source"]["device"]
+            self.sync_device_selection()
+            self.sw_fb.setChecked(bool(fb["enabled"]))
+            self.sw_shuf.setChecked(bool(fb["shuffle"]))
+            for k in ("threshold", "silence_s", "recover_s"):
+                self.fb_ed[k].setText(str(fb[k]))
+            self.fb_ed["fade_in"].setText(str(fb.get("fade_in", "0.5")))
+            self.fb_ed["fade_out"].setText(str(fb.get("fade_out", "1.2")))
+            self.sw_jingle.setChecked(bool(fb["jingle"]["enabled"]))
+            try:
+                self.sp_jevery.setValue(int(float(fb["jingle"]["every"])))
+            except (TypeError, ValueError):
+                self.sp_jevery.setValue(15)
+            self.jingles = list(fb["jingle"]["files"])
+            self.playlist = list(fb["playlist"])
+            self.pl_off = set(fb.get("off", []))
+            self.pl_folders = list(fb.get("folders", []))
+            self.pl_folder = {k: v for k, v in dict(fb.get("folder_of", {})).items() if v in self.pl_folders}
+            self.pl_view = None
+            self.ed_meta.setText(p["meta"]["text"])
+            self.sw_follow.setChecked(bool(p["meta"]["follow"]))
+            try:
+                self.sp_delay.setValue(int(float(p["delay"])))
+            except (TypeError, ValueError):
+                self.sp_delay.setValue(0)
+            try:
+                self.sl_gain.setValue(int(float(p["gain"])))
+            except (TypeError, ValueError):
+                self.sl_gain.setValue(0)
+            self.cover_path = p["cover"]
+            c = p["carts"]
+            self.cb_route.setCurrentText(ROUTES[0])          # choix de route retiré : le cartoucheur joue à l'antenne (Maj + clic = sortie audio seule)
+            self.sw_solo.setChecked(bool(c["solo"]))
+            self.sl_duck.setValue(int(c["duck"]))
+            try:
+                self.sl_fc.setValue(int(round(float(c.get("fade_click", 2.5)) * 10)))
+            except (TypeError, ValueError):
+                self.sl_fc.setValue(25)
+        finally:
+            self._loading = False
+        self.live_gain()
+        self.pl_refresh()
+        self.refresh_outputs()
+        self.cur_set = 0
+        self.refresh_sets()
+        self.fb_summary()
+        self.sync_cart_device()
+        self.cover_shown = "?"
+
+    def save_all(self):
+        self.collect_profile()
+        self.data["profiles"][self.cur] = self.prof
+        self.data["last"] = self.cur
+        self.data["autostart"] = self.sw_auto.isChecked()
+        self.sync_net()
+        self.sync_alerts()
+        try:
+            save_data(self.data)
+        except OSError as e:
+            self.log(f"Enregistrement des réglages impossible : {e}")
+
+    def save_all_raw(self):
+        try:
+            save_data(self.data)
+        except OSError:
+            pass
+
+    def prof_label(self):
+        t = self.cb_prof.currentText() or self.cur
+        self.btn_prof.setText("Profil · " + (t if len(t) <= 16 else t[:15] + "…"))
+        self.btn_prof.setToolTip("Profil de réglages : " + t)
+
+    def prof_menu(self):
+        m = self.m_prof
+        m.clear()
+        for n in self.data["profiles"]:
+            a = m.addAction(n)
+            a.setCheckable(True)
+            a.setChecked(n == self.cur)
+            a.triggered.connect(lambda _=False, n=n: (self.cb_prof.setCurrentText(n), self.on_profile()))
+        m.addSeparator()
+        m.addAction("Nouveau profil à partir de celui-ci…", self.new_profile)
+        m.addAction("Renommer…", self.rename_profile)
+        m.addAction("Enregistrer", self.save_profile)
+        m.addAction("Supprimer", self.delete_profile)
+
+    def new_profile(self):
+        n, ok = QInputDialog.getText(self, "Nouveau profil", "Nom du profil :")
+        if ok and n.strip():
+            self.cb_prof.setEditable(True)
+            self.cb_prof.setCurrentText(n.strip())
+            self.save_profile()
+
+    def rename_profile(self):
+        n, ok = QInputDialog.getText(self, "Renommer le profil", "Nouveau nom :", text=self.cur)
+        n = n.strip()
+        if not (ok and n) or n == self.cur or self.engine:
+            return
+        self.collect_profile()
+        self.data["profiles"][n] = self.data["profiles"].pop(self.cur)
+        self.cur = n
+        self.cb_prof.blockSignals(True)
+        self.cb_prof.clear()
+        self.cb_prof.addItems(list(self.data["profiles"]))
+        self.cb_prof.setCurrentText(n)
+        self.cb_prof.blockSignals(False)
+        self.data["last"] = n
+        self.prof_label()
+
+    def on_profile(self, *_):
+        if self.engine:
+            self.cb_prof.setCurrentText(self.cur)
+            return info(self, "Profil", "Arrête la diffusion avant de changer de profil.")
+        name = self.cb_prof.currentText()
+        if name not in self.data["profiles"]:
+            return
+        self.collect_profile()
+        self.data["profiles"][self.cur] = self.prof
+        self.cur = name
+        self.apply_profile(self.data["profiles"][name])
+        self.data["last"] = name
+        self.prof_label()
+
+    def save_profile(self):
+        name = self.cb_prof.currentText().strip()
+        if not name:
+            return info(self, "Profil", "Donne un nom au profil.")
+        self.cur = name
+        self.save_all()
+        self.cb_prof.blockSignals(True)
+        self.cb_prof.clear()
+        self.cb_prof.addItems(list(self.data["profiles"]))
+        self.cb_prof.setCurrentText(name)
+        self.cb_prof.blockSignals(False)
+        self.prof_label()
+        self.log(f"Profil « {name} » enregistré.")
+
+    def delete_profile(self):
+        name = self.cb_prof.currentText()
+        if name not in self.data["profiles"] or self.engine:
+            return
+        if not yes(self, "Supprimer", f"Supprimer le profil « {name} » ?"):
+            return
+        del self.data["profiles"][name]
+        if not self.data["profiles"]:
+            self.data["profiles"]["Défaut"] = default_profile()
+        self.cur = next(iter(self.data["profiles"]))
+        self.cb_prof.blockSignals(True)
+        self.cb_prof.clear()
+        self.cb_prof.addItems(list(self.data["profiles"]))
+        self.cb_prof.setCurrentText(self.cur)
+        self.cb_prof.blockSignals(False)
+        self.apply_profile(self.data["profiles"][self.cur])
+
+    # ------------------------------------------------------------ page Diffusion
+    def _page_diffusion(self):
+        w = FitPage()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 4, 0)
+        h.setSpacing(12)
+        left, right = QVBoxLayout(), QVBoxLayout()
+        left.setSpacing(10)
+        right.setSpacing(10)
+        h.addLayout(left, 1)
+        h.addLayout(right, 1)
+        # --- source
+        src = Card("1 · Source audio", "Entrée captée et niveau de modulation")
+        r = QHBoxLayout()
+        r.setSpacing(8)
+        self.dev_pick = DevicePicker()
+        self.dev_pick.picked.connect(self.on_dev_select)
+        self.dev_pick.refresh.connect(self.refresh_devices)
+        r.addWidget(self.dev_pick, 1)
+        rb = self.btn_devref = IconButton("refresh", "Actualiser la liste des entrées")
+        rb.clicked.connect(self.refresh_devices)
+        r.addWidget(rb, 0, Qt.AlignmentFlag.AlignVCenter)
+        src.lay.addLayout(r)
+        self.l_devst = lab("Recherche...", "mut")
+        self.l_devst.setTextFormat(Qt.TextFormat.RichText)
+        src.lay.addWidget(self.l_devst)
+        mr = QHBoxLayout()
+        self.meter_in = LevelMeter("ENTRÉE")
+        mr.addWidget(self.meter_in)
+        side = QVBoxLayout()
+        self.btn_prev = btn("Voir l'entrée", "", self.toggle_preview)
+        side.addWidget(self.btn_prev)
+        gr = QHBoxLayout()
+        gr.addWidget(lab("Gain d'entrée", ""))
+        self.l_gain = lab("0 dB", "mut")
+        self.l_gain.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        gr.addWidget(self.l_gain, 1)
+        g0 = QPushButton("0")
+        g0.setToolTip("Remettre le gain à 0 dB")
+        g0.setFixedSize(30, 26)
+        g0.setCursor(Qt.CursorShape.PointingHandCursor)
+        g0.setStyleSheet("padding:0;border-radius:9px;font-size:11px;")
+        g0.clicked.connect(lambda: self.sl_gain.setValue(0))
+        gr.addWidget(g0)
+        side.addLayout(gr)
+        self.sl_gain = Slider(Qt.Orientation.Horizontal)
+        self.sl_gain.setRange(-12, 12)
+        self.sl_gain.valueChanged.connect(lambda *_: self.live_gain())
+        side.addWidget(self.sl_gain)
+        side.addStretch(1)
+        mr.addLayout(side, 1)
+        src.lay.addLayout(mr)
+        self.btn_loop = btn("Activer la capture du son de l'ordinateur", "", lambda: self.enable_loopback())
+        if SYS == "Windows" and not have_loopback():
+            src.lay.addWidget(self.btn_loop, 0, Qt.AlignmentFlag.AlignLeft)
+        left.addWidget(src)
+        # --- secours
+        fb = Card("3 · Playlist de secours", "Relève automatique en cas de silence")
+        hd = QHBoxLayout()
+        self.sw_fb = Switch("Prendre le relais après 10 s de silence")
+        self.sw_fb.toggled.connect(lambda *_: self.fb_summary())
+        hd.addWidget(self.sw_fb)
+        hd.addStretch(1)
+        self.btn_adv = btn("Options", "", self.toggle_fb_adv)
+        hd.addWidget(self.btn_adv)
+        fb.lay.addLayout(hd)
+        self.build_fb_dialog()
+        lib = QHBoxLayout()                       # bibliothèque : dossiers à gauche, titres à droite
+        lib.setSpacing(10)
+        self.pl_bar = FolderBar(self)
+        lib.addWidget(self.pl_bar, 0)
+        rc = QVBoxLayout()
+        rc.setSpacing(6)
+        r2 = QHBoxLayout()
+        self.l_plview = lab("Tous les titres", "")
+        self.l_plview.setStyleSheet("font-size:15px;font-weight:800;")
+        r2.addWidget(self.l_plview)
+        self.l_plc = lab("", "mut")
+        r2.addWidget(self.l_plc)
+        r2.addStretch(1)
+        self.ed_plq = QLineEdit()
+        self.ed_plq.setPlaceholderText("Rechercher")
+        self.ed_plq.setClearButtonEnabled(True)
+        self.ed_plq.setMaximumWidth(150)
+        self.ed_plq.setStyleSheet("border-radius:14px;padding:4px 12px;")
+        self.ed_plq.textChanged.connect(lambda *_: self.pl_refresh())
+        r2.addWidget(self.ed_plq)
+        rc.addLayout(r2)
+        self.l_plsel = lab("", "")
+        self.l_plsel.setStyleSheet(f"color:{ACCT};font-weight:700;font-size:12px;")
+        self.l_plsel.hide()
+        self.pl_tv = TrackList(self.pl_toggle, self.pl_play, self.pl_menu, self.pl_remove)
+        self.pl_tv.cb_s = self.pl_sel_changed
+        self.pl_tv.cb_drop = self.pl_drop
+        rc.addWidget(self.pl_tv, 1)
+        lib.addLayout(rc, 1)
+        fb.lay.addLayout(lib, 1)
+        r3 = QHBoxLayout()
+        mb = btn("＋ Ajouter")
+        mb.setMinimumWidth(mb.fontMetrics().horizontalAdvance("＋ Ajouter") + 58)
+        mm = QMenu(mb)
+        mm.addAction("Des fichiers…", self.pl_add)
+        mm.addAction("Un dossier…", self.pl_add_dir)
+        mm.addSeparator()
+        mm.addAction("Remettre les compteurs à zéro", self.pl_reset_counts)
+        mb.setMenu(mm)
+        r3.addWidget(mb)
+        self.btn_plrem = btn("Retirer", "", self.pl_remove)
+        r3.addWidget(self.btn_plrem)
+        r3.addStretch(1)
+        self.btn_playsel = btn("Jouer la sélection", "", self.pl_play_sel)
+        r3.addWidget(self.btn_playsel)
+        self.btn_manual = btn("Lancer la playlist", "", self.toggle_manual)
+        r3.addWidget(self.btn_manual)
+        fb.lay.addLayout(r3)
+        left.addWidget(fb, 1)
+        # --- flux
+        outf = Card("2 · Flux", "Destinations de diffusion")
+        self.tb_out = QTableWidget(0, 5)
+        self.tb_out.setHorizontalHeaderLabels(["ACTIF", "TYPE", "NOM", "DESTINATION", "ÉTAT"])
+        style_table(self.tb_out, check_col=0)
+        hh = self.tb_out.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.tb_out.verticalHeader().hide()
+        self.tb_out.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tb_out.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tb_out.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tb_out.setShowGrid(False)
+        self.tb_out.setMinimumHeight(64)
+        self.tb_out.cellClicked.connect(self.on_tree_click)
+        self.tb_out.doubleClicked.connect(lambda *_: self.edit_output())
+        outf.lay.addWidget(self.tb_out, 1)
+        self.l_flux = CLabel("", "mut", True, MUT)
+        outf.lay.addWidget(self.l_flux)
+        r = QHBoxLayout()
+        mb = btn("＋ Flux     ")
+        mm = QMenu(mb)
+        for k, label in (("internet", " Internet (Icecast / Shoutcast)"), ("fm", " FM (carte son + RDS)"), ("dab", " DAB+")):
+            mm.addAction(KINDS[k][0] + label, lambda kk=k: self.add_output(kk))
+        mm.addSeparator()
+        mm.addAction("Plateau extérieur (nouvelle adresse)…", self.new_plateau)
+        mm.addAction("Changer l'adresse du flux choisi…", self.rename_mount)
+        mb.setMenu(mm)
+        r.addWidget(mb)
+        for t, fn in (("Modifier", self.edit_output), ("Dupliquer", self.dup_output), ("Supprimer", self.del_output)):
+            b = btn(t, "", fn)
+            b.setMinimumWidth(b.fontMetrics().horizontalAdvance(t) + 30)
+            self.flux_btns = getattr(self, "flux_btns", []) + [b]
+            r.addWidget(b)
+        r.addStretch(1)
+        self.btn_run_out = btn("Marche/arrêt", "", self.toggle_selected)
+        self.btn_run_out.setMinimumWidth(self.btn_run_out.fontMetrics().horizontalAdvance("Marche/arrêt") + 30)
+        r.addWidget(self.btn_run_out)
+        outf.lay.addLayout(r)
+        right.addWidget(outf, 1)
+        # --- antenne
+        air = Card("4 · À l'antenne", "Signal diffusé et métadonnées")
+        r = QHBoxLayout()
+        self.cover_lbl = QLabel()
+        self.cover_lbl.setFixedSize(96, 96)
+        self.cover_lbl.setStyleSheet("background:#222;border-radius:12px;")
+        r.addWidget(self.cover_lbl)
+        col = QVBoxLayout()
+        self.meter = LevelMeter("ANTENNE")
+        col.addWidget(self.meter)
+        self.l_sig = CLabel("Signal : -", "mut", False, MUT)
+        col.addWidget(self.l_sig)
+        self.l_now = CLabel("Titre : -", "mut", True, MUT)
+        col.addWidget(self.l_now)
+        r.addLayout(col, 1)
+        air.lay.addLayout(r)
+        self.wave = Wave(28)
+        air.lay.addWidget(self.wave)
+        mt = QHBoxLayout()
+        mt.addWidget(lab("Titre affiché", ""))
+        self.ed_meta = QLineEdit()
+        self.ed_meta.returnPressed.connect(self.send_meta_now)
+        mt.addWidget(self.ed_meta, 1)
+        mt.addWidget(btn("Envoyer", "", self.send_meta_now))
+        mt.addWidget(btn("Image…", "", self.pick_cover))
+        air.lay.addLayout(mt)
+        self.sw_follow = Switch("Pendant la playlist, afficher le titre du morceau joué")
+        self.sw_follow.toggled.connect(lambda *_: self.live_meta())
+        air.lay.addWidget(self.sw_follow)
+        self.l_last = lab("", "mut")
+        self.l_last.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.l_last.mouseReleaseEvent = lambda _e: self.go_tab("sos")
+        self.l_last.hide()                     # le dernier message reste lisible dans SOS > Journal (gain de place)
+        right.addWidget(air)
+        self.facts = FactCard()
+        right.addWidget(self.facts)
+        self.cur_device = ""
+        self.show_cover(None)
+        sa = FitScroll()                         # fenêtre basse : la page défile au lieu de se chevaucher
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        w.setObjectName("page")
+        sa.setWidget(w)
+        return sa
+
+    # --- options du secours
+    def build_fb_dialog(self):
+        d = self.fb_win = QDialog(self)
+        d.setWindowTitle("Options de la playlist de secours")
+        f = QFormLayout(d)
+        f.setContentsMargins(20, 16, 20, 16)
+        self.fb_ed = {}
+        for k, t in (("threshold", "Seuil de silence (dB)"), ("silence_s", "Délai avant bascule (s)"), ("recover_s", "Retour au direct après (s)"),
+                     ("fade_in", "Fondu vers la playlist (s)"), ("fade_out", "Fondu retour direct (s)")):
+            e = QLineEdit()
+            e.setMaximumWidth(90)
+            e.textChanged.connect(lambda *_: (self.fb_summary(), self.live_fb()))
+            self.fb_ed[k] = e
+            f.addRow(t, e)
+        self.sw_shuf = Switch("Lecture aléatoire")
+        f.addRow("", self.sw_shuf)
+        jr = QHBoxLayout()
+        self.sw_jingle = Switch("Jingle toutes les")
+        self.sw_jingle.toggled.connect(lambda *_: self.live_fb())
+        self.sp_jevery = QSpinBox()
+        self.sp_jevery.setRange(1, 240)
+        self.sp_jevery.valueChanged.connect(lambda *_: self.live_fb())
+        jr.addWidget(self.sw_jingle)
+        jr.addWidget(self.sp_jevery)
+        jr.addWidget(lab("min", "mut"))
+        self.btn_jfile = btn("Choisir les jingles…", "", self.pick_fb_jingle)
+        jr.addWidget(self.btn_jfile)
+        f.addRow(jr)
+        f.addRow(btn("Fermer", "primary", d.hide))
+
+    def toggle_fb_adv(self):
+        self.fb_win.show()
+        self.fb_win.raise_()
+
+    def fb_summary(self):
+        if not hasattr(self, "sw_fb") or not hasattr(self, "fb_ed"):
+            return
+        sec = self.fb_ed['silence_s'].text().strip() or "10"
+        self.sw_fb.setText(f"Prendre le relais après {sec} s de silence" if self.sw_fb.isChecked() else "Playlist de secours désactivée")
+        self.sw_fb.updateGeometry()
+        self.sw_fb.update()
+        n = len(self.jingles)
+        self.btn_jfile.setText(f"{n} jingle{'s' if n > 1 else ''}…" if n else "Choisir les jingles…")
+
+    def pick_fb_jingle(self):
+        r = JingleDialog(self, self.jingles)
+        if r.exec() and r.result is not None:
+            self.jingles = r.result
+            if r.result:
+                self.sw_jingle.setChecked(True)
+            self.live_fb()
+
+    def live_fb(self):
+        self.fb_summary()
+        if self.engine and not getattr(self, "_loading", False):
+            e = self.fb_ed
+            self.engine.prof_update("fallback", jingle=dict(enabled=self.sw_jingle.isChecked(), every=str(self.sp_jevery.value()),
+                                                            files=list(self.jingles)),
+                                    fade_in=e["fade_in"].text(), fade_out=e["fade_out"].text())
+
+    # --- entrées audio
+    def refresh_devices(self):
+        self.dev_status("Recherche des entrées…", ACC2)
+
+        def scan():
+            if SYS != "Linux" and not shutil.which("ffmpeg"):
+                return self.ui(self.apply_devices, [], "", "ffmpeg introuvable")
+            try:
+                devs, raw = list_devices()
+                self.ui(self.apply_devices, devs, raw, "")
+            except Exception as e:
+                self.ui(self.apply_devices, [], str(e), "erreur de détection")
+        threading.Thread(target=scan, daemon=True).start()
+
+    def dev_status(self, text, col):
+        self.l_devst.setText(f"<span style='color:{col}'>●</span>&nbsp;&nbsp;<span style='color:{MUT}'>{text}</span>")
+
+    def apply_devices(self, devs, raw, err_):
+        self.dev_list = devs
+        self.dev_map = {l: v for l, v in devs}
+        self.dev_pick.set_devices(list(self.dev_map))
+        loop = any(v.startswith("loopback:") for _, v in devs)
+        self.dev_pick.extra = ([("Activer la capture…", self.enable_loopback)]
+                               if SYS == "Windows" and not loop else [])
+        if hasattr(self, "btn_loop"):
+            self.btn_loop.setVisible(SYS == "Windows" and not loop)
+        if devs:
+            n = len(devs)
+            self.dev_status(f"{n} entrée{'s' if n > 1 else ''} détectée{'s' if n > 1 else ''}", OKC)
+            self.sync_device_selection()
+            self.set_cart_devices()
+            return
+        self.dev_status((err_ or "Aucune entrée détectée") + " · vérifie le branchement puis actualise", BADC)
+        self.sync_device_selection()
+        if raw.strip():
+            self.log("Sortie de ffmpeg : " + " | ".join(raw.strip().splitlines()[-6:]))
+
+    def enable_loopback(self):
+        """Capture du son de l'ordinateur (WASAPI loopback) : installe le module si besoin, puis met la liste à jour sans redémarrer."""
+        if have_loopback():
+            return self.refresh_devices()
+
+        def done():
+            importlib.invalidate_caches()
+            self.refresh_devices()
+            QTimer.singleShot(2500, lambda: self.dev_pick.popup() if any(v.startswith("loopback:") for v in self.dev_map.values()) else
+                              self.log("Capture du son de l'ordinateur : le module est installé mais aucune sortie n'est détectée (voir SOS)."))
+        self.dev_status("Installation de la capture du son de l'ordinateur…", ACC2)
+        self.install("PyAudioWPatch", done)
+
+    def sync_device_selection(self):
+        cur = self.cur_device
+        lbl = next((k for k, v in self.dev_map.items() if v == cur), None)
+        self.dev_pick.set_current(lbl or cur)
+
+    def on_dev_select(self, txt=""):
+        txt = (txt or "").strip()
+        if txt:
+            self.cur_device = self.dev_map.get(txt, txt)
+
+    def live_gain(self):
+        g = self.sl_gain.value()
+        self.l_gain.setText(f"{g:+d} dB" if g else "0 dB")
+        if self.engine:
+            self.engine.set_gain(str(g))
+
+    def live_meta(self):
+        if self.engine:
+            self.engine.prof_update("meta", follow=self.sw_follow.isChecked())
+
+    def send_meta_now(self):
+        if self.engine:
+            self.engine.meta_manual = self.ed_meta.text()
+            self.log("Titre envoyé : " + (self.ed_meta.text() or "(vide)"))
+        else:
+            self.log("Titre enregistré : il sera envoyé au démarrage.")
+
+    def pick_cover(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Pochette par défaut (logo de la radio)", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp);;Tous (*)")
+        if f:
+            self.cover_path = f
+            self.cover_shown = "?"
+
+    # --- pochettes
+    def set_cover(self, path):
+        if path == self.cover_shown:
+            return
+        self.cover_shown = path
+        if not path:
+            return self.show_cover(None)
+        if path in self.cover_cache:
+            return self.show_cover(self.cover_cache[path])
+        threading.Thread(target=lambda: self.ui(self.got_cover, path, cover_png(path)), daemon=True).start()
+
+    def got_cover(self, path, data):
+        pm = None
+        if data:
+            pm = QPixmap()
+            if not pm.loadFromData(data):
+                pm = None
+        if pm is None and os.path.isfile(path) and path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+            pm = QPixmap(path)
+            if pm.isNull():
+                pm = None
+        if len(self.cover_cache) > 60:
+            self.cover_cache.clear()
+        self.cover_cache[path] = pm
+        if self.cover_shown == path:
+            self.show_cover(pm)
+
+    def show_cover(self, pm):
+        if pm is None:
+            if self.cover_pm is None:
+                self.cover_pm = default_cover_pm(96)
+            pm = self.cover_pm
+        self.cover_lbl.setPixmap(pm.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.mini_lbl.setPixmap(pm.scaled(38, 38, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    # ------------------------------------------------------------ playlist
+    def pl_now_idx(self):
+        e = self.engine
+        cur = e.pl_cur if (e and e.backup) else None
+        return cur["i"] if cur else -1
+
+    def pl_img(self, f):
+        if f in self.pl_cov:
+            return self.pl_cov[f]
+        img = self.pl_cov_raw.get(f, 0)
+        if img == 0:
+            return None
+        pm = QPixmap.fromImage(img) if img is not None else None
+        self.pl_cov[f] = pm
+        return pm
+
+    def pl_rows(self):
+        cnt = self.data.get("counts", {})
+        q = norm_txt(self.ed_plq.text().strip())
+        rows = []
+        for i, f in enumerate(self.playlist):
+            fo = self.pl_folder.get(f, "")
+            if self.pl_view is not None and fo != self.pl_view:
+                continue
+            inf = self.pl_info.get(f) or {}
+            title, dur = inf.get("title") or os.path.splitext(os.path.basename(f))[0], inf.get("dur", 0)
+            artist = inf.get("artist", "")
+            if not artist and " - " in title:
+                artist, title = title.split(" - ", 1)
+            if q and q not in norm_txt(title + " " + artist + " " + inf.get("album", "") + " " + fo):
+                continue
+            rows.append({"i": i, "title": title, "artist": artist, "album": inf.get("album", ""), "dur": dur, "n": cnt.get(f, 0), "off": f in self.pl_off,
+                         "folder": fo if self.pl_view is None else "", "img": self.pl_img(f)})
+        rows.sort(key=lambda r: (r["off"], r["n"], r["i"]))
+        return rows
+
+    def pl_chips_build(self):
+        n_of = {}
+        for f in self.playlist:
+            n_of[self.pl_folder.get(f, "")] = n_of.get(self.pl_folder.get(f, ""), 0) + 1
+        items = [("Tous", None, len(self.playlist))] + [(n, n, n_of.get(n, 0)) for n in self.pl_folders]
+        if n_of.get("", 0) and self.pl_folders:
+            items.append(("Sans dossier", "", n_of[""]))
+        self.pl_bar.set_items(items, self.pl_view)
+        self.l_plview.setText({None: "Tous les titres", "": "Sans dossier"}.get(self.pl_view, self.pl_view or ""))
+
+    def pl_set_view(self, k):
+        self.pl_view = k
+        QTimer.singleShot(0, self.pl_refresh)
+
+    def pl_new_folder(self, move=None):
+        name = (ask_text(self, "Nouveau dossier", "Nom du dossier (par exemple Jingles, Musique, Émissions) :") or "").strip()
+        if not name:
+            return None
+        if name not in self.pl_folders:
+            self.pl_folders.append(name)
+        for i in (move or []):
+            self.pl_folder[self.playlist[i]] = name
+        self.pl_view = name if not move else self.pl_view
+        self.pl_refresh()
+        return name
+
+    def pl_folder_menu(self, name, pos):
+        m = QMenu(self)
+        m.addAction("Renommer…", lambda: self.pl_rename_folder(name))
+        files = [f for f in self.playlist if self.pl_folder.get(f) == name]
+        allout = bool(files) and all(f in self.pl_off for f in files)
+        m.addAction("Remettre tout le dossier dans la rotation" if allout else "Exclure tout le dossier de la rotation",
+                    lambda: self.pl_folder_rotation(name, allout))
+        m.addAction("Supprimer le dossier (garde les titres)", lambda: self.pl_del_folder(name))
+        m.exec(pos)
+
+    def pl_rename_folder(self, name):
+        new = (ask_text(self, "Renommer", "Nouveau nom :", name) or "").strip()
+        if new and new != name and new not in self.pl_folders:
+            self.pl_folders[self.pl_folders.index(name)] = new
+            self.pl_folder = {f: (new if v == name else v) for f, v in self.pl_folder.items()}
+            if self.pl_view == name:
+                self.pl_view = new
+            self.pl_refresh()
+
+    def pl_folder_rotation(self, name, include):
+        for f in self.playlist:
+            if self.pl_folder.get(f) == name:
+                (self.pl_off.discard if include else self.pl_off.add)(f)
+        self.pl_refresh()
+
+    def pl_del_folder(self, name):
+        self.toast(f"Dossier « {name} » supprimé (les titres sont gardés)   ·   Ctrl+Z pour annuler")
+        if name in self.pl_folders:
+            self.pl_folders.remove(name)
+        self.pl_folder = {f: v for f, v in self.pl_folder.items() if v != name}
+        if self.pl_view == name:
+            self.pl_view = None
+        self.pl_refresh()
+
+    def pl_move(self, idx, name):
+        for i in idx:
+            if name:
+                self.pl_folder[self.playlist[i]] = name
+            else:
+                self.pl_folder.pop(self.playlist[i], None)
+        self.pl_refresh()
+
+    def pl_refresh(self):
+        if not hasattr(self, "pl_tv"):
+            return
+        todo = [f for f in self.playlist if f not in self.pl_info or f not in self.pl_cov_raw]
+        idx = self.pl_now_idx()
+        self.pl_sig = (idx, tuple(self.data.get("counts", {}).get(f, 0) for f in self.playlist))
+        self.pl_chips_build()
+        rows = self.pl_rows()
+        self.pl_tv.set(rows, idx)
+        tot = sum(r["dur"] for r in rows)
+        hh, mn = int(tot // 3600), int(tot // 60 % 60)
+        self._plc_txt = f"{len(rows)} titre{'s' if len(rows) > 1 else ''}" + (f" · {hh} h {mn:02d} min" if hh else f" · {mn} min" if tot else "")
+        self.l_plc.setText(self._plc_txt)
+        self.live_pl()
+        if todo and not getattr(self, "_pl_busy", False):
+            self._pl_busy = True
+
+            def one(f):
+                try:
+                    tags, img = track_meta(f, 96)
+                    if img is None and shutil.which("ffmpeg"):          # même recherche directe que « Chercher la pochette… »
+                        png = _cover_extract(f, 96)
+                        q = QImage()
+                        if png and q.loadFromData(png):
+                            img = square_image(q, 96)
+                    if f not in self.pl_info:
+                        title, dur = track_info(f) if shutil.which("ffprobe") else (tags.get("title") or "", 0.0)
+                        inf = dict(tags)
+                        inf["dur"] = dur
+                        if not inf.get("title"):
+                            if " - " in title and not inf.get("artist"):
+                                inf["artist"], inf["title"] = title.split(" - ", 1)
+                            else:
+                                inf["title"] = title or os.path.splitext(os.path.basename(f))[0]
+                        self.pl_info[f] = inf
+                    self.pl_cov_raw[f] = img
+                except Exception:
+                    self.pl_cov_raw.setdefault(f, None)
+                    self.pl_info.setdefault(f, {"title": os.path.splitext(os.path.basename(f))[0], "dur": 0})
+
+            def work():
+                from concurrent.futures import ThreadPoolExecutor
+                try:
+                    with ThreadPoolExecutor(4) as ex:
+                        for k in range(0, len(todo), 12):
+                            list(ex.map(one, todo[k:k + 12]))
+                            self.ui(self.pl_redraw_covers)
+                finally:
+                    self._pl_busy = False
+                    self.ui(self.pl_refresh)
+            threading.Thread(target=work, daemon=True).start()
+
+    def pl_redraw_covers(self):
+        try:
+            self.pl_tv.set(self.pl_rows(), self.pl_now_idx())
+        except Exception:
+            pass
+
+    def pl_cover_diag(self, i):
+        f = self.playlist[i]
+
+        def work():
+            er = []
+            _, img = track_meta(f, 96)
+            if img is None:
+                png = _cover_extract(f, 96, err=er)
+                if png:
+                    q = QImage()
+                    img = square_image(q, 96) if q.loadFromData(png) else None
+            self.pl_cov_raw[f] = img
+            self.pl_cov.pop(f, None)
+            if img is not None:
+                self.ui(lambda: (self.pl_tv.set(self.pl_rows(), self.pl_now_idx()), info(self, "Pochette", "Pochette trouvée et affichée.")))
+            else:
+                why = (er[-1] if er else "aucune image trouvée") + ("" if shutil.which("ffmpeg") else "\n(ffmpeg est introuvable dans le PATH)")
+                self.ui(lambda: info(self, "Pochette", "Aucune pochette trouvée pour :\n" + os.path.basename(f) + "\n\nDétail : " + why
+                                     + "\n\nAstuce : place une image cover.jpg ou folder.jpg dans le dossier du morceau."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def pl_infos(self, i):
+        f = self.playlist[i]
+        inf = dict(self.pl_info.get(f) or {})
+        inf["folder"] = self.pl_folder.get(f, "")
+        img = self.pl_cov_raw.get(f) or None
+        if img is not None:                       # pochette en grand : on la relit à pleine définition
+            tags, big = track_meta(f, 300)
+            img = big or img
+        TrackInfoDialog(self, f, inf, img, self.data.get("counts", {}).get(f, 0)).exec()
+
+    def pl_toggle(self, i):
+        sel = self.pl_tv.selection()
+        idx = sel if (i in sel and len(sel) > 1) else [i]
+        if self.playlist[i] in self.pl_off:
+            self.pl_off.difference_update(self.playlist[j] for j in idx)
+        else:
+            self.pl_off.update(self.playlist[j] for j in idx)
+        self.pl_refresh()
+
+    def pl_sel_changed(self, n):
+        tot = len(self.pl_tv.rows)
+        base = f"{tot} titre{'s' if tot > 1 else ''}"
+        self.l_plc.setText(f"{n} sur {tot} sélectionné{'s' if n > 1 else ''}" if n else getattr(self, "_plc_txt", base))
+        self.pl_tv.setToolTip("Glisse la sélection sur un dossier pour la ranger · clic droit pour plus d'options" if n else "")
+
+    def pl_menu(self, i, pos):
+        m = QMenu(self)
+        m.addAction("Jouer maintenant", lambda: self.pl_play(i))
+        m.addAction("Infos…", lambda: self.pl_infos(i))
+        m.addAction("Chercher la pochette…", lambda: self.pl_cover_diag(i))
+        m.addAction("Tout sélectionner", lambda: self.pl_tv.select_all(True))
+        sel = self.pl_tv.selection() or [i]
+        nsel = len(sel) if i in sel else 1
+        m.addAction(("Exclure de la rotation" if self.playlist[i] not in self.pl_off else "Remettre dans la rotation")
+                    + (f"  ({nsel} titres)" if nsel > 1 else ""), lambda: self.pl_toggle(i))
+        mv = m.addMenu("Ranger dans…")
+        for n in self.pl_folders:
+            mv.addAction(n, lambda n=n: self.pl_move(sel, n))
+        if self.pl_folders:
+            mv.addSeparator()
+        mv.addAction("Nouveau dossier…", lambda: self.pl_new_folder(sel))
+        mv.addAction("Aucun dossier", lambda: self.pl_move(sel, ""))
+        m.addAction("Retirer de la liste" + (f"  ({len(sel)} titres)" if len(sel) > 1 else ""), self.pl_remove)
+        m.exec(pos)
+
+    def pl_drop(self, files):
+        n0 = len(self.playlist)
+        for p in files:
+            if os.path.isdir(p):
+                self.pl_import_folder(p, [os.path.join(p, f) for f in sorted(os.listdir(p)) if f.lower().endswith(AUDIO_EXTS)])
+                continue
+            new = [q for q in ([p] if p.lower().endswith(AUDIO_EXTS) else []) if q not in self.playlist]
+            self.playlist += new
+            if self.pl_view:
+                for q in new:
+                    self.pl_folder[q] = self.pl_view
+        if len(self.playlist) > n0:
+            self.log(f"{len(self.playlist) - n0} titre(s) ajouté(s) à la playlist de secours.")
+        self.pl_refresh()
+
+    def live_pl(self):
+        if self.engine:
+            self.engine.prof_update("fallback", playlist=list(self.playlist), off=sorted(self.pl_off))
+
+    def pl_play_sel(self):
+        sel = self.pl_tv.selection()
+        if not sel:
+            return info(self, "Playlist", "Clique d'abord sur un morceau de la liste (ou double-clique dessus pour le jouer).")
+        self.pl_play(sel[0])
+
+    def pl_play(self, i):
+        if not self.on_air:
+            return info(self, "Playlist", "Démarre la diffusion pour jouer un morceau ou une émission à l'antenne.")
+        self.live_pl()
+        self.engine.play_now(self.playlist[i])
+
+    def pl_import_folder(self, d, paths):
+        name = os.path.basename(d.rstrip("/\\")) or d
+        new = [q for q in paths if q not in self.playlist]
+        if not new:
+            return
+        if name not in self.pl_folders:
+            self.pl_folders.append(name)
+        self.playlist += new
+        for q in new:
+            self.pl_folder[q] = name
+        self.pl_view = name
+        self.pl_refresh()
+
+    def pl_add(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Choisir des fichiers audio", "", "Audio (*.mp3 *.wav *.flac *.ogg *.opus *.m4a *.aac);;Tous (*)")
+        new = [f for f in files if f not in self.playlist]
+        self.playlist += new
+        if self.pl_view:
+            for f in new:
+                self.pl_folder[f] = self.pl_view
+        self.pl_refresh()
+
+    def pl_add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Choisir un dossier")
+        if d:
+            paths = [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.lower().endswith(AUDIO_EXTS)]
+            self.pl_import_folder(d, paths)
+
+    def pl_reset_counts(self):
+        if yes(self, "Compteurs", "Remettre à zéro le nombre de lectures de tous les titres et jingles ?"):
+            self.data.setdefault("counts", {}).clear()
+            self.pl_refresh()
+
+    def pl_remove(self):
+        sel = self.pl_tv.selection()
+        for i in sorted(sel, reverse=True):
+            self.pl_folder.pop(self.playlist[i], None)
+            del self.playlist[i]
+        self.pl_refresh()
+        if sel:
+            self.toast(f"{len(sel)} titre(s) retiré(s) de la playlist   ·   Ctrl+Z pour annuler")
+
+    # ------------------------------------------------------------ flux de sortie
+    def refresh_outputs(self):
+        if hasattr(self, "fx_rows"):
+            self.fx_flux_rows()
+        if not hasattr(self, "tb_out"):
+            return
+        r0 = self.tb_out.currentRow()
+        self.tb_out.setRowCount(len(self.outputs_cfg))
+        for r, c in enumerate(self.outputs_cfg):
+            ico, l = KINDS[c["type"]]
+            vals = ("", f"{ico} {l}".strip(), c["name"], self.describe(c), "○ Arrêté")
+            for k, t in enumerate(vals):
+                it = QTableWidgetItem(t)
+                it.setData(Qt.ItemDataRole.UserRole, c["id"])
+                if k == 0:
+                    it.setData(CHECK_ROLE, bool(c.get("enabled", True)))
+                    it.setToolTip("Actif : ce flux part au démarrage de la diffusion")
+                self.tb_out.setItem(r, k, it)
+        if 0 <= r0 < len(self.outputs_cfg):
+            self.tb_out.selectRow(r0)
+
+    def sel_output(self):
+        r = self.tb_out.currentRow()
+        return self.outputs_cfg[r] if 0 <= r < len(self.outputs_cfg) else None
+
+    def select_output_id(self, oid):
+        for r, c in enumerate(self.outputs_cfg):
+            if c["id"] == oid:
+                self.tb_out.selectRow(r)
+
+    def on_tree_click(self, r, col):
+        if col == 0 and 0 <= r < len(self.outputs_cfg):
+            c = self.outputs_cfg[r]
+            c["enabled"] = not c.get("enabled", True)
+            self.tb_out.item(r, 0).setData(CHECK_ROLE, c["enabled"])
+            self.live_enable(c)
+
+    def add_output(self, kind):
+        d = OutputDialog(self, new_output(kind))
+        if d.exec() and d.result:
+            self.outputs_cfg.append(d.result)
+            self.refresh_outputs()
+            self.select_output_id(d.result["id"])
+            if self.apply_live(d.result):
+                self.log(f"« {d.result['name']} » ajouté et lancé tout de suite.")
+
+    def edit_output(self):
+        c = self.sel_output()
+        if not c:
+            return
+        d = OutputDialog(self, c)
+        if d.exec() and d.result:
+            self.outputs_cfg[self.outputs_cfg.index(c)] = d.result
+            self.refresh_outputs()
+            self.select_output_id(d.result["id"])
+            if self.apply_live(d.result):
+                self.log(f"« {d.result['name']} » : réglages appliqués tout de suite (reconnexion du flux).")
+
+    @staticmethod
+    def mount_ext(c):
+        m = os.path.splitext(c.get("mount", ""))[1]
+        if m:
+            return m
+        f = str(c.get("format", "")).lower()
+        return next((e for k, e in (("mp3", ".mp3"), ("aac", ".aac"), ("ogg", ".ogg"), ("opus", ".opus")) if k in f), "")
+
+    def free_mount(self, mount, skip=None):
+        used = {c.get("mount") for c in self.outputs_cfg if c["type"] == "internet" and c is not skip}
+        base, ext = os.path.splitext(mount)
+        m, i = mount, 2
+        while m in used:
+            m, i = f"{base}-{i}{ext}", i + 1
+        return m
+
+    def new_plateau(self):
+        base = next((c for c in self.outputs_cfg if c["type"] == "internet" and c.get("protocol") != "Shoutcast"), None)
+        if not base:
+            return info(self, "Plateau extérieur", "Crée d'abord un flux Internet (Icecast) : le plateau en reprend le serveur, le mot de passe et le format.")
+        name = ask_text(self, "Nouveau plateau", "Nom du plateau (par exemple : Festival scène 2) :")
+        if not name or not name.strip() or not slugify(name):
+            return
+        n = json.loads(json.dumps(base))
+        n["id"], n["name"] = uuid.uuid4().hex[:8], "Plateau · " + name.strip()
+        n["mount"] = self.free_mount("/" + slugify(name) + self.mount_ext(base))
+        self.outputs_cfg.append(n)
+        self.refresh_outputs()
+        self.select_output_id(n["id"])
+        live = self.apply_live(n)
+        self.log(f"Plateau créé : {n['name']} → {listen_url(n)}" + (" (lancé tout de suite)" if live else ""))
+        self.show_address(n)
+
+    def rename_mount(self):
+        c = self.sel_output()
+        if not c or c["type"] != "internet" or c.get("protocol") == "Shoutcast":
+            return info(self, "Adresse", "Choisis d'abord un flux Internet (Icecast) dans la liste.")
+        new = ask_text(self, "Changer l'adresse", "Nouveau nom de l'adresse (point de montage) :", c.get("mount", "/live").lstrip("/"))
+        if not new or not slugify(new):
+            return
+        c["mount"] = self.free_mount("/" + slugify(new), skip=c)
+        self.refresh_outputs()
+        self.select_output_id(c["id"])
+        live = self.apply_live(c)
+        self.log(f"Adresse de « {c['name']} » : {listen_url(c)}" + (" (appliquée tout de suite)" if live else ""))
+        self.show_address(c)
+
+    def apply_live(self, c):
+        if self.on_air and self.engine and not self.preview:
+            cfg = json.loads(json.dumps(c))
+            threading.Thread(target=lambda: self.engine.swap_output(cfg), daemon=True).start()
+            return True
+        return False
+
+    def show_address(self, c):
+        url = listen_url(c)
+        d = QDialog(self)
+        d.setWindowTitle("Adresse d'écoute")
+        v = QVBoxLayout(d)
+        v.setContentsMargins(22, 18, 22, 16)
+        t = lab(c["name"], "")
+        t.setStyleSheet("font-size:17px;font-weight:700;")
+        v.addWidget(t)
+        m = lab("Donne cette adresse aux auditeurs. Le flux part dès qu'il est connecté au serveur : tant qu'il est arrêté, l'adresse répond « 404 ».", "mut", True)
+        m.setMinimumWidth(520)
+        v.addWidget(m)
+        e = QLineEdit(url)
+        e.setReadOnly(True)
+        v.addWidget(e)
+        v.addWidget(lab("Le serveur doit accepter ce nom d'adresse avec le mot de passe source (c'est le cas d'un Icecast standard).", "mut", True))
+        h = QHBoxLayout()
+        h.addWidget(btn("Copier l'adresse", "primary", lambda: self.copy_text(url, "Adresse")))
+        h.addWidget(btn("Ajouter au monitoring", "", lambda: (self.mon_add(c["name"], url), d.accept())))
+        h.addStretch(1)
+        h.addWidget(btn("Fermer", "", d.accept))
+        v.addLayout(h)
+        d.exec()
+
+    def dup_output(self):
+        c = self.sel_output()
+        if c:
+            n = json.loads(json.dumps(c))
+            n["id"], n["name"] = uuid.uuid4().hex[:8], c["name"] + " (copie)"
+            self.outputs_cfg.append(n)
+            self.refresh_outputs()
+
+    def del_output(self):
+        c = self.sel_output()
+        if c and yes(self, "Supprimer", f"Supprimer le flux « {c['name']} » ?"):
+            self.outputs_cfg.remove(c)
+            self.live_remove(c["id"])
+            self.refresh_outputs()
+            self.update_ui(self.engine)
+            self.toast(f"Flux « {c['name']} » supprimé   ·   Ctrl+Z pour annuler")
+
+    def live_remove(self, oid):
+        """Retire tout de suite un flux de l'antenne en cours : bandeau, compteurs et alertes sont à jour immédiatement."""
+        e = self.engine
+        if not (e and not self.preview):
+            return
+        o = e.output(oid)
+        if o:
+            e.remove_output(oid)
+            self.prob_since = {k: v for k, v in getattr(self, "prob_since", {}).items() if k != "out-" + oid}
+            self.log(f"Flux « {o.cfg['name']} » retiré de l'antenne.")
+
+    def live_enable(self, c):
+        """Case « Actif » cochée / décochée pendant l'antenne : le flux démarre ou s'arrête sans attendre."""
+        e = self.engine
+        if not (e and self.on_air):
+            return
+        if c.get("enabled", True):
+            self.apply_live(c)
+            self.log(f"Flux « {c['name']} » activé : connexion…")
+        else:
+            self.live_remove(c["id"])
+
+    def toggle_selected(self):
+        c = self.sel_output()
+        if not (c and self.on_air):
+            return info(self, "Flux", "Sélectionne un flux pendant la diffusion.")
+        o = self.engine.output(c["id"])
+        if o:
+            o.stop() if o.state != "stopped" else o.start()
+
+    # ------------------------------------------------------------ démarrage / arrêt
+    def toggle(self):
+        if self.on_air:
+            if self.data.get("settings", {}).get("confirm_stop") and not yes(self, "Arrêter l'antenne", "Arrêter la diffusion maintenant ?"):
+                return
+            self.stop()
+        else:
+            self.start()
+
+    def start(self):
+        if self.preview:
+            self.stop()
+        prof = json.loads(json.dumps(self.collect_profile()))
+        if not shutil.which("ffmpeg"):
+            return err(self, "ffmpeg", "ffmpeg est introuvable dans le PATH (voir onglet SOS).")
+        outs = [o for o in prof["outputs"] if o.get("enabled", True)]
+        if not outs:
+            return info(self, "Flux", "Ajoute et coche (Actif) au moins un flux.")
+        for o in outs:
+            if o["type"] == "internet" and not o["password"]:
+                return info(self, "Mot de passe", f"Renseigne le mot de passe de « {o['name']} ».")
+        if prof["fallback"]["enabled"] and not prof["fallback"]["playlist"]:
+            return info(self, "Playlist", "Ajoute des fichiers à la playlist de secours ou désactive la bascule.")
+        self.save_all()
+        self.engine = self.make_engine(prof, self.alerts.send)
+        self.engine.start()
+        self.log(f"Diffusion démarrée ({len(outs)} flux). Mat eo, bonne émission !")
+
+    def stop(self):
+        if self.engine:
+            self.engine.stop()
+            self.log("Diffusion arrêtée. Kenavo !" if not self.preview else "Contrôle d'entrée arrêté.")
+        self.engine, self.preview = None, False
+
+    # ------------------------------------------------------------ moteur audio séparé
+    def prewarm(self):
+        """Prépare en arrière-plan le prochain processus moteur (pour que « Démarrer » soit instantané)."""
+        if self._closing or self._proc_off or not self.data.get("settings", {}).get("engine_proc", True):
+            return
+        if getattr(self, "slot", None) is None or (self.slot.ready.is_set() and not self.slot.alive()):
+            self.slot = WorkerSlot()
+
+    def take_slot(self):
+        sl = getattr(self, "slot", None)
+        if sl is None:
+            self.prewarm()
+            sl = self.slot
+        if sl is None:
+            return None
+        if not sl.ready.is_set():
+            t0 = time.time()
+            while not sl.ready.is_set() and time.time() - t0 < 8:       # premier lancement juste après l'ouverture
+                QApplication.processEvents()
+                sl.ready.wait(.03)
+        self.slot = None
+        if sl.alive():
+            return sl
+        sl.close()
+        self._proc_fail = getattr(self, "_proc_fail", 0) + 1
+        why = sl.error or ("toujours en préparation" if not sl.ready.is_set() else "arrêté")
+        if self._proc_fail >= 2:
+            self._proc_off = True
+            self.log(f"Moteur audio séparé indisponible ({why}) : le moteur tourne dans l'application pour cette session.")
+        else:
+            self.log(f"Moteur audio séparé indisponible ({why}) : le moteur tourne dans l'application.")
+        return None
+
+    def make_engine(self, prof, alert, standalone=False):
+        if self.data.get("settings", {}).get("engine_proc", True) and not self._proc_off:
+            sl = self.take_slot()
+            if sl is not None:
+                eng = EngineProxy(sl, prof, self.log, alert, standalone, on_dead=lambda p: self.ui(self.engine_died, p))
+                QTimer.singleShot(12000, self.prewarm)   # le suivant se prépare plus tard : rien ne ralentit le lancement
+                return eng
+        return Engine(prof, self.log, alert, standalone)
+
+    def worker_pids(self):
+        pids = set()
+        e, sl = self.engine, getattr(self, "slot", None)
+        if isinstance(e, EngineProxy) and e.pid:
+            pids.add(e.pid)
+        if sl is not None and sl.pid:
+            pids.add(sl.pid)
+        if sl is not None and sl.proc is not None:
+            pids.add(sl.proc.pid)
+        return pids
+
+    def engine_died(self, p, why="arrêté brutalement"):
+        """Le processus moteur a disparu (ou ne répond plus) pendant l'antenne : on relance aussitôt l'antenne, cette fois
+        avec le moteur dans l'application, pour ne pas laisser les auditeurs sans son."""
+        if self.engine is not p:
+            return
+        air = not self.preview
+        try:
+            p._slot.close()
+        except Exception:
+            pass
+        self.engine, self.preview = None, False
+        self._proc_off = True
+        if air and not self._closing:
+            self.log(f"⚠ Le moteur audio s'est {why} : redémarrage immédiat de l'antenne.")
+            self.alerts.send(f"Moteur audio {why} : antenne relancée automatiquement.", "engine-crash")
+            self.start()
+
+    def toggle_preview(self):
+        if self.on_air:
+            return info(self, "Contrôle", "Arrête la diffusion pour utiliser le contrôle d'entrée.")
+        if self.engine and not self.standalone:
+            return self.stop()
+        if self.standalone:
+            if self.engine and any(not v["stopping"] for v in list(self.engine.voices)):
+                return self.log("Une cartouche est en cours : attends la fin ou arrête-la avant de regarder l'entrée.")
+            self.stop()
+        prof = json.loads(json.dumps(self.collect_profile()))
+        prof["outputs"] = []
+        prof["fallback"]["enabled"] = False
+        self.engine = self.make_engine(prof, None)
+        self.preview = True
+        self.engine.start()
+        self.log("Contrôle d'entrée : le niveau s'affiche sans rien diffuser.")
+
+    def start_cart_engine(self):
+        prof = json.loads(json.dumps(self.collect_profile()))
+        prof["outputs"] = []
+        prof["fallback"]["enabled"] = False
+        self.engine = self.make_engine(prof, None, standalone=True)
+        self.preview = True
+        self.engine.start()
+        self.log("Cartoucheur hors antenne : lecture sur la carte son choisie.")
+
+    def toggle_manual(self):
+        e = self.engine
+        if not (e and self.on_air and self.playlist):
+            return info(self, "Playlist de secours", "Démarre la diffusion avec au moins un fichier dans la playlist.")
+        e.set_manual(not e.manual)
+
+    # ------------------------------------------------------------ Cartoucheur : réglages généraux
+    def set_cart_devices(self):
+        try:
+            outs = list_output_devices()
+        except Exception:
+            outs = []
+        cur = self.prof["carts"].get("device", "")
+        self.cb_cdev.blockSignals(True)
+        self.cb_cdev.clear()
+        self.cb_cdev.addItem(NODEV, "")
+        for l, _ in outs:
+            self.cb_cdev.addItem(l, l)
+        i = self.cb_cdev.findData(cur)
+        if i < 0 and cur:
+            self.cb_cdev.addItem(cur, cur)
+            i = self.cb_cdev.count() - 1
+        self.cb_cdev.setCurrentIndex(max(0, i))
+        self.cb_cdev.blockSignals(False)
+        if hasattr(self, "b_cdev"):
+            self.cdev_label()
+
+    def sync_cart_device(self):
+        d = self.prof["carts"].get("device", "")
+        i = self.cb_cdev.findData(d)
+        if i < 0 and d:
+            self.cb_cdev.addItem(d, d)
+            i = self.cb_cdev.count() - 1
+        self.cb_cdev.blockSignals(True)
+        self.cb_cdev.setCurrentIndex(max(0, i))
+        self.cb_cdev.blockSignals(False)
+        if hasattr(self, "b_cdev"):
+            self.cdev_label()
+
+    def cart_dev_changed(self, i):
+        self.prof["carts"]["device"] = self.cb_cdev.currentData() or ""
+        if self.engine:
+            self.engine.cmon.set_device(self.prof["carts"]["device"])
+        self.cdev_label()
+
+    def fc_changed(self, v):
+        self.prof["carts"]["fade_click"] = v / 10.0
+        self.l_fc.setText("direct" if v == 0 else f"{v / 10:.1f} s".replace(".", ","))
+        if self.engine:
+            self.engine.prof_update("carts", fade_click=v / 10.0)
+
+    # ------------------------------------------------------------ boucle d'affichage
+    def tick(self):
+        if hasattr(self, "res"):
+            self.res.frame()
+        Gov.frame(self.isVisible() and not self.isMinimized())
+        Ticker.get().tick()
+        e = self.engine
+        if e and not e.running:
+            self.engine, self.preview = None, False
+            e = None
+        self.slow_n += 1
+        pin, pout, clip = [-90.0, -90.0], [-90.0, -90.0], False
+        now = time.time()
+        if e:
+            pin, pout = list(e.in_peak), list(e.peak)
+            e.in_peak[:] = [-90.0, -90.0]
+            e.peak[:] = [-90.0, -90.0]
+            clip = now - e.clip_t < 3
+            # à 60 i/s, une image peut tomber entre deux blocs audio (20 ms) : on garde alors la dernière mesure
+            if max(pin + pout) <= -90 and now - self._pk[2] < .06:
+                pin, pout = list(self._pk[0]), list(self._pk[1])
+            elif max(pin + pout) > -90:
+                self._pk = (list(pin), list(pout), now)
+        if not self._live_any:                  # crête-mètre antenne : seulement si un flux est vraiment en ligne
+            pout, clip = [-90.0, -90.0], False
+        try:
+            thr = float(self.fb_ed["threshold"].text())
+        except ValueError:
+            thr = None
+        thr = thr if self.sw_fb.isChecked() else None
+        self.mini_in.set(pin, thr)
+        self.mini_out.set(pout, None, clip)
+        if self.page_key == "diff":
+            self.meter_in.set(pin, thr)
+            self.meter.set(pout, None, clip)
+            if self.slow_n % 3 == 0:
+                self.wave.push(max(pout))
+        if self.slow_n % 6 == 0:
+            self.clock_tick()
+            self.update_ui(e)
+        elif self.slow_n % 6 == 3:              # seconde moitié des mises à jour, décalée : pas de pic sur une seule image
+            self.update_ui2(self.engine)
+        if self.slow_n % 2 == 0:                               # cartouche lue (en-tête) et cartoucheur : 30 i/s
+            st = e.cart_status()[0] if e else {}
+            self.cart_now_update(st)
+            if self.page_key == "cart":
+                self.cart_strip(e, st)
+
+    def update_ui(self, e):
+        if isinstance(e, EngineProxy) and e.running and not e._stopping and time.time() - e._s["t"] > 6:
+            self.engine_died(e, "bloqué (plus de nouvelles depuis 6 s)")
+            return
+        n_live = n_all = 0
+        if self.on_air and e:
+            outs = [o for o in e.outputs if o.cfg.get("enabled", True)]
+            n_all = len(outs)
+            n_live = sum(1 for o in outs if o.state == "live")
+        self._live_any = bool(self.on_air and n_live > 0)
+        note = "" if self._live_any else ("aucun flux en ligne" if self.on_air else ("rien n'est diffusé" if self.preview else ""))
+        self.meter.note = note
+        self.mini_out.note = note
+        self.nav_w.set_air(n_live > 0)
+        if self.bot_btn:
+            self.bot_btn.air = n_live > 0
+        if self.on_air:
+            pulse = (math.sin(time.time() * 4) + 1) / 2
+            if n_live:
+                head = f"●  EN ANTENNE  {fmt_dur(time.time() - e.started)}"
+                self.l_air.setToolTip(f"{n_live} flux sur {n_all} en ligne")
+                fgc = mixc("#ffb3ba", BADC, pulse).name()
+            elif any(o.state == "connecting" for o in e.outputs):
+                head, fgc = "◌  Connexion des flux…", ACC2
+            else:
+                head, fgc = "✕  Aucun flux en ligne", BADC
+            self.set_label(self.l_air, head, fgc)
+            if self.l_air.fontMetrics().horizontalAdvance(head) + 12 > self.l_air.width():
+                self.fit_air_label(head)
+            self.set_kind(self.btn_start, "Arrêter", "stop")
+        else:
+            self.set_label(self.l_air, ("Cartoucheur hors antenne" if self.standalone else "Contrôle d'entrée") if self.preview else "○ Hors antenne",
+                           ACCT if self.preview else MUT)
+            self.set_kind(self.btn_start, "Démarrer", "primary")
+        if self.on_air:
+            self.btn_prev.setText("● Entrée visible")
+            self.btn_prev.setEnabled(False)
+        else:
+            self.btn_prev.setText("■ Arrêter" if (self.preview and not self.standalone) else "Voir l'entrée")
+            self.btn_prev.setEnabled(True)
+        for r, c in enumerate(self.outputs_cfg):
+            if r >= self.tb_out.rowCount():
+                break
+            o = e.output(c["id"]) if (e and not self.preview) else None
+            st = o.state if o else "stopped"
+            cfg_on = c.get("enabled", True)
+            txt = o.status_text() if o else ("○ Arrêté" if cfg_on else "— Désactivé")
+            if o is None and not cfg_on:
+                st = "off"
+            it = self.tb_out.item(r, 4)
+            if it is not None:
+                if it.text() != txt:
+                    it.setText(txt)
+                col = {"live": OKC, "error": "#e5485a", "connecting": ACC2, "stopped": "#7f8c8d", "off": "#566074"}.get(st, TXT)
+                if it.foreground().color().name() != QColor(col).name():
+                    it.setForeground(QColor(col))
+        self.flux_summary(e)
+        self.rupture_ui(e, n_live, n_all)
+        self.update_nowbar(e)
+        if not e:
+            self.set_label(self.l_sig, "Signal : -", MUT)
+            self.set_label(self.l_now, "Titre : -", MUT)
+            self.btn_manual.setText("Lancer la playlist")
+            return
+        self.btn_manual.setText("Revenir au direct" if e.manual else "Lancer la playlist")
+        if e.backup:
+            if e.manual:
+                txt = "Playlist de secours (manuel)"
+            elif e.silent_ms < 1000:
+                txt = f"Playlist de secours - direct détecté, retour dans {max(0.0, e.rec_ms - e.loud_ms) / 1000:.0f} s"
+            else:
+                txt = "Playlist de secours - direct : aucun signal"
+            self.set_label(self.l_sig, txt, ACCT)
+        elif e.silent_ms >= 1000:
+            self.set_label(self.l_sig, f"● Aucun signal depuis {e.silent_ms // 1000} s", BADC)
+        else:
+            self.set_label(self.l_sig, "● Signal détecté", OKC)
+        flags = ("  MUTE" if e.mute else "") + ("  TON" if e.tone else "")
+        self.set_label(self.l_now, ("Titre : " + (e.meta or "-")) + flags, TXT)
+        if self.slow_n % 20 == 0 and self.page_key == "rec":
+            self.rec_tick()
+        elif self.slow_n % 20 == 0 and self.on_air:
+            self.rec_tick()
+
+    def update_ui2(self, e):
+        if e:
+            self.check_outages(e)
+        self.update_playlist_visuals(e)
+        self.update_enabled(e)
+        self.update_health(e)
+
+    @staticmethod
+    def en(w, on, why=""):
+        """Active / grise un contrôle (sans retoucher s'il est déjà dans le bon état), avec la raison en infobulle."""
+        on = bool(on)
+        if w.isEnabled() != on:
+            w.setEnabled(on)
+            if why or on:
+                w.setProperty("_tip", w.property("_tip") if w.property("_tip") is not None else w.toolTip())
+                w.setToolTip(w.property("_tip") if on else why)
+
+    def update_enabled(self, e):
+        """Grise ce qu'on ne peut pas modifier dans la situation présente."""
+        running = bool(e)
+        air = self.on_air
+        self.en(self.btn_prof, not running, "Arrête la diffusion pour changer de profil")
+        self.en(self.btn_prof, not running, "Arrête la diffusion pour gérer les profils")
+        self.en(self.dev_pick, not running, "Arrête la diffusion (ou le contrôle d'entrée) pour changer d'entrée")
+        self.en(self.btn_devref, not running, "Arrête la diffusion pour actualiser les entrées")
+        sel = self.sel_output() is not None
+        for b in getattr(self, "flux_btns", []):
+            self.en(b, sel, "Choisis d'abord un flux dans la liste")
+        self.en(self.btn_run_out, sel and air, "Pendant la diffusion, choisis un flux pour le couper ou le relancer")
+        has_sel = bool(self.pl_tv.sel)
+        self.en(self.btn_plrem, has_sel, "Sélectionne des titres à retirer")
+        self.en(self.btn_playsel, has_sel and air, "Démarre la diffusion et sélectionne un titre")
+        self.en(self.btn_manual, air and bool(self.playlist), "Démarre la diffusion avec au moins un titre dans la playlist de secours")
+        if hasattr(self, "al_testb"):
+            self.en(self.al_testb, bool(self.alerts.channels()), "Configure d'abord un mail, un SMS ou un message")
+        if hasattr(self, "btn_lstop"):
+            self.en(self.btn_lstop, self.listen_proc is not None, "Aucune écoute en cours")
+        if hasattr(self, "gray_net"):
+            ok = self.net_sel() is not None
+            for b in self.gray_net:
+                self.en(b, ok, "Choisis d'abord une connexion dans la liste")
+
+    @staticmethod
+    def set_label(l, text, color):
+        if l.text() != text:
+            l.setText(text)
+        if isinstance(l, CLabel):
+            l.set_color(color)
+            return
+        ss = f"color:{color};" + ("font-weight:700;" if l.objectName() == "" and l.styleSheet().find("font-weight:700") >= 0 else "")
+        if l.property("_c") != color:
+            l.setProperty("_c", color)
+            l.setStyleSheet(ss)
+
+    @staticmethod
+    def set_kind(b, text, kind):
+        if b.text() != text:
+            b.setText(text)
+        if b.property("kind") != kind:
+            b.setProperty("kind", kind)
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def rupture_ui(self, e, n_live, n_all):
+        """Deux alertes bien distinctes : ROUGE = rupture de flux (le son ne sort plus vers les auditeurs),
+        AMBRE = pas de son en entrée (les flux sont en ligne mais diffusent du silence, ou le secours a pris le relais)."""
+        bad = []
+        silent = None
+        if self.on_air and e:
+            bad = [o.cfg["name"] for o in e.outputs if o.cfg.get("enabled", True) and o.state == "error"]
+            if not bad and n_all and n_live == 0 and time.time() - e.started > 8 and not any(o.state == "connecting" for o in e.outputs):
+                bad = ["aucun flux en ligne"]
+            if not e.mute and e.silent_ms >= 5000 and time.time() - e.started > 6:
+                silent = "backup" if e.backup else "dead"
+        kind = "flux" if bad else ("son" if silent == "dead" else ("secours" if silent == "backup" else None))
+        if kind:
+            pulse = (math.sin(time.time() * 5) + 1) / 2
+            if kind == "flux":
+                c = mixc("#c4263a", "#ff4d5e", pulse).name()
+                txt = "⚠  RUPTURE DE FLUX  ·  " + ", ".join(bad[:3]) + "  ·  les auditeurs ne reçoivent plus l'antenne  ·  reconnexion automatique"
+                if silent == "dead":
+                    txt += "  ·  et pas de son en entrée"
+                fg = "white"
+            elif kind == "son":
+                c = mixc("#b86e00", "#ffb020", pulse).name()
+                txt = f"⚠  PAS DE SON À L'ANTENNE  ·  aucun signal en entrée depuis {e.silent_ms // 1000} s  ·  les flux sont en ligne mais diffusent du silence"
+                fg = "#1d0d03"
+            else:
+                c = mixc("#7a5a10", "#a07a18", pulse * .4).name()
+                txt = f"PLAYLIST DE SECOURS À L'ANTENNE  ·  plus de signal en entrée depuis {e.silent_ms // 1000} s  ·  la playlist de secours a pris le relais"
+                fg = "white"
+            self.banner.set_colors(c, fg)
+            if self.banner.text() != txt:
+                self.banner.setText(txt)
+        if kind != getattr(self, "alert_kind", None):
+            prev = getattr(self, "alert_kind", None)
+            self.alert_kind = kind
+            self.banner.setVisible(bool(kind))
+            border = {"flux": "#ff4d5e", "son": "#ffb020"}.get(kind)
+            self.centralWidget().set_border(border)
+            if kind == "flux":
+                QApplication.beep()
+                self.log("⚠ Rupture de flux : " + ", ".join(bad))
+            elif kind == "son":
+                QApplication.beep()
+                self.log(f"⚠ Pas de son à l'antenne depuis {e.silent_ms // 1000} s (les flux sont en ligne).")
+            elif prev in ("flux", "son"):
+                self.log("Antenne rétablie.")
+        self.alert_on = kind == "flux"
+        air = bool(self.on_air and not self.preview)     # contrôle d'entrée / cartoucheur seul : le phare reste éteint et immobile
+        self.air_fx.set(bool(air and n_live > 0), ("flux" if kind == "flux" else ("son" if kind == "son" else False)) if air else False)
+
+    def update_playlist_visuals(self, e):
+        cur = e.pl_cur if (e and e.backup) else None
+        idx = cur["i"] if cur else -1
+        cnt = self.data.get("counts", {})
+        sig = (idx, tuple(cnt.get(f, 0) for f in self.playlist))
+        if sig != getattr(self, "pl_sig", None):
+            self.pl_sig = sig
+            self.pl_tv.set(self.pl_rows(), idx)
+        if cur and cur["dur"]:
+            self.pl_tv.set_prog(max(0.0, (e.pl_out - cur["start"]) / 176400) / cur["dur"])
+        else:
+            self.pl_tv.set_prog(0.0)
+        self.set_cover(cur["path"] if cur else (self.cover_path or None))
+
+    def update_nowbar(self, e):
+        if not e:
+            self.set_label(self.now_main, "○ Rien en lecture", MUT)
+            self.now_sub.setText("")
+            return
+        if e.mute:
+            txt, col = "ANTENNE COUPÉE", "#ff6b5e"
+        elif e.tone:
+            txt, col = "Tonalité 1 kHz à l'antenne", "#5dade2"
+        elif e.backup:
+            txt, col = "PLAYLIST DE SECOURS · " + (e.track or ""), "#f5b041"
+        elif e.silent_ms >= 1000:
+            txt, col = f"● Direct : aucun signal depuis {e.silent_ms // 1000} s", "#ff6b5e"
+        else:
+            txt, col = "DIRECT" + (" · " + e.meta if e.meta else ""), "#58d68d"
+        if self.preview:
+            txt = "Cartoucheur hors antenne" if e.standalone else "Contrôle d'entrée (rien n'est diffusé)"
+        self.set_label(self.now_main, txt, col)
+        self.now_sub.setText("audio ralenti (voir SOS)" if e.slow_now() else "")
+
+    def flux_summary(self, e):
+        live, bad, wait, off = [], [], [], []
+        for c in self.outputs_cfg:
+            o = e.output(c["id"]) if (e and not self.preview) else None
+            if not c.get("enabled", True):
+                off.append(c["name"])
+            elif o is None:
+                continue
+            elif o.state == "live":
+                live.append(c["name"])
+            elif o.state == "error":
+                bad.append(c["name"])
+            elif o.state == "connecting":
+                wait.append(c["name"])
+        if not (e and self.on_air):
+            act = [c["name"] for c in self.outputs_cfg if c.get("enabled", True)]
+            txt = ("Prêts à démarrer : " + ", ".join(act)) if act else "Aucun flux actif : ajoute-en un, ou coche « Actif »."
+            if off:
+                txt += "   ·   Désactivés : " + ", ".join(off)
+            fg = MUT
+        else:
+            parts = []
+            if live:
+                parts.append("● En ligne : " + ", ".join(live))
+            if wait:
+                parts.append("◌ Connexion : " + ", ".join(wait))
+            if bad:
+                parts.append("✕ Problème : " + ", ".join(bad))
+            if off:
+                parts.append("— Désactivés : " + ", ".join(off))
+            txt = "   ·   ".join(parts) or "Aucun flux actif."
+            fg = BADC if (bad or not live) else (ACC2 if wait else OKC)
+        self.set_label(self.l_flux, txt, fg)
+
+    # ------------------------------------------------------------ mises à jour + bulle de Radiobot
+    def update_start(self, manual=False):
+        st = self.data.setdefault("settings", {})
+        repo = st.get("update_repo") or UPDATE_REPO
+        if not repo:
+            if not manual:
+                return
+            txt, ok = QInputDialog.getText(self, "Mise à jour", "Dépôt GitHub où sont publiées les versions (compte/depot) :\n"
+                                           "(rempli automatiquement dans la version téléchargée depuis GitHub)")
+            if not ok or not txt.strip():
+                return
+            repo = txt.strip()
+            st["update_repo"] = repo
+            self.save_settings()
+
+        def work():
+            r = check_update(repo)
+            self.ui(self.update_result, r, manual)
+        if manual:
+            self.log("Recherche de mises à jour…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_result(self, r, manual):
+        if not r or r.get("error"):
+            if manual:
+                info(self, "Mise à jour", (r or {}).get("error") or "Recherche impossible.")
+            return
+        newer = parse_ver(r["tag"]) > parse_ver(VERSION)
+        skip = self.data.get("settings", {}).get("update_skip") == r["tag"]
+        if newer and (manual or not skip):
+            self.update_bubble(r)
+        elif manual:
+            info(self, "Mise à jour", f"Tu as déjà la dernière version ({VERSION}). Dernière version publiée : {r['tag'] or '—'}.")
+
+    def update_bubble(self, r):
+        self.update_bubble_close()
+        self.upd_info = r
+        self.bot_talk = 60
+        b = Card(parent=self.centralWidget())
+        b.lay.setContentsMargins(16, 12, 16, 14)
+        t = lab(f"Nouvelle version {r['tag']} disponible !", "")
+        t.setStyleSheet("font-weight:700;font-size:14px;")
+        b.lay.addWidget(t)
+        notes = " ".join(r["notes"].split())[:160]
+        m = lab(f"Tu as la {VERSION}." + (f"  {notes}" if notes else ""), "mut", True)
+        m.setMaximumWidth(320)
+        b.lay.addWidget(m)
+        h = QHBoxLayout()
+        h.addWidget(btn("Télécharger", "primary", lambda: (webbrowser.open(r.get("asset") or r["url"]), self.update_bubble_close())))
+
+        def later():
+            self.data.setdefault("settings", {})["update_skip"] = r["tag"]
+            self.save_settings()
+            self.update_bubble_close()
+        h.addWidget(btn("Plus tard", "", later))
+        h.addStretch(1)
+        b.lay.addLayout(h)
+        b.adjustSize()
+        if NAVTOP:
+            b.move(self.width() - b.width() - 14, TopNav.H + 14)
+        else:
+            b.move(Rail.W + 10, 14)
+        b.show()
+        b.raise_()
+        self.upd_bubble = b
+
+    def update_bubble_close(self):
+        if self.upd_bubble is not None:
+            self.upd_bubble.hide()
+            self.upd_bubble.deleteLater()
+            self.upd_bubble = None
+
+    # ------------------------------------------------------------ fermeture
+    def closeEvent(self, ev):
+        try:
+            os.remove(self.MARK)                  # fermeture normale : pas de reprise automatique au prochain lancement
+        except OSError:
+            pass
+        try:
+            self.save_all()
+        except Exception:
+            pass
+        try:
+            self.mon_listen_stop()
+        except Exception:
+            pass
+        try:
+            self.fx_stop()
+        except Exception:
+            pass
+        try:
+            if self.engine:
+                self.engine.stop()
+        except Exception:
+            pass
+        try:
+            if self.slot is not None:
+                self.slot.close()
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
+def load_fonts():
+    """Polices intégrées au fichier (Inter, Space Grotesk) : même rendu partout, sans rien installer."""
+    import zlib
+    fams = []
+    for name, parts in _FONT_BLOB.items():
+        try:
+            raw = zlib.decompress(base64.b64decode("".join(parts)))
+            i = QFontDatabase.addApplicationFontFromData(raw)
+            if i >= 0:
+                fams += QFontDatabase.applicationFontFamilies(i)
+        except Exception:
+            pass
+    return fams
+
+
+def win_timer_1ms():
+    """Windows cadence ses minuteurs par pas de 15,6 ms par défaut : un rendu « 60 i/s » y tombe souvent à 30-40. On
+    demande la précision d'1 ms (comme les navigateurs et lecteurs vidéo) pendant que l'application tourne."""
+    if SYS == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
+
+def main():
+    try:
+        sys.setswitchinterval(0.002)  # le moteur audio reprend la main plus vite que l'interface
+    except Exception:
+        pass
+    win_timer_1ms()
+    if SYS == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fr.radio.bev")
+        except Exception:
+            pass
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP)
+    app.setStyle("Fusion")
+    load_fonts()
+    try:
+        pm = QPixmap()
+        pm.loadFromData(base64.b64decode("".join(_ICON_B64) if not isinstance(_ICON_B64, str) else _ICON_B64))
+        if not pm.isNull():
+            app.setWindowIcon(QIcon(pm))
+    except Exception:
+        pass
+    app.setStyleSheet(qss())
+    selftest = "--selftest" in sys.argv
+    errs = []
+    if selftest:                       # vérification automatique (construction GitHub) : tout ouvrir, puis quitter
+        import traceback
+        sys.excepthook = lambda *a: errs.append("".join(traceback.format_exception(*a)))
+    sp = None
+    if not selftest and not MINI:
+        try:
+            sp = Splash()
+            sp.show()
+            sp.spin(1100)
+        except Exception:
+            sp = None
+    w = MainWindow()
+    if sp is not None:
+        try:
+            sp.spin(500)
+            sp.close()
+        except Exception:
+            pass
+    w.show()
+    if selftest:
+        for k, key in enumerate(PAGE_KEYS):
+            QTimer.singleShot(1500 + k * 500, lambda key=key: w.go_tab(key))
+
+        def done():
+            rep = [f"{APP} {VERSION} · Python {platform.python_version()} · {platform.platform()}",
+                   "ffmpeg : " + (shutil.which("ffmpeg") or "INTROUVABLE"), "ffprobe : " + (shutil.which("ffprobe") or "INTROUVABLE"),
+                   "numpy : " + ("oui" if np is not None else "non"), "sounddevice : " + ("oui" if have_module("sounddevice") else "non"),
+                   "psutil : " + ("oui" if have_module("psutil") else "non"),
+                   "capture son de l'ordinateur : " + ("oui" if have_loopback() else ("non" if SYS == "Windows" else "sans objet")),
+                   "moteur audio séparé : " + (("oui (pid %s)" % w.slot.pid) if (w.slot is not None and w.slot.alive())
+                                               else "non (" + ((w.slot.error if w.slot is not None else "") or "pas lancé") + ")"),
+                   f"erreurs : {len(errs)}"] + errs
+            try:
+                with open("selftest.txt", "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(rep) + "\n")
+            except OSError:
+                pass
+            bad = bool(errs) or (SYS == "Windows" and not shutil.which("ffmpeg"))
+            w._closing = True
+            app.exit(1 if bad else 0)
+        QTimer.singleShot(1500 + len(PAGE_KEYS) * 500 + 2500, done)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
