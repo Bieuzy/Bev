@@ -34,6 +34,108 @@ from array import array
 from collections import deque
 from urllib.parse import quote, urlencode
 
+
+# ======================================================================================================================
+# VERSION ET MISE À JOUR EXPRESS
+# La plupart des versions de Bev ne changent que son code (ce fichier). Plutôt que de télécharger et d'exécuter un nouvel
+# installateur de 190 Mo (non signé : Smart App Control, SmartScreen et certains antivirus le bloquent), Bev télécharge
+# seulement le nouveau code (~1 Mo), vérifie son empreinte SHA-256, puis redémarre dessus. L'exécutable installé, lui, ne
+# change pas : rien de nouveau à « exécuter » pour Windows, pas de droits administrateur, pas de pare-feu à convaincre.
+# Garde-fous : le code express n'est utilisé que s'il est plus récent que la version installée, prévu pour le même « socle »
+# (RUNTIME : exécutable, Python et bibliothèques), intact (empreinte), et s'il démarre bien ; après deux démarrages ratés,
+# Bev revient tout seul à la version installée. Le moteur audio (processus séparé) suit toujours le code de l'interface.
+# RUNTIME est à augmenter quand le socle change (nouvelle bibliothèque, nouvelle version de Python, de PySide6, de ffmpeg…) :
+# les versions concernées passent alors par l'installateur complet.
+# ======================================================================================================================
+VERSION = "1.2.0"
+RUNTIME = 1
+UPD_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
+    "~/Library/Application Support" if sys.platform == "darwin" else "~/.local/share"), "Bev", "maj")
+UPD_STATE = os.path.join(UPD_DIR, "actuel.json")
+
+
+def _ver_tuple(s):
+    return tuple(int(n) for n in re.findall(r"\d+", str(s).split("-")[0])[:4]) or (0,)
+
+
+def express_log(msg):
+    try:
+        os.makedirs(UPD_DIR, exist_ok=True)
+        with open(os.path.join(UPD_DIR, "journal.txt"), "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def express_state(update=None):
+    """État de la mise à jour express (actuel.json) ; update : champs à modifier (écriture atomique)."""
+    try:
+        with open(UPD_STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    if update:
+        st.update(update)
+        try:
+            os.makedirs(UPD_DIR, exist_ok=True)
+            with open(UPD_STATE + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(st, fh)
+            os.replace(UPD_STATE + ".tmp", UPD_STATE)
+        except OSError:
+            pass
+    return st
+
+
+def _express_boot():
+    """Au lancement de l'application empaquetée : passe sur le code express s'il est valide (sinon : version installée)."""
+    if not getattr(sys, "frozen", False) or globals().get("_BEV_EXPRESS") or "--selftest" in sys.argv:
+        return
+    code = os.environ.get("BEV_CODE")               # moteur audio lancé par l'interface : exactement le même code qu'elle
+    worker = "--bev-engine" in sys.argv
+    if not code:
+        if worker:
+            return
+        st = express_state()
+        f = os.path.join(UPD_DIR, os.path.basename(str(st.get("file") or "")))
+        if not (st.get("file") and _ver_tuple(st.get("version")) > _ver_tuple(VERSION) and st.get("runtime") == RUNTIME):
+            os.environ["BEV_CODE"] = "builtin"
+            return
+        if int(st.get("fails", 0)) >= 2:            # deux démarrages ratés : on reste sur la version installée
+            express_log(f"Code express {st.get('version')} écarté (démarrages ratés) : version installée {VERSION}.")
+            os.environ["BEV_CODE"] = "builtin"
+            return
+        try:
+            import hashlib as _h
+            with open(f, "rb") as fh:
+                ok = _h.sha256(fh.read()).hexdigest() == st.get("sha256")
+        except OSError:
+            ok = False
+        if not ok:
+            express_log(f"Code express {st.get('version')} absent ou abîmé : version installée {VERSION}.")
+            os.environ["BEV_CODE"] = "builtin"
+            return
+        express_state({"fails": int(st.get("fails", 0)) + 1})   # remis à zéro quand Bev a bien démarré
+        code = f
+    if code == "builtin" or not os.path.isfile(code):
+        return
+    os.environ["BEV_CODE"] = code
+    ns = {"__name__": "__bev_express__", "__file__": code, "_BEV_EXPRESS": code, "__builtins__": __builtins__}
+    try:
+        with open(code, "rb") as fh:
+            exec(compile(fh.read(), code, "exec"), ns)
+    except SystemExit:
+        raise
+    except BaseException as ex:                      # (module introuvable, erreur…) : la version installée prend le relais
+        express_log(f"Code express inutilisable ({type(ex).__name__}: {ex}) : version installée {VERSION}.")
+        os.environ["BEV_CODE"] = "builtin"
+        if not worker:
+            express_state({"fails": 2})
+        return
+    sys.exit((ns["_engine_worker_main"] if worker else ns["main"])() or 0)
+
+
+_express_boot()
+
 try:  # calcul audio rapide (installé automatiquement si absent)
     import numpy as np
 except Exception:
@@ -3351,9 +3453,10 @@ def clean_env(splash=True, reset=True):
     return env
 
 
-def relaunch_self():
+def relaunch_self(fresh=False):
     """Relance l'application (après un réglage d'Apparence, une réinitialisation…) : la nouvelle fenêtre attend que
-    l'ancienne soit complètement fermée avant de s'ouvrir (--after <pid>)."""
+    l'ancienne soit complètement fermée avant de s'ouvrir (--after <pid>). fresh : repart du code le plus récent
+    (mise à jour express) au lieu de rester sur celui qui tourne."""
     args, skip = [], False
     for a in (sys.argv[1:] if getattr(sys, "frozen", False) or "__compiled__" in globals() else sys.argv[1:]):
         if skip:
@@ -3367,7 +3470,10 @@ def relaunch_self():
         args.append(a)
     base = [sys.executable] if (getattr(sys, "frozen", False) or "__compiled__" in globals()) else [sys.executable, os.path.abspath(sys.argv[0])]
     kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {"start_new_session": True}
-    subprocess.Popen(base + args + ["--after", str(os.getpid())], env=clean_env(True), close_fds=True,
+    env = clean_env(True)
+    if fresh:
+        env.pop("BEV_CODE", None)
+    subprocess.Popen(base + args + ["--after", str(os.getpid())], env=env, close_fds=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
 
 
@@ -8455,7 +8561,34 @@ Problèmes fréquents
 """
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
-VERSION = "1.1.0"
+NEWS = {
+    "1.2.0": """## Des mises à jour qui passent toutes seules
+
+- **Mise à jour express** : la plupart des versions ne pèsent plus que ~1 Mo. Bev récupère son nouveau code, vérifie son empreinte, et redémarre en quelques secondes. Pas d'installateur à lancer, pas de droits administrateur : Smart App Control, SmartScreen, l'antivirus et le pare-feu n'ont plus rien à bloquer.
+- Si une version a besoin de l'installateur complet (nouvelles bibliothèques), Bev le dit clairement, affiche la progression (taille, débit, temps restant) et **ne se ferme que si l'installation a vraiment démarré**. Si Windows la bloque, Bev reste ouvert et explique quoi faire.
+- Garde-fou : si une nouvelle version ne démarre pas, Bev revient tout seul à la précédente.
+- À l'antenne, rien ne coupe le direct : la mise à jour s'applique au prochain démarrage.
+
+## Gaël et ses bulles
+
+- Gaël a une **animation de mise à jour** : il réceptionne les colis de la nouvelle version dans un carton qui se remplit, le ferme d'un ruban et saute de joie quand tout est prêt.
+- Les bulles changent en douceur au fil de l'opération (téléchargement, vérification, prêt, redémarrage) au lieu de s'empiler.
+- Les bulles ont une largeur bornée et restent dans la fenêtre : elles ne débordent plus sur l'application.
+- Après une mise à jour, Gaël l'annonce, avec un lien vers les nouveautés.
+
+## À propos
+
+- Nouvelle case **Nouveautés de la version**, et accès aux notes de toutes les versions.""",
+    "1.1.0": """## Un vrai processeur d'antenne
+
+- Traitement temps réel de tout ce qui part à l'antenne : AGC, compresseur-limiteur 5 bandes à phase linéaire, élargisseur stéréo, écrêteur suréchantillonné, limiteur sur les crêtes vraies.
+- 10 préréglages radio, réglage MOINS ↔ PLUS, vumètres et sonie LUFS, bypass sans coupure.
+
+## Diffusion
+
+- Les noms des flux défilent dans la pastille EN ANTENNE.
+- Playlist de secours : bandeau et cadre jaunes ; le phare change d'animation selon l'état de l'antenne.""",
+}
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
 
 
@@ -8468,6 +8601,132 @@ def parse_ver(s):
 def installed_copy():
     """Bev installé par l'installateur Windows (désinstalleur présent à côté de l'exécutable) : mise à jour automatique possible."""
     return bool(getattr(sys, "frozen", False)) and os.path.isfile(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
+
+
+def fmt_size(n):
+    n = float(n or 0)
+    if n >= 1e6:
+        return ("%.1f Mo" % (n / 1e6)).replace(".", ",")
+    return "%d Ko" % max(0, round(n / 1e3))
+
+
+def download(url, dst, prog=None, size=0, timeout=30):
+    """Téléchargement HTTPS en flux (progression, reprise sur coupure brève, empreinte SHA-256 calculée en route).
+    Renvoie (octets reçus, empreinte)."""
+    h = hashlib.sha256()
+    got, last_t = 0, 0.0
+    for attempt in range(3):
+        try:
+            hdr = {"User-Agent": "Bev-update"}
+            if got:
+                hdr["Range"] = f"bytes={got}-"
+            rq = urllib.request.Request(url, headers=hdr)
+            with urllib.request.urlopen(rq, timeout=timeout) as resp, open(dst, "ab" if got else "wb") as fh:
+                if got and resp.status != 206:              # le serveur ne reprend pas : on recommence au début
+                    fh.seek(0)
+                    fh.truncate()
+                    got, h = 0, hashlib.sha256()
+                total = int(resp.headers.get("Content-Length") or 0) + got or int(size or 0)
+                while True:
+                    blk = resp.read(256 * 1024)
+                    if not blk:
+                        break
+                    fh.write(blk)
+                    h.update(blk)
+                    got += len(blk)
+                    now = time.time()
+                    if prog and now - last_t > .08:
+                        last_t = now
+                        prog(got, total)
+            if size and got != size:
+                raise RuntimeError(f"fichier incomplet ({fmt_size(got)} sur {fmt_size(size)})")
+            if prog:
+                prog(got, total or got)
+            return got, h.hexdigest()
+        except (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout) as ex:
+            if attempt == 2:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    return got, h.hexdigest()
+
+
+def friendly_dl_error(ex):
+    t = str(ex)
+    if isinstance(ex, urllib.error.HTTPError):
+        return f"GitHub a répondu avec l'erreur {ex.code}"
+    if isinstance(ex, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError)):
+        return "la connexion à Internet a été interrompue (ou un pare-feu bloque github.com)"
+    if isinstance(ex, PermissionError) or "Permission" in t or "denied" in t.lower():
+        return "l'antivirus ou Windows a empêché d'enregistrer le fichier"
+    if isinstance(ex, OSError) and getattr(ex, "errno", None) == 28:
+        return "le disque est plein"
+    return t[:160] or type(ex).__name__
+
+
+def md_html(md):
+    """Notes de version (Markdown simple de GitHub : titres, listes, gras, liens) -> HTML pour l'affichage."""
+    import html as _h
+    out, in_ul = [], False
+    for raw in (md or "").replace("\r", "").split("\n"):
+        line = raw.rstrip()
+        m = re.match(r"^\s*[-*•]\s+(.*)", line)
+        if not m and in_ul:
+            out.append("</ul>")
+            in_ul = False
+        txt = _h.escape(m.group(1) if m else line.lstrip("# ").strip())
+        txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", txt)
+        txt = re.sub(r"(?<![*\w])\*(?!\s)(.+?)\*(?!\w)", r"<i>\1</i>", txt)
+        txt = re.sub(r"\[(.+?)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', txt)
+        if m:
+            if not in_ul:
+                out.append("<ul style='margin-top:2px;margin-bottom:6px'>")
+                in_ul = True
+            out.append(f"<li style='margin-bottom:3px'>{txt}</li>")
+        elif line.startswith("#"):
+            out.append(f"<h3 style='margin-top:12px;margin-bottom:4px'>{txt}</h3>")
+        elif re.fullmatch(r"-{3,}", line.strip()):
+            out.append("<hr>")
+        elif txt:
+            out.append(f"<p style='margin-top:2px;margin-bottom:6px'>{txt}</p>")
+    if in_ul:
+        out.append("</ul>")
+    return "".join(out)
+
+
+def express_plan(assets, tag, get):
+    """La nouvelle version peut-elle s'installer en express (code seul) ? -> (infos, None) ou (None, raison)."""
+    if not getattr(sys, "frozen", False):
+        return None, "lancé depuis le code source"
+    by = {str(a.get("name", "")): a for a in assets}
+    m = by.get("bev-maj.json")
+    if not m:
+        return None, "pas de mise à jour express pour cette version"
+    try:
+        man = get(m["browser_download_url"])
+    except Exception as ex:
+        return None, f"manifeste illisible ({ex})"
+    if not isinstance(man, dict) or _ver_tuple(man.get("version")) != _ver_tuple(tag):
+        return None, "manifeste d'une autre version"
+    if man.get("runtime") != RUNTIME:
+        return None, "cette version change le socle de Bev (bibliothèques)"
+    f = by.get(str(man.get("file", "")))
+    if not f or not re.fullmatch(r"[0-9a-f]{64}", str(man.get("sha256", ""))):
+        return None, "fichier de mise à jour absent"
+    need = list(man.get("modules") or []) + (list(man.get("windows_modules") or []) if SYS == "Windows" else [])
+    missing = []
+    for mod in need:
+        try:
+            if importlib.util.find_spec(mod) is None:
+                missing.append(mod)
+        except Exception:
+            missing.append(mod)
+    if missing:
+        return None, "modules absents du socle : " + ", ".join(missing[:4])
+    dg = str(f.get("digest") or "")
+    if dg.startswith("sha256:") and dg[7:].lower() != man["sha256"]:
+        return None, "empreintes différentes entre GitHub et le manifeste"
+    return {"url": f["browser_download_url"], "file": os.path.basename(str(man["file"])), "sha256": man["sha256"],
+            "size": int(man.get("size") or f.get("size") or 0), "version": str(man["version"])}, None
 
 
 def check_update(repo, timeout=10):
@@ -8496,10 +8755,12 @@ def check_update(repo, timeout=10):
         assets = [a for a in js.get("assets", []) if exts and str(a.get("name", "")).lower().endswith(exts)]
         assets.sort(key=lambda a: "setup" not in str(a.get("name", "")).lower())     # l'installateur d'abord
         a = assets[0] if assets else {}
-        return {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(),
-                "title": str(js.get("name") or "").strip(),
-                "asset": a.get("browser_download_url", ""), "asset_name": a.get("name", ""), "size": int(a.get("size") or 0),
-                "digest": str(a.get("digest") or "")}
+        res = {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(),
+               "title": str(js.get("name") or "").strip(),
+               "asset": a.get("browser_download_url", ""), "asset_name": a.get("name", ""), "size": int(a.get("size") or 0),
+               "digest": str(a.get("digest") or "")}
+        res["express"], res["express_why"] = express_plan(js.get("assets", []), res["tag"], get)
+        return res
     except urllib.error.HTTPError as ex:
         if ex.code == 404:
             return {"error": f"Dépôt « {repo} » introuvable. Vérifie son nom, et qu'il est public."}
@@ -9804,8 +10065,124 @@ class AHello(GAnim):
         return P
 
 
+class AMaj(GAnim):
+    """Mise à jour : la nouvelle version tombe du ciel en petits colis que Gaël réceptionne dans un carton posé à ses pieds
+    (le carton se remplit au rythme du téléchargement). Une fois tout reçu, le carton se ferme d'un ruban et Gaël saute de
+    joie au milieu des étincelles ; en cas d'échec, il se gratte la tête. Elle dure tant que la mise à jour n'est pas finie."""
+    name, label, dur = "maj", "La mise à jour", 3600.0
+    BX, BW, BH = 50.0, 34.0, 26.0
+
+    def __init__(self):
+        super().__init__()
+        self.k, self.state, self.t_state = 0.0, "dl", time.monotonic()
+
+    def set(self, state=None, k=None):
+        if state is not None and state != self.state:
+            self.state, self.t_state = state, time.monotonic()
+        if k is not None:
+            self.k = max(0.0, min(1.0, float(k)))
+
+    def since(self):
+        return time.monotonic() - self.t_state
+
+    def pose(self, t, P):
+        st, d = self.state, self.since()
+        if st == "dl":                               # regarde les colis tomber, la main tendue vers le carton
+            h = ik(1, 36, -4 + 3 * math.sin(t * 3))
+            nod = math.sin(t * 2 * math.pi / .9)
+            P.update(ra1=h[0], ra2=h[1], look=.9, lookv=-.4 + .3 * math.sin(t * 1.4), head=2.5 * nod, eye=0, mouth=0,
+                     y=-1.2 * abs(nod))
+        elif st == "done":                           # saut de joie, les deux bras en l'air, puis pouce levé
+            j = max(0.0, 1 - d / 1.6)
+            hop = abs(math.sin(d * 7.5)) * j
+            arms = 1.0 if d < 1.6 else max(0.0, 1 - (d - 1.6) / .5)
+            P.update(y=-9 * hop, la1=lerp(P["la1"], 150, arms), la2=lerp(P["la2"], 20, arms), ra1=lerp(P["ra1"], 150, arms),
+                     ra2=lerp(P["ra2"], 20 + 18 * math.sin(d * 10) * arms, arms), eye=1, mouth=2, head=-4 * math.sin(d * 7.5) * j)
+        elif st == "restart":                        # au revoir : petit signe de la main
+            P.update(ra1=150, ra2=18 + math.sin(t * 13) * 26, eye=1, mouth=2, head=-4)
+        else:                                        # échec : il se gratte la tête, perplexe
+            h = ik(1, 14, -78)
+            P.update(ra1=h[0], ra2=h[1] + 6 * math.sin(t * 9), eye=4, mouth=0, head=-6, look=-.5)
+        return P
+
+    def front(self, p, t, gp, P):
+        st, d = self.state, self.since()
+        bx, bw, bh = self.BX, self.BW, self.BH
+        x0, y0 = bx - bw / 2, -bh
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        if st == "dl":                               # colis qui tombent dans le carton
+            per = .62
+            for i in range(4):
+                u = ((t + i * per) % (per * 4)) / (per * 4)
+                y = lerp(-212, y0 - 4, u * u)
+                a = _cl(min(u * 6, (1 - u) * 9))
+                x = bx + math.sin(u * 5 + i * 1.7) * 6 * (1 - u)
+                c = QColor("#e9dfc8")
+                c.setAlphaF(a)
+                p.setBrush(c)
+                p.drawRoundedRect(QRectF(x - 5, y - 5, 10, 10), 2, 2)
+                ac = QColor(ACC)
+                ac.setAlphaF(a)
+                p.setPen(QPen(ac, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x, y - 3), QPointF(x, y + 2.5))
+                p.drawLine(QPointF(x - 2.6, y), QPointF(x, y + 2.8))
+                p.drawLine(QPointF(x + 2.6, y), QPointF(x, y + 2.8))
+                p.setPen(Qt.PenStyle.NoPen)
+        # carton (de face) : le contenu monte avec le téléchargement
+        p.setBrush(qc("#000000", 64))
+        p.drawEllipse(QPointF(bx, 1), bw * .62, 3)
+        p.setBrush(QColor("#c9965a"))
+        p.drawRoundedRect(QRectF(x0, y0, bw, bh), 2.5, 2.5)
+        k = 1.0 if st in ("done", "restart") else self.k
+        if k > 0:
+            fill = QLinearGradient(0, y0, 0, 0)
+            fill.setColorAt(0, QColor(ACC2))
+            fill.setColorAt(1, QColor(ACC))
+            p.setBrush(QBrush(fill))
+            fh = (bh - 7) * k
+            p.drawRoundedRect(QRectF(x0 + 4, -3.5 - fh, bw - 8, fh), 1.5, 1.5)
+        p.setBrush(QColor("#a87a43"))
+        p.drawRect(QRectF(x0, y0, bw, 3))
+        if st in ("done", "restart"):                # rabats fermés + ruban
+            c = min(1.0, d / .35)
+            p.setBrush(QColor("#b9864d"))
+            p.drawRect(QRectF(x0 - 1, y0 - 3 * c, bw + 2, 4))
+            p.setBrush(QColor(ONAIR_RED))
+            p.drawRect(QRectF(bx - 2.5, y0 - 3 * c, 5, bh + 3 * c))
+            for sd in (-1, 1):                       # nœud
+                bow = QPainterPath(QPointF(bx, y0 - 3 * c))
+                bow.cubicTo(QPointF(bx + sd * 10, y0 - 13 * c), QPointF(bx + sd * 12, y0 - 2 * c), QPointF(bx, y0 - 3 * c))
+                p.drawPath(bow)
+            for i in range(6):                       # étincelles
+                u = ((d * .8) + i / 6) % 1.0
+                ang = i * 1.05 + d * .4
+                sc = QColor(SECOURS_Y if i % 2 else ACC2)
+                sc.setAlphaF(_cl(min(u * 4, (1 - u) * 2.5)))
+                draw_sparkle(p, bx + math.cos(ang) * (16 + 22 * u), y0 - 10 + math.sin(ang) * (12 + 16 * u) - 18 * u,
+                             2.2 + 2.4 * (1 - u), sc)
+        else:                                        # rabats ouverts
+            p.setBrush(QColor("#b9864d"))
+            for sd in (-1, 1):
+                fl = QPainterPath(QPointF(bx + sd * bw / 2, y0))
+                fl.lineTo(QPointF(bx + sd * (bw / 2 + 7), y0 - 8))
+                fl.lineTo(QPointF(bx + sd * (bw / 2 - 9), y0 - 8))
+                fl.lineTo(QPointF(bx + sd * (bw / 2 - 11), y0))
+                fl.closeSubpath()
+                p.drawPath(fl)
+            if st == "err":                          # point d'interrogation au-dessus du carton
+                p.setPen(QColor(ACC2))
+                f = QFont()
+                f.setPixelSize(16)
+                f.setBold(True)
+                p.setFont(f)
+                p.drawText(QRectF(bx - 10, y0 - 34 + 2 * math.sin(t * 3), 20, 20), Qt.AlignmentFlag.AlignCenter, "?")
+        p.restore()
+
+
 G_ANIMS = [AGavotte(), ACrepes(), ACrachin(), AGoeland(), ACafe(), ACasque(), AEtire(), AHoquet()]
 G_HELLO = AHello()
+G_MAJ = AMaj()
 
 
 class GaelView(QWidget):
@@ -14276,7 +14653,9 @@ class PagesMixin1:
             qv = PySide6.__version__
         except Exception:
             qv = "?"
-        self.about_info = [("Version de l'application", VERSION), ("Python", platform.python_version()), ("Qt (PySide6)", qv),
+        code = os.environ.get("BEV_CODE")
+        vtxt = VERSION + (f"  (mise à jour express, installée : {express_state().get('from') or '?'})" if code and code != "builtin" else "")
+        self.about_info = [("Version de l'application", vtxt), ("Python", platform.python_version()), ("Qt (PySide6)", qv),
                            ("Système", platform.platform()[:52]), ("ffmpeg", ff or "introuvable"),
                            ("numpy (calcul rapide)", "oui" if np is not None else "non"),
                            ("sounddevice (cartes son)", "oui" if have_module("sounddevice") else "non"),
@@ -14295,6 +14674,28 @@ class PagesMixin1:
         h.addStretch(1)
         sy.lay.addLayout(h)
         g.addWidget(sy, 0, 1)
+        nw = Card(f"Nouveautés de la version {VERSION}", "Ce qui a changé avec la dernière mise à jour")
+        notes = NEWS.get(VERSION) or express_state().get("notes") or ""
+        tx = QLabel(md_html(notes) or "Pas de notes pour cette version.")
+        tx.setWordWrap(True)
+        tx.setTextFormat(Qt.TextFormat.RichText)
+        tx.setOpenExternalLinks(True)
+        tx.setStyleSheet("font-size:13px;")
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setWidget(tx)
+        sc.setMinimumHeight(170)
+        sc.setMaximumHeight(300)
+        sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        nw.lay.addWidget(sc, 1)
+        h = QHBoxLayout()
+        h.addWidget(btn("Tout lire", "", lambda: self.news_dialog(None)))
+        h.addWidget(btn("Toutes les versions", "", lambda: webbrowser.open(
+            f"https://github.com/{self.data.get('settings', {}).get('update_repo') or UPDATE_REPO or 'Bieuzy/bev'}/releases")))
+        h.addStretch(1)
+        nw.lay.addLayout(h)
+        g.addWidget(nw, 1, 0, 1, 2)
         sk = Card("Raccourcis", "Commandes clavier et souris")
         grid = QGridLayout()
         for i, (k, v) in enumerate((("F1 à F12", "jouer la touche du cartoucheur"), ("Maj + clic sur une touche", "jouer sur la sortie audio seule (sans antenne)"),
@@ -14307,8 +14708,8 @@ class PagesMixin1:
         grid.setHorizontalSpacing(18)
         self._sk = (grid, [grid.itemAt(i).widget() for i in range(grid.count())])
         sk.lay.addLayout(grid)
-        g.addWidget(sk, 1, 0, 1, 2)
-        g.setRowStretch(2, 1)
+        g.addWidget(sk, 2, 0, 1, 2)
+        g.setRowStretch(3, 1)
         return pg
 
 # ------------------------------------------------------------------ Traitement du son
@@ -18820,7 +19221,7 @@ class SpeechBubble(QFrame):
 
     def _kids(self, on):
         for w in self.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly):
-            w.setVisible(on)
+            w.setVisible(on and not getattr(w, "_off", False))     # (_off : élément masqué exprès, ex. barre inutile)
 
     def _k(self, v):
         self.k = float(v)
@@ -18870,6 +19271,57 @@ class SpeechBubble(QFrame):
         p.setBrush(QColor(mixc(PANEL, "#ffffff", .06)))
         p.setPen(QPen(QColor(mixc(TXT, ACC, .25)), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(path)
+
+
+class UpdBar(QWidget):
+    """Barre de progression de la bulle de Gaël : remplissage doux, reflet qui glisse ; -1 = en cours (durée inconnue)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(10)
+        self.v, self.shown, self.t = 0.0, 0.0, 0.0
+        self.hide()
+        Ticker.add(self, self.step, 60)
+
+    def set(self, v):
+        self.v = float(v)
+        self.update()
+
+    def step(self, t, dt):
+        self.t = t
+        if self.v >= 0:
+            self.shown += (self.v - self.shown) * min(1.0, dt * 10)
+        return True
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        r = QRectF(self.rect()).adjusted(0, 1, 0, -1)
+        rad = r.height() / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(TRACK))
+        p.drawRoundedRect(r, rad, rad)
+        if self.v < 0:                                  # en cours, sans durée connue : segment qui va et vient
+            u = (math.sin(self.t * 3) + 1) / 2
+            w = r.width() * .3
+            fr = QRectF(r.left() + u * (r.width() - w), r.top(), w, r.height())
+        else:
+            fr = QRectF(r.left(), r.top(), max(r.height(), r.width() * min(1.0, self.shown)), r.height())
+        g = QLinearGradient(fr.topLeft(), fr.topRight())
+        g.setColorAt(0, QColor(ACC))
+        g.setColorAt(1, QColor(ACC2))
+        p.setBrush(QBrush(g))
+        p.drawRoundedRect(fr, rad, rad)
+        if self.v >= 0 and ANIM:                         # reflet qui glisse sur la partie remplie
+            x = fr.left() + ((self.t * .6) % 1.0) * (fr.width() + 40) - 20
+            sh = QLinearGradient(x - 18, 0, x + 18, 0)
+            sh.setColorAt(0, qc("#ffffff", 0))
+            sh.setColorAt(.5, qc("#ffffff", 90))
+            sh.setColorAt(1, qc("#ffffff", 0))
+            p.save()
+            p.setClipRect(fr)
+            p.setBrush(QBrush(sh))
+            p.drawRoundedRect(fr, rad, rad)
+            p.restore()
 
 
 class Banner(QLabel):
@@ -19032,6 +19484,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.upd_tm = QTimer(self)                        # puis toutes les 6 h (Bev reste souvent ouvert des jours entiers)
             self.upd_tm.timeout.connect(lambda: self.update_start(False))
             self.upd_tm.start(6 * 3600 * 1000)
+        QTimer.singleShot(2600, self.after_update_greet)
+        QTimer.singleShot(20000, self.express_settle)
         if not self.data.get("np_tried") and np is None:
             self.data["np_tried"] = True
             QTimer.singleShot(4000, lambda: self.install("numpy"))
@@ -21352,49 +21806,46 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 self.gael_bubble("Je n'ai pas pu vérifier les mises à jour.", (r or {}).get("error") or "Recherche impossible.", hide_after=9000)
             return
         newer = parse_ver(r["tag"]) > parse_ver(VERSION)
+        st = express_state()
+        if r.get("express") and _ver_tuple(st.get("version")) == _ver_tuple(r["tag"]):
+            if int(st.get("fails", 0)) >= 2:          # ce code express n'a pas démarré ici : installateur complet
+                r["express"], r["express_why"] = None, "la mise à jour express n'a pas démarré sur cet ordinateur"
+            elif os.environ.get("BEV_CODE") not in (None, "", "builtin"):
+                newer = False                          # (déjà sur cette version)
+            else:
+                self._upd_express_ready = r["tag"]     # déjà téléchargée : il ne reste qu'à redémarrer
         if newer:
             if manual or self.upd_bubble is None or getattr(self, "_upd_mode", "") == "info":
                 if getattr(self, "upd_pending", None) and getattr(self, "_upd_pending_tag", "") == r["tag"]:
                     return self.update_ready_bubble(r)
                 self.update_bubble(r)
-        elif manual or first:                       # au lancement (ou sur demande) : Gaël dit bonjour, tout est à jour
+        elif (manual or first) and not getattr(self, "_just_updated", False):   # au lancement : Gaël dit bonjour, tout est à jour
             self.gael_bubble("Demat ! Bev est à jour." if not manual else "Bev est à jour.", f"Version {VERSION}", hide_after=6000)
 
-    def upd_title(self, r):
-        """« 1.0.2 → 1.0.3 · Titre de la version » (le titre seulement s'il dit autre chose que le numéro)."""
-        new = r.get("tag", "").lstrip("vV")
-        t = r.get("title", "")
-        if t and parse_ver(t) == parse_ver(new) and not re.sub(r"[\dvV.\s-]", "", t):
-            t = ""
-        return f"{VERSION}  →  {new}" + (f"  ·  {t}" if t else "")
-
-    def gael_bubble(self, title, line="", buttons=(), hide_after=0, mode="info", one_line=False):
-        """Bulle de BD qui sort de Gaël. buttons : [(texte, type, fonction)]. hide_after : disparaît seule (ms)."""
+    def gael_bubble(self, title, line="", buttons=(), hide_after=0, mode="info", one_line=False, progress=None):
+        """Bulle de BD qui sort de Gaël. buttons : [(texte, type, fonction)]. hide_after : disparaît seule (ms).
+        progress : None (pas de barre) ou 0-1 (barre de progression ; -1 = en cours, durée inconnue).
+        La bulle a une largeur bornée (le texte passe à la ligne) et reste toujours dans la fenêtre."""
         self.update_bubble_close()
         self._upd_mode = mode
         self.bot_talk = 40
         b = SpeechBubble(self.centralWidget(), tail="top" if NAVTOP else "left")
-        t = lab(title, "")
-        t.setStyleSheet("font-weight:800;font-size:13px;")
-        b.lay.addWidget(t)
-        b.l_line = None
-        if line:
-            m = lab(line, "mut", not one_line)
-            m.setStyleSheet(f"color:{MUT};font-size:12px;")
-            if not one_line:
-                m.setMaximumWidth(300)
-            b.lay.addWidget(m)
-            b.l_line = m
-        if buttons:
-            h = QHBoxLayout()
-            h.setSpacing(6)
-            for txt, kind, fn in buttons:
-                h.addWidget(btn(txt, kind, fn))
-            h.addStretch(1)
-            b.lay.addLayout(h)
-        b.adjustSize()
+        b.t = lab("", "", True)
+        b.t.setStyleSheet("font-weight:800;font-size:13px;")
+        b.lay.addWidget(b.t)
+        b.l_line = lab("", "mut", True)
+        b.l_line.setStyleSheet(f"color:{MUT};font-size:12px;")
+        b.lay.addWidget(b.l_line)
+        b.bar = UpdBar()
+        b.lay.addWidget(b.bar)
+        b.btns = QWidget()
+        b.btn_l = QHBoxLayout(b.btns)
+        b.btn_l.setContentsMargins(0, 2, 0, 0)
+        b.btn_l.setSpacing(6)
+        b.lay.addWidget(b.btns)
         self.upd_bubble = b
-        self.place_upd_bubble()
+        b.bar._off = b.btns._off = True
+        self.bubble_set(title, line, buttons or [], progress)
         b.pop()
         if hide_after:
             b.hide_t.timeout.connect(lambda b=b: self.update_bubble_close() if self.upd_bubble is b else None)
@@ -21402,24 +21853,54 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         g = getattr(self.rail, "gael", None)
         if g is not None and g.isVisible():
             try:
-                g.play(G_HELLO)
+                if g.anim is not G_MAJ:
+                    g.play(G_HELLO)
                 g.say(min(3.0, .9 + len(title) / 30))
             except Exception:
                 pass
         return b
 
-    def update_bubble(self, r):
-        """Nouvelle version : une seule ligne (version actuelle → nouvelle, titre), et deux boutons."""
-        self.upd_info = r
-        inst = SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy()
-        go = (lambda: self.update_install(r)) if inst else (lambda: (self.update_bubble_close(), webbrowser.open(r.get("asset") or r["url"])))
-        self.gael_bubble("Nouvelle version de Bev !", self.upd_title(r),
-                         [("Installer" if inst else "Télécharger", "primary", go), ("Plus tard", "", self.update_bubble_close)], mode="new",
-                         one_line=True)
+    BUBBLE_W = 330
 
-    def update_ready_bubble(self, r):
-        self.gael_bubble("Mise à jour prête.", "Elle s'installera quand tu fermeras Bev : le direct n'est pas coupé.",
-                         [("OK", "", self.update_bubble_close)], hide_after=12000, mode="ready")
+    def bubble_set(self, title=None, line=None, buttons=None, progress="keep"):
+        """Fait évoluer la bulle en place (titre, texte, barre, boutons) : pas de clignotement, pas de nouvelle bulle."""
+        b = self.upd_bubble
+        if b is None:
+            return
+        cw = self.centralWidget()
+        wmax = max(220, min(self.BUBBLE_W, cw.width() - (self.rail.width() if not NAVTOP else 0) - 40))
+        for l in (b.t, b.l_line):
+            l.setMaximumWidth(wmax)
+            l.setMinimumWidth(min(wmax, 230))
+        if title is not None:
+            b.t.setText(title)
+        anim = b.anim.state() == QVariantAnimation.State.Running
+
+        def vis(w, on):
+            w._off = not on
+            if not anim:
+                w.setVisible(on)
+        if line is not None:
+            b.l_line.setText(line)
+            vis(b.l_line, bool(line))
+        if progress != "keep":
+            vis(b.bar, progress is not None)
+            if progress is not None:
+                b.bar.set(progress)
+        if buttons is not None:
+            while b.btn_l.count():
+                it = b.btn_l.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+            for txt, kind, fn in buttons:
+                bt = btn(txt, kind, fn)
+                bt.setMinimumHeight(30)
+                b.btn_l.addWidget(bt)
+            b.btn_l.addStretch(1)
+            vis(b.btns, bool(buttons))
+        b.lay.activate()
+        b.adjustSize()
+        self.place_upd_bubble()
 
     def place_upd_bubble(self):
         b = getattr(self, "upd_bubble", None)
@@ -21427,14 +21908,15 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             return
         b.adjustSize()
         cw = self.centralWidget()
+        W, H = cw.width(), cw.height()
         if NAVTOP:
             bb = self.bot_btn
             if bb is not None and bb.isVisible():
                 c = bb.mapTo(cw, QPointF(bb.width() / 2, bb.height() - 4))
             else:
-                c = QPointF(cw.width() - 40, TopNav.H - 4)
-            x = int(max(8, min(c.x() - b.width() + 46, cw.width() - b.width() - 8)))
-            y = int(c.y() + 6)
+                c = QPointF(W - 40, TopNav.H - 4)
+            x = int(max(8, min(c.x() - b.width() + 46, W - b.width() - 8)))
+            y = int(min(c.y() + 6, H - b.height() - 8))
             b.move(x, y)
             b.tip = QPointF(c.x() - x, 0)
         else:
@@ -21442,95 +21924,317 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             if g is not None and g.isVisible():                  # la pointe touche la tête de Gaël
                 hp = g.mapTo(cw, g.head_point())
             else:                                                # Gaël caché (fenêtre basse) : la bulle part du bas du menu
-                hp = QPointF(self.rail.width() - 8, cw.height() - 60)
-            x = int(hp.x() + 4)
-            y = int(max(8, min(hp.y() - b.height() * .45, cw.height() - b.height() - 8)))
+                hp = QPointF(self.rail.width() - 8, H - 60)
+            x = int(min(hp.x() + 4, W - b.width() - 8))
+            y = int(max(8, min(hp.y() - b.height() * .55, H - b.height() - 8)))
             b.move(x, y)
-            b.tip = QPointF(0, hp.y() - y)
+            b.tip = QPointF(hp.x() - x, hp.y() - y)
         b.raise_()
         b.update()
 
-    def update_install(self, r):
-        """Mise à jour sans fenêtre d'installation : téléchargement (progression dans la bulle), vérification du fichier, puis
-        installation silencieuse et Bev se rouvre tout seul. À l'antenne, rien n'est coupé : l'installation attend la
-        fermeture de Bev. Windows peut demander l'autorisation (installation pour tous les utilisateurs)."""
-        url = r.get("asset") or ""
-        if not url:
-            return webbrowser.open(r.get("url") or "")
-        import tempfile
-        dst = os.path.join(tempfile.gettempdir(), r.get("asset_name") or "Bev-Setup.exe")
-        b = self.gael_bubble("Je télécharge la mise à jour…", self.upd_title(r), mode="dl", one_line=True)
-        self._upd_dl_bubble = b
+    def gael_maj(self, state=None, k=None):
+        """Animation de mise à jour de Gaël (colis, carton, saut de joie) ; state=None : arrêt."""
+        g = getattr(self.rail, "gael", None)
+        if g is None:
+            return
+        if state is None:
+            if g.anim is G_MAJ:
+                g.anim = None
+                g.update()
+            return
+        G_MAJ.set(state, k)
+        if g.anim is not G_MAJ:
+            G_MAJ.k = 0.0 if k is None else G_MAJ.k
+            g.play(G_MAJ)
 
-        def prog(pc):
-            bb = self.upd_bubble
-            if bb is not None and bb is getattr(self, "_upd_dl_bubble", None) and bb.l_line is not None:
-                bb.l_line.setText(f"{self.upd_title(r)}   ·   {pc} %")
+    # ------------------------------------------------------------ mise à jour : annonce
+    def upd_title(self, r):
+        """« 1.1.0 → 1.2.0 » suivi du titre de la version s'il apporte quelque chose (« Processeur d'antenne »)."""
+        new = r.get("tag", "").lstrip("vV")
+        t = re.sub(r"(?i)^\s*bev\s*", "", r.get("title", "")).strip()
+        t = re.sub(r"(?i)^v?\d+(\.\d+)*\s*", "", t).strip(" ·:-–")
+        t = re.sub(r"(?i)\b(available|disponible)\b", "", t).strip(" ·:-–")
+        return f"{VERSION}  →  {new}" + (f"  ·  {t}" if t else "")
+
+    def express_settle(self):
+        """Bev tourne depuis 20 s sur le code express : il a bien démarré (le compteur de démarrages ratés repart à zéro)."""
+        code = os.environ.get("BEV_CODE")
+        if code and code != "builtin":
+            st = express_state()
+            if st.get("fails"):
+                express_state({"fails": 0})
+
+    def after_update_greet(self):
+        """Premier lancement après une mise à jour : Gaël l'annonce, avec un accès direct aux nouveautés."""
+        S = self.data.setdefault("settings", {})
+        seen = S.get("seen_version")
+        S["seen_version"] = VERSION
+        self.save_settings()
+        if not seen or parse_ver(seen) >= parse_ver(VERSION):
+            return
+        self._just_updated = True
+        self.log(f"Bev est passé de la version {seen} à la version {VERSION}.")
+        self.gael_maj("done")
+        self.gael_bubble(f"Bev est passé en {VERSION} !", f"Mise à jour réussie (tu avais la {seen}). Tes réglages sont tous là.",
+                         [("Voir les nouveautés", "primary", lambda: (self.close_maj(), self.go_tab("about"))), ("OK", "", self.close_maj)],
+                         hide_after=20000, mode="info")
+        QTimer.singleShot(3500, lambda: self.gael_maj(None) if self._upd_mode != "dl" else None)
+
+    def update_bubble(self, r):
+        """Nouvelle version : ce qu'elle apporte (titre), comment elle s'installe (express ou complète), et 3 boutons."""
+        self.upd_info = r
+        new = r.get("tag", "").lstrip("vV")
+        ex = r.get("express")
+        news = ("Nouveautés", "", lambda: self.news_dialog(r))
+        later = ("Plus tard", "", self.update_bubble_close)
+        if ex:
+            line = (f"{self.upd_title(r)}\nMise à jour express : {fmt_size(ex['size'])}, sans installateur ni droits "
+                    "administrateur. Tes réglages, playlists et cartouches restent en place.")
+            btns = [("Mettre à jour", "primary", lambda: self.express_install(r)), news, later]
+        elif SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy():
+            line = (f"{self.upd_title(r)}\nCette version renouvelle les bibliothèques de Bev : elle passe par "
+                    f"l'installateur complet ({fmt_size(r.get('size', 0))}).")
+            btns = [("Télécharger et installer", "primary", lambda: self.full_install(r)), news, later]
+        else:
+            line = f"{self.upd_title(r)}\nTélécharge la nouvelle version depuis la page des versions."
+            btns = [("Télécharger", "primary", lambda: (self.update_bubble_close(), webbrowser.open(r.get("asset") or r["url"]))),
+                    news, later]
+        self.gael_bubble(f"Bev {new} est disponible !", line, btns, mode="new")
+
+    def update_ready_bubble(self, r):
+        """Mise à jour déjà téléchargée (express ou installateur) : on rappelle simplement comment l'appliquer."""
+        if getattr(self, "_upd_express_ready", "") == r.get("tag"):
+            return self.express_ready(r)
+        self.gael_maj("done")
+        self.gael_bubble("Mise à jour prête ✓", "Elle s'installera quand tu fermeras Bev : le direct n'est pas coupé.",
+                         [("OK", "", self.update_bubble_close)], hide_after=12000, mode="ready")
+
+    def news_dialog(self, r=None):
+        """Nouveautés d'une version (notes de la Release GitHub), dans une fenêtre lisible."""
+        notes = (r or {}).get("notes") or NEWS.get(VERSION, "")
+        ver = ((r or {}).get("tag") or VERSION).lstrip("vV")
+        d = QDialog(self)
+        d.setWindowTitle(f"Nouveautés de Bev {ver}")
+        d.resize(620, 560)
+        v = QVBoxLayout(d)
+        tx = QTextEdit()
+        tx.setReadOnly(True)
+        tx.setHtml(md_html(notes) or "<p>Pas de notes pour cette version.</p>")
+        v.addWidget(tx, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(d.reject)
+        v.addWidget(bb)
+        d.exec()
+
+    # ------------------------------------------------------------ mise à jour express (code seul, ~1 Mo)
+    def express_install(self, r):
+        ex = r.get("express") or {}
+        new = r.get("tag", "").lstrip("vV")
+        self.gael_maj("dl", 0.0)
+        self.gael_bubble(f"Je récupère Bev {new}…", f"0 Ko sur {fmt_size(ex.get('size', 0))}", progress=0.0, mode="dl")
+        dst = os.path.join(UPD_DIR, ex["file"])
+
+        def prog(got, total):
+            if self._upd_mode != "dl" or self.upd_bubble is None:
+                return
+            k = got / total if total else -1
+            self.gael_maj("dl", max(0.0, k))
+            self.bubble_set(line=f"{fmt_size(got)} sur {fmt_size(total)}" if total else fmt_size(got), progress=k)
 
         def work():
             res = {}
             try:
-                rq = urllib.request.Request(url, headers={"User-Agent": "Bev-update"})
-                h = hashlib.sha256()
-                got, last = 0, -1
-                with urllib.request.urlopen(rq, timeout=30) as resp, open(dst + ".part", "wb") as fh:
-                    total = int(resp.headers.get("Content-Length") or r.get("size") or 0)
-                    while True:
-                        blk = resp.read(256 * 1024)
-                        if not blk:
-                            break
-                        fh.write(blk)
-                        h.update(blk)
-                        got += len(blk)
-                        pc = int(100 * got / total) if total else 0
-                        if pc != last:
-                            last = pc
-                            self.ui(prog, pc)
-                if r.get("size") and got != r["size"]:
-                    raise RuntimeError(f"fichier incomplet ({got} octets sur {r['size']})")
-                dg = r.get("digest", "")
-                if dg.startswith("sha256:") and dg[7:].lower() != h.hexdigest():
-                    raise RuntimeError("le fichier téléchargé est abîmé (empreinte différente)")
+                os.makedirs(UPD_DIR, exist_ok=True)
+                data, sha = download(ex["url"], dst + ".part", lambda g, t: self.ui(prog, g, t), size=ex.get("size", 0))
+                if sha != ex["sha256"]:
+                    raise RuntimeError("le fichier reçu est abîmé (empreinte différente) : rien n'a été changé")
+                with open(dst + ".part", "rb") as fh:
+                    compile(fh.read(), dst, "exec")         # code lisible par ce Bev (sinon : on ne l'active pas)
                 os.replace(dst + ".part", dst)
+                express_state({"version": ex["version"], "runtime": RUNTIME, "file": ex["file"], "sha256": ex["sha256"],
+                               "fails": 0, "from": VERSION, "notes": (r.get("notes") or "")[:20000]})
+                for f in os.listdir(UPD_DIR):              # anciens codes express : supprimés
+                    if f.startswith("bev-") and f.endswith(".py") and f != ex["file"]:
+                        try:
+                            os.remove(os.path.join(UPD_DIR, f))
+                        except OSError:
+                            pass
                 res["ok"] = True
-            except Exception as ex:
-                res["err"] = str(ex)
-            self.ui(self.update_downloaded, r, dst, res)
+            except Exception as e:
+                res["err"] = friendly_dl_error(e)
+                try:
+                    os.remove(dst + ".part")
+                except OSError:
+                    pass
+            self.ui(self.express_done, r, res)
         threading.Thread(target=work, daemon=True).start()
 
-    def update_downloaded(self, r, dst, res):
+    def express_done(self, r, res):
+        new = r.get("tag", "").lstrip("vV")
         if not res.get("ok"):
-            self.gael_bubble("Téléchargement impossible.", (res.get("err") or "?")[:140],
-                             [("Page des versions", "", lambda: (self.update_bubble_close(), webbrowser.open(r.get("url") or ""))),
-                              ("Fermer", "", self.update_bubble_close)], mode="err")
+            self.gael_maj("err")
+            self.log(f"Mise à jour express {new} impossible : {res.get('err')}")
+            self.gael_bubble("Le téléchargement n'a pas abouti.", f"{res.get('err')}\nRien n'a changé : Bev continue normalement.",
+                             [("Réessayer", "primary", lambda: self.express_install(r)), ("Fermer", "", self.close_maj)], mode="err")
             return
-        self.upd_pending, self._upd_pending_tag = dst, r.get("tag", "")
-        if self.on_air:                                   # jamais de coupure du direct : installation à la fermeture
-            self.log(f"Mise à jour {r.get('tag', '')} prête : elle s'installera à la fermeture de Bev.")
-            return self.update_ready_bubble(r)
-        self.log(f"Installation de Bev {r.get('tag', '')} : Bev se ferme et se rouvre tout seul.")
-        if self.update_launch(relaunch=True):
+        self._upd_express_ready = r.get("tag")
+        self.log(f"Mise à jour express {new} téléchargée et vérifiée.")
+        self.express_ready(r)
+
+    def express_ready(self, r):
+        new = r.get("tag", "").lstrip("vV")
+        self.gael_maj("done")
+        if self.on_air:
+            self.gael_bubble(f"Bev {new} est prêt ✓", "Il s'appliquera au prochain démarrage de Bev : le direct n'est pas touché.",
+                             [("Parfait", "primary", self.close_maj)], mode="ready")
+        else:
+            self.gael_bubble(f"Bev {new} est prêt ✓", "Il ne reste qu'à redémarrer Bev : quelques secondes, et tout est "
+                             "conservé (réglages, playlists, cartouches).",
+                             [("Redémarrer maintenant", "primary", self.express_restart), ("Au prochain lancement", "", self.close_maj)],
+                             mode="ready")
+
+    def express_restart(self):
+        if self.on_air:
+            return self.express_ready(self.upd_info or {})
+        self.gael_maj("restart")
+        self.bubble_set(title="À tout de suite !", line="Bev redémarre dans sa nouvelle version…", buttons=[], progress=-1)
+        self.log("Redémarrage sur la nouvelle version (mise à jour express).")
+
+        def go():
+            try:
+                self.save_all()
+            except Exception:
+                pass
+            relaunch_self(fresh=True)
             self._closing = True
             self.close()
+        QTimer.singleShot(900, go)
+
+    def close_maj(self):
+        self.gael_maj(None)
+        self.update_bubble_close()
+
+    # ------------------------------------------------------------ installateur complet (quand le socle change)
+    def full_install(self, r):
+        url = r.get("asset") or ""
+        if not url:
+            return webbrowser.open(r.get("url") or "")
+        import tempfile
+        new = r.get("tag", "").lstrip("vV")
+        dst = os.path.join(tempfile.gettempdir(), r.get("asset_name") or "Bev-Setup.exe")
+        self.gael_maj("dl", 0.0)
+        self.gael_bubble(f"Je télécharge l'installateur de Bev {new}…", "Préparation…", progress=0.0, mode="dl")
+        t0 = time.time()
+
+        def prog(got, total):
+            if self._upd_mode != "dl" or self.upd_bubble is None:
+                return
+            k = got / total if total else -1
+            el = max(.5, time.time() - t0)
+            sp = got / el
+            rest = (total - got) / sp if (total and sp > 0) else 0
+            eta = f"  ·  encore {int(rest // 60)} min {int(rest % 60):02d} s" if rest >= 60 else (f"  ·  encore {int(rest)} s" if rest >= 2 else "")
+            self.gael_maj("dl", max(0.0, k))
+            self.bubble_set(line=f"{fmt_size(got)} sur {fmt_size(total)}  ·  {fmt_size(sp)}/s{eta}" if total else fmt_size(got),
+                            progress=k)
+
+        def work():
+            res = {}
+            try:
+                _, sha = download(url, dst + ".part", lambda g, t: self.ui(prog, g, t), size=r.get("size", 0))
+                dg = r.get("digest", "")
+                if dg.startswith("sha256:") and dg[7:].lower() != sha:
+                    raise RuntimeError("le fichier reçu est abîmé (empreinte différente)")
+                if os.path.exists(dst):
+                    os.remove(dst)
+                os.replace(dst + ".part", dst)
+                try:                                      # (par précaution) pas de marque « téléchargé d'Internet »
+                    os.remove(dst + ":Zone.Identifier")
+                except OSError:
+                    pass
+                res["ok"] = True
+            except Exception as e:
+                res["err"] = friendly_dl_error(e)
+            self.ui(self.full_downloaded, r, dst, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def full_downloaded(self, r, dst, res):
+        new = r.get("tag", "").lstrip("vV")
+        if not res.get("ok"):
+            self.gael_maj("err")
+            self.gael_bubble("Le téléchargement n'a pas abouti.", f"{res.get('err')}\nRien n'a changé : Bev continue normalement.",
+                             [("Réessayer", "primary", lambda: self.full_install(r)),
+                              ("Page des versions", "", lambda: (self.close_maj(), webbrowser.open(r.get("url") or "")))], mode="err")
+            return
+        self.upd_pending, self._upd_pending_tag = dst, r.get("tag", "")
+        self.gael_maj("done")
+        if self.on_air:
+            self.log(f"Installateur de Bev {new} prêt : il s'installera à la fermeture de Bev.")
+            self.gael_bubble("Installateur prêt ✓", "Il s'installera quand tu fermeras Bev : le direct n'est pas coupé.",
+                             [("Parfait", "primary", self.close_maj)], mode="ready")
+            return
+        self.gael_bubble("Installateur prêt ✓", f"Bev va se fermer le temps de l'installation (une fenêtre de progression "
+                         f"s'affiche, environ 30 s), puis Bev {new} se rouvre tout seul.",
+                         [("Installer maintenant", "primary", self.full_launch_now), ("À la fermeture de Bev", "", self.close_maj)],
+                         mode="ready")
+
+    def full_launch_now(self):
+        """Lance l'installateur, et ne ferme Bev que lorsqu'il a vraiment démarré : si Windows (Smart App Control,
+        SmartScreen) ou un antivirus le bloque, Bev reste ouvert et explique quoi faire, au lieu de disparaître."""
+        self.bubble_set(title="Lancement de l'installation…", line="Windows peut demander une confirmation.", buttons=[], progress=-1)
+        p, why = self.update_launch(relaunch=True)
+        if p is None:
+            return self.full_blocked(why)
+
+        def check(n=0):
+            rc = p.poll()
+            if rc is None and n < 6:
+                return QTimer.singleShot(400, lambda: check(n + 1))
+            if rc not in (None, 0):
+                return self.full_blocked(f"l'installateur s'est arrêté tout de suite (code {rc})")
+            self.log("Installation de la mise à jour : Bev se ferme et se rouvrira tout seul.")
+            self._closing = True
+            self.close()
+        QTimer.singleShot(400, check)
+
+    def full_blocked(self, why):
+        self.gael_maj("err")
+        self.upd_pending = getattr(self, "_upd_last_dst", None)
+        self.log(f"Mise à jour bloquée : {why}")
+        r = self.upd_info or {}
+        self.gael_bubble(why[:1].upper() + why[1:] + ".",
+                         "Rien n'a changé : Bev continue normalement. Installe cette version depuis la page des versions ; "
+                         "les suivantes arriveront en express, sans installateur à lancer.",
+                         [("Page des versions", "primary", lambda: (self.close_maj(), webbrowser.open(r.get("url") or ""))),
+                          ("Fermer", "", self.close_maj)], mode="err")
 
     def update_launch(self, relaunch):
-        """Lance l'installateur téléchargé en mode invisible (aucune fenêtre ; seule la demande d'autorisation de Windows
-        peut apparaître). relaunch=False : Bev a été fermé par l'utilisateur, il ne se rouvre pas."""
+        """Lance l'installateur téléchargé (fenêtre de progression seulement, aucune question). Renvoie (processus, None)
+        ou (None, raison). relaunch=False : Bev a été fermé par l'utilisateur, il ne se rouvre pas."""
         dst = getattr(self, "upd_pending", None)
         if not dst or not os.path.isfile(dst):
-            return False
+            return None, "installateur introuvable"
+        self._upd_last_dst = dst
         try:
             kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {}
-            args = [dst, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
+            args = [dst, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
                     "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")]
             if not relaunch:
                 args.append("/NORELAUNCH=1")
-            subprocess.Popen(args, env=clean_env(True), close_fds=True, **kw)
+            env = clean_env(True)
+            env.pop("BEV_CODE", None)
+            p = subprocess.Popen(args, env=env, close_fds=True, **kw)
             self.upd_pending = None
-            return True
+            return p, None
+        except OSError as ex:
+            w = getattr(ex, "winerror", None)
+            why = {4551: "Smart App Control (Windows) a bloqué l'installateur", 1260: "une stratégie de Windows bloque l'installateur",
+                   225: "l'antivirus a bloqué l'installateur", 5: "Windows a refusé l'accès à l'installateur"}.get(w, f"lancement impossible ({ex})")
+            self.log(f"Impossible de lancer la mise à jour : {ex}")
+            return None, why
         except Exception as ex:
             self.log(f"Impossible de lancer la mise à jour : {ex}")
-            return False
+            return None, f"lancement impossible ({ex})"
 
     def update_bubble_close(self):
         if self.upd_bubble is not None:

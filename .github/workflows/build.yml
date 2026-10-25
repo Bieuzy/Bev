@@ -14,6 +14,15 @@ on:
 permissions:
   contents: write
 
+# Signature de code Windows (facultative, recommandée) : avec un compte Azure Artifact Signing (ex-Trusted Signing),
+# l'exécutable et l'installateur sont signés au nom de l'éditeur : SmartScreen, Smart App Control et les antivirus les
+# reconnaissent. Pour l'activer, renseigner dans Settings > Secrets and variables > Actions :
+#   secrets   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#   variables AZURE_SIGN_ENDPOINT (ex. https://weu.codesigning.azure.net/), AZURE_SIGN_ACCOUNT, AZURE_SIGN_PROFILE
+# Sans ces réglages, la construction se fait comme avant (non signée).
+env:
+  SIGN: ${{ vars.AZURE_SIGN_ACCOUNT != '' && 'oui' || '' }}
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -59,6 +68,23 @@ jobs:
           --hidden-import PySide6.QtNetwork
           broadcast_tool_qt.py
 
+      - name: Signature de Bev.exe et des outils (si configurée)
+        if: env.SIGN == 'oui'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGN_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGN_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGN_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\Bev
+          files-folder-filter: exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Vérification automatique (selftest)
         shell: pwsh
         run: |
@@ -76,6 +102,22 @@ jobs:
           & $iscc "/DMyAppVersion=$ver" installer\bev.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup en échec" }
           Get-ChildItem dist-installer
+
+      - name: Signature de l'installateur (si configurée)
+        if: env.SIGN == 'oui'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGN_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGN_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGN_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist-installer
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -163,5 +205,33 @@ jobs:
       - name: Joindre à la Release
         if: github.event_name == 'release'
         run: gh release upload "${{ github.ref_name }}" Bev-macOS.dmg --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Mise à jour express : le code de cette version (~1 Mo) + son manifeste, joints à la Release. Les Bev déjà installés
+  # passent à la nouvelle version sans installateur (voir tools/express.py et _express_boot dans broadcast_tool_qt.py).
+  express:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Code et manifeste de la mise à jour express
+        env:
+          TAG: ${{ github.event_name == 'release' && github.ref_name || '' }}
+          REPO: ${{ github.repository }}
+        run: python tools/express.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bev-mise-a-jour-express
+          path: dist-express/*
+
+      - name: Joindre à la Release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.ref_name }}" dist-express/* --clobber
         env:
           GH_TOKEN: ${{ github.token }}
