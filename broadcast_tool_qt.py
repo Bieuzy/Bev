@@ -127,7 +127,7 @@ def build_fx_chain(c, force=False):
     if num("excite") > 0:  # présence / brillance harmonique
         f.append(f"aexciter=amount={1 + num('excite') / 100 * 3:.1f}:freq=6500:drive=6:blend=0")
     if c.get("agc"):  # contrôle automatique de gain : ramène voix fortes et faibles au même niveau
-        f.append(f"dynaudnorm=f=500:g=15:p=0.9:m={3 + num('agc_lvl', 50) * .17:.1f}:s=5")
+        f.append(f"dynaudnorm=f=150:g=7:p=0.9:m={3 + num('agc_lvl', 50) * .17:.1f}:s=5")   # ~1 s d'anticipation (et non 7 s)
     cp = num("comp")
     if cp > 0:
         f.append(f"acompressor=threshold={10 ** (-(10 + cp * .18) / 20):.4f}:ratio={1.5 + cp / 100 * 5.5:.2f}"
@@ -155,6 +155,14 @@ def fx_chain_for(cfg):
     if mode.startswith("Page "):
         return FX["chains"].get(mode[5:6], "")
     return FX["chains"].get("A", "")  # ancien « réglage de la page »
+
+
+def fx_key(cfg):
+    """Quel traitement suit ce flux : « Page A »…« Page D », un style, ou « Aucun traitement »."""
+    mode = cfg.get("fxmode", FX_PAGE) or FX_PAGE
+    if mode == FX_NONE or mode in FX_PRESETS or (mode.startswith("Page ") and mode[5:6] in FX_LETTERS):
+        return mode
+    return "Page A"
 
 
 FM_PROC = "Radio FM (filtre 15 kHz + compresseur + limiteur)"
@@ -1092,33 +1100,43 @@ class Engine:
     def output(self, oid):
         return next((o for o in self.outputs if o.cfg["id"] == oid), None)
 
-    # --- traitement du son partagé
-    def bus_wanted(self, chain):
-        """Un même traitement utilisé par au moins deux flux est calculé une seule fois (bus), puis partagé."""
-        if chain in self.bus_bad:
-            return False
-        return sum(1 for o in self.outputs if o.cfg.get("enabled", True) and fx_chain_for(o.cfg) == chain) >= 2
+    # --- traitement du son : un « bus » par réglage (page A-D, style, ou aucun), partagé par les flux qui l'utilisent.
+    # Les encodeurs (connectés au serveur) ne voient que le son déjà traité : changer le traitement ne les coupe jamais.
+    def bus_wanted(self, key):
+        return key not in self.bus_bad
 
     def distribute(self, out):
-        """Bloc de 20 ms vers les sorties : directement, ou via le bus de traitement qu'elles partagent."""
+        """Bloc de 20 ms vers les sorties : via le bus de traitement de chacune (ou directement si son bus a échoué)."""
         used = set()
         for o in self.outputs:
-            bc = o.bus_chain
-            if bc is None:
+            bk = o.bus_key
+            if bk is None:
                 o.push(out)
             elif o.thread is not None and o.thread.is_alive():
-                used.add(bc)
-        for c in used:
-            if c in self.bus_bad:
+                used.add(bk)
+        for k in used:
+            if k in self.bus_bad:
                 continue
-            b = self.buses.get(c)
+            b = self.buses.get(k)
             if b is None:
-                b = self.buses[c] = FxBus(self, c)
+                b = self.buses[k] = FxBus(self, k)
             b.push(out)
         self.n_dist += 1
         if self.n_dist % 50 == 0:                  # une fois par seconde : bus devenus inutiles arrêtés
-            for c in [c for c in self.buses if c not in used]:
-                self.buses.pop(c).stop()
+            for k in [k for k in self.buses if k not in used]:
+                self.buses.pop(k).stop()
+
+    def set_out_fx(self, modes):
+        """« Appliquer aux flux » : chaque flux suit son nouveau réglage SANS redémarrer (son encodeur reste connecté)."""
+        for o in list(self.outputs):
+            m = modes.get(o.cfg.get("id"))
+            if m is None:
+                continue
+            o.cfg["fxmode"] = m
+            if o.bus_key is not None:
+                o.bus_key = fx_key(o.cfg)
+            elif o.state == "live":                 # traitement propre au flux (bus en échec) : seul cas où il faut relancer
+                threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.0), o.start() if self.air else None), daemon=True).start()
 
     def remove_output(self, oid):
         """Retire une sortie de l'antenne en cours (elle s'arrête en arrière-plan)."""
@@ -1943,16 +1961,29 @@ class Engine:
 
 # ------------------------------------------------------------------ sorties
 class FxBus:
-    """Traitement du son calculé UNE fois pour tous les flux qui utilisent la même page (A-D) : un seul ffmpeg de traitement,
-    puis le son traité est distribué aux encodeurs. Avec trois flux sur la page A, trois fois moins de calcul. En cas
-    d'échecs répétés, les flux concernés reviennent à leur propre traitement (comme avant)."""
+    """Traitement du son d'un réglage (page A-D, style ou aucun) calculé UNE fois, puis distribué aux encodeurs des flux qui
+    le suivent. Quand le réglage change (« Appliquer aux flux »), un second ffmpeg démarre en parallèle avec le nouveau
+    réglage ; dès qu'il est prêt, il prend le relais AU MÊME INSTANT du son, avec un fondu de 0,3 s. Les encodeurs ne sont
+    jamais arrêtés : les auditeurs restent connectés. En cas d'échecs répétés, les flux reprennent leur propre traitement."""
+    FADE = int(0.3 * SR) * 4
 
-    def __init__(self, eng, chain):
-        self.eng, self.chain = eng, chain
+    def __init__(self, eng, key):
+        self.eng, self.key = eng, key
         self.q = queue.Queue(maxsize=300)
         self.stop_ev = threading.Event()
-        self.proc, self.fails = None, 0
-        threading.Thread(target=self.run, daemon=True).start()
+        self.lk = threading.Lock()
+        self.G = 0                                   # octets de son entrés dans le bus depuis sa création
+        self.cur = self.nxt = None
+        self.fails, self.t_fail0, self.refused = 0, 0.0, set()
+        threading.Thread(target=self.feed_loop, daemon=True).start()
+        threading.Thread(target=self.out_loop, daemon=True).start()
+
+    @property
+    def chain(self):
+        return self.cur["chain"] if self.cur else ""
+
+    def chain_now(self):
+        return fx_chain_for({"fxmode": self.key}) or "anull"
 
     def push(self, blk):
         try:
@@ -1965,65 +1996,188 @@ class FxBus:
                 pass
 
     def subscribers(self):
-        return [o for o in list(self.eng.outputs) if o.bus_chain == self.chain]
+        return [o for o in list(self.eng.outputs) if o.bus_key == self.key]
 
-    def run(self):
-        while not self.stop_ev.is_set():
-            err, t0 = deque(maxlen=6), time.time()
-            try:
-                p = self.proc = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "s16le", "-ar", str(SR),
-                                       "-ac", "2", "-i", "pipe:0", "-af", self.chain, "-ar", str(SR), "-ac", "2", "-f", "s16le",
-                                       "pipe:1"], bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except OSError as ex:
-                err.append(str(ex))
-                p = None
-            if p is not None:
-                threading.Thread(target=Engine.drain, args=(p, err), daemon=True).start()
-                threading.Thread(target=self.feed, args=(p,), daemon=True).start()
-                carry = b""
-                while True:
-                    data = p.stdout.read(8192)
-                    if not data:
+    # --- un processus de traitement
+    def spawn(self, chain):
+        st = {"chain": chain, "G0": None, "buf": bytearray(), "out": 0, "pushed": 0, "dead": False, "err": deque(maxlen=6),
+              "inq": queue.Queue(maxsize=400), "t0": time.time(), "p": None}
+        try:
+            st["p"] = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "s16le", "-ar", str(SR),
+                             "-ac", "2", "-i", "pipe:0", "-af", chain, "-ar", str(SR), "-ac", "2", "-f", "s16le", "pipe:1"],
+                            bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as ex:
+            st["err"].append(str(ex))
+            st["dead"] = True
+            return st
+        p = st["p"]
+        threading.Thread(target=Engine.drain, args=(p, st["err"]), daemon=True).start()
+
+        def writer():
+            while not st["dead"]:
+                try:
+                    blk = st["inq"].get(timeout=0.2)
+                except queue.Empty:
+                    if p.poll() is not None:
                         break
-                    data = carry + data
-                    n = len(data) // 4 * 4
-                    data, carry = data[:n], data[n:]
-                    if data:
-                        for o in self.subscribers():
-                            o.push(data)
-                stop_proc(p)
-            if self.stop_ev.is_set():
-                break
-            self.fails = 0 if time.time() - t0 > 30 else self.fails + 1
-            self.eng.log("Traitement son partagé interrompu" + (f" ({' '.join(list(err)[-1:])})" if err else "") + " : relance.")
-            if self.fails >= 3:                     # on n'insiste pas : chaque flux reprend son propre traitement
-                self.eng.bus_bad.add(self.chain)
-                self.eng.log("Traitement son partagé abandonné : chaque flux applique son propre traitement.")
-                for o in self.subscribers():
-                    threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.5), o.start()), daemon=True).start()
-                break
-            self.stop_ev.wait(1)
+                    continue
+                try:
+                    p.stdin.write(blk)
+                except (OSError, ValueError):
+                    break
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
 
-    def feed(self, p):
-        while not self.stop_ev.is_set() and p.poll() is None:
+        def reader():
+            carry = b""
+            while True:
+                try:
+                    data = p.stdout.read(8192)
+                except Exception:
+                    data = b""
+                if not data:
+                    break
+                data = carry + data
+                n = len(data) // 4 * 4
+                data, carry = data[:n], data[n:]
+                if data:
+                    with self.lk:
+                        st["buf"] += data
+                        st["out"] += len(data)
+                        if len(st["buf"]) > 40 * SR * 4:          # (sécurité) jamais plus de 40 s en attente
+                            cut = len(st["buf"]) - 30 * SR * 4
+                            del st["buf"][:cut]
+                            st["pushed"] += cut
+            st["dead"] = True
+        threading.Thread(target=writer, daemon=True).start()
+        threading.Thread(target=reader, daemon=True).start()
+        return st
+
+    def kill(self, st):
+        if st is None:
+            return
+        st["dead"] = True
+        if st.get("p") is not None:
+            stop_proc(st["p"])
+
+    def feed_loop(self):
+        while not self.stop_ev.is_set():
             try:
                 blk = self.q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            try:
-                p.stdin.write(blk)
-            except (OSError, ValueError):
-                break
-        try:
-            p.stdin.close()
-        except Exception:
-            pass
+            with self.lk:
+                for st in (self.cur, self.nxt):
+                    if st is None or st["dead"]:
+                        continue
+                    if st["G0"] is None:
+                        st["G0"] = self.G
+                    try:
+                        st["inq"].put_nowait(blk)
+                    except queue.Full:
+                        pass
+                self.G += len(blk)
+
+    def send(self, data):
+        if data:
+            for o in self.subscribers():
+                o.push(data)
+
+    def out_loop(self):
+        last_chk = 0.0
+        while not self.stop_ev.is_set():
+            time.sleep(0.01)
+            now = time.time()
+            if now - last_chk > 0.4:                         # le réglage a-t-il changé ?
+                last_chk = now
+                want = self.chain_now()
+                with self.lk:
+                    pending = self.nxt["chain"] if self.nxt else (self.cur["chain"] if self.cur else None)
+                if want != pending and want not in self.refused:
+                    st = self.spawn(want)
+                    with self.lk:
+                        if self.cur is None:
+                            self.cur = st
+                        else:
+                            old, self.nxt = self.nxt, st
+                            self.kill(old)
+            with self.lk:
+                cur, nxt = self.cur, self.nxt
+                out = b""
+                switched = False
+                if nxt is not None and nxt["dead"] and nxt["out"] == 0:       # nouveau réglage refusé par ffmpeg
+                    self.refused.add(nxt["chain"])
+                    self.nxt = None
+                    why = next((l for l in reversed(list(nxt["err"])) if l), "réglage refusé")
+                    self.eng.log(f"Traitement son : nouveau réglage impossible ({why[:120]}) : l'ancien continue.")
+                elif cur is not None and nxt is not None and nxt["G0"] is not None and cur["G0"] is not None:
+                    X = cur["G0"] + cur["pushed"]             # instant (dans le son d'entrée) du prochain octet à diffuser
+                    j = max(nxt["pushed"], X - nxt["G0"])    # le même instant dans la sortie du nouveau réglage
+                    j -= j % 4
+                    have_cur = len(cur["buf"])
+                    aligned = X >= nxt["G0"] and nxt["out"] >= j + self.FADE and (have_cur >= self.FADE or cur["dead"])
+                    forced = nxt["out"] >= self.FADE and (now - nxt["t0"] > 6 or cur["dead"])
+                    if aligned or forced:
+                        if not aligned:                       # (très rare) le nouveau ne rattrape pas : on prend le plus récent
+                            j = max(nxt["pushed"], nxt["out"] - self.FADE)
+                            j -= j % 4
+                        del nxt["buf"][:j - nxt["pushed"]]
+                        nxt["pushed"] = j
+                        f = min(self.FADE, len(nxt["buf"]), have_cur)
+                        f -= f % 4
+                        a_, b_ = bytes(cur["buf"][:f]), bytes(nxt["buf"][:f])
+                        del nxt["buf"][:f]
+                        nxt["pushed"] += f
+                        out = mix_blocks(a_, b_, 0.0, 1.0) if f else b""
+                        out += bytes(nxt["buf"])
+                        nxt["pushed"] += len(nxt["buf"])
+                        nxt["buf"].clear()
+                        self.cur, self.nxt = nxt, None
+                        self.kill(cur)
+                        switched = True
+                    else:
+                        # en attendant que le nouveau réglage soit prêt : l'ancien continue, en gardant 0,35 s en réserve pour
+                        # le fondu ; si le nouveau a plus de retard (AGC ajouté), l'ancien patiente (≈ 1 s) au lieu de répéter
+                        lag = nxt["out"] > 0 and X >= nxt["G0"] and nxt["out"] < j + self.FADE
+                        keep = have_cur if lag else min(have_cur, self.FADE + SR * 4 // 20)
+                        n = have_cur - keep
+                        n -= n % 4
+                        if n > 0:
+                            out = bytes(cur["buf"][:n])
+                            del cur["buf"][:n]
+                            cur["pushed"] += n
+                        switched = None
+                if switched is False and self.cur is not None and self.cur["buf"]:
+                    c = self.cur
+                    out = bytes(c["buf"])
+                    c["pushed"] += len(out)
+                    c["buf"].clear()
+                dead_cur = self.cur is not None and self.cur["dead"] and not self.cur["buf"] and self.nxt is None
+            self.send(out)
+            if switched:
+                self.eng.log("Traitement son appliqué en direct, sans couper les flux (fondu de 0,3 s).")
+            if dead_cur and not self.stop_ev.is_set():
+                err = list(self.cur["err"])
+                self.fails = self.fails + 1 if now - self.t_fail0 < 60 else 1
+                if self.fails == 1:
+                    self.t_fail0 = now
+                self.eng.log("Traitement son interrompu" + (f" ({err[-1][:100]})" if err else "") + " : relance.")
+                if self.fails >= 3:                    # on n'insiste pas : chaque flux reprend son propre traitement
+                    self.eng.bus_bad.add(self.key)
+                    self.eng.log("Traitement son partagé abandonné : chaque flux applique son propre traitement.")
+                    for o in self.subscribers():
+                        threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.5), o.start()), daemon=True).start()
+                    break
+                with self.lk:
+                    self.cur = self.spawn(self.chain_now())
 
     def stop(self):
         self.stop_ev.set()
-        p = self.proc
-        if p is not None:
-            threading.Thread(target=stop_proc, args=(p,), daemon=True).start()
+        with self.lk:
+            for st in (self.cur, self.nxt):
+                self.kill(st)
 
 
 class Output:
@@ -2040,7 +2194,7 @@ class Output:
         self.t_live = 0.0
         self.had_error = False
         self.meta_note = ""
-        self.bus_chain = None              # traitement du son partagé : ce flux reçoit le son déjà traité par le bus
+        self.bus_key = None                # traitement du son partagé : ce flux reçoit le son déjà traité par le bus
 
     @property
     def name(self):
@@ -2156,10 +2310,11 @@ class Output:
                 break
 
     def filters(self):
-        chain = fx_chain_for(self.cfg)
+        key = fx_key(self.cfg)
         wanted = getattr(self.eng, "bus_wanted", None)
-        self.bus_chain = chain if (chain and wanted and wanted(chain)) else None
-        f = ",".join(x for x in (None if self.bus_chain else chain, PROCESSING.get(self.cfg.get("processing", "Aucun"), "")) if x)
+        self.bus_key = key if (wanted and wanted(key)) else None
+        chain = None if self.bus_key else fx_chain_for(self.cfg)
+        f = ",".join(x for x in (chain, PROCESSING.get(self.cfg.get("processing", "Aucun"), "")) if x)
         return ["-af", f] if f else []
 
     @staticmethod
@@ -2329,7 +2484,7 @@ class FMOutput(Output):
         if idx is None:
             raise RuntimeError("carte son de sortie introuvable : choisis-la dans la sortie")
         buf, lk = bytearray(), threading.Lock()
-        hi, lo = int(0.6 * SR) * 4, int(0.3 * SR) * 4
+        hi, lo = int(1.6 * SR) * 4, int(0.9 * SR) * 4      # le traitement livre parfois le son par paquets de 0,5 s
 
         def add(data):
             with lk:
@@ -2373,7 +2528,7 @@ class FMOutput(Output):
                                     callback=cb, latency="high", extra_settings=extra)
         try:
             t0 = time.time()
-            while len(buf) < int(0.2 * SR) * 4 and time.time() - t0 < 2:
+            while len(buf) < int(0.6 * SR) * 4 and time.time() - t0 < 10:
                 time.sleep(0.02)
             stream.start()
             self.set_state("live")
@@ -3420,6 +3575,13 @@ class EngineProxy:
 
     def set_cart_live(self, cid, **kw):
         self._call("set_cart_live", cid, **kw)
+
+    def set_out_fx(self, modes):
+        for o in self.outputs:
+            m = modes.get(o.cfg.get("id"))
+            if m is not None:
+                o.cfg["fxmode"] = m
+        self._call("set_out_fx", modes)
 
     def set_manual(self, on):
         self._hold["manual"] = (bool(on), time.time())
@@ -5327,124 +5489,90 @@ class AuroraBar(QWidget):
         p.drawRoundedRect(QRectF(0, 1, 120, 4), 2, 2)
 
 
+ONAIR_RED, ONAIR_RED2 = "#ff3150", "#e0123a"        # rouge « ON AIR » des studios : la couleur universelle de l'antenne
+
+
 class AirWaves(QWidget):
-    """Phare de l'antenne : éteint hors antenne, VERT quand tout part bien, ROUGE qui clignote en cas de panne.
-    Le faisceau balaie et des ondes partent de la lanterne ; 60 i/s via l'horloge commune, rien quand il est éteint."""
+    """Phare d'antenne, version moderne : silhouette épurée et faisceau ambre (la couleur des ondes du logo) qui TOURNE
+    comme un vrai phare, avec un halo qui respire. Éteint hors antenne ; orange si plus de son ; rouge en cas de rupture."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(64, 54)
-        self.on, self.bad, self.pulse, self.t = False, False, 0.0, 0.0
-        self.setToolTip("Phare d'antenne : vert = à l'antenne, rouge = panne")
+        self.setFixedSize(58, 54)
+        self.on, self.bad, self.t = False, False, 0.0
+        self.setToolTip("Phare d'antenne")
         Ticker.add(self, self.step, 30)
 
     def set(self, on, bad=False):
-        if not on and not bad:
-            bad = False
         if (on, bad) != (self.on, self.bad):
             self.on, self.bad = on, bad
-            self.setToolTip("Phare d'antenne : " + ({"son": "pas de son en entrée", "flux": "rupture de flux"}.get(bad, "PANNE") if bad
+            self.setToolTip("Phare d'antenne : " + ({"son": "pas de son en entrée", "flux": "rupture de flux"}.get(bad, "panne") if bad
                                                     else ("à l'antenne, tout va bien" if on else "hors antenne")))
             self.update()
 
     def step(self, t, dt):
         self.t = t
-        return self.on or bool(self.bad)       # jamais animé tant que la diffusion n'est pas lancée
+        return self.on or bool(self.bad)
 
     def paintEvent(self, e):
         p = new_painter(self)
         t = self.t
         act = self.on or bool(self.bad)
-        cx, base = 32, 51
-        if self.bad == "son":
-            k = (math.sin(t * 5) + 1) / 2
-            col = mixc("#b86e00", "#ffb020", k)
-        elif self.bad:
-            k = (math.sin(t * 7) + 1) / 2
-            col = mixc("#a8202f", BADC, k)
-        elif self.on:
-            col = QColor(OKC)
-        else:
-            col = QColor(ACC)
-        dim = QColor("#4a5266" if not LIGHT else "#a8afbd")
-        if act and ANIM and self.bad != "flux":
-            sweep = math.sin(t * 1.9)
-            p.save()
-            p.translate(cx, 15)
-            g = QRadialGradient(0, 0, 26)
-            g.setColorAt(0, qc(col.name(), 120))
-            g.setColorAt(1, qc(col.name(), 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(g))
-            w = 22 * abs(sweep) + 3
-            side = 1 if sweep > 0 else -1
-            path = QPainterPath(QPointF(0, 0))
-            path.lineTo(QPointF(side * 28, -w / 2))
-            path.lineTo(QPointF(side * 28, w / 2))
-            path.closeSubpath()
-            p.drawPath(path)
-            p.restore()
+        col = QColor(ONAIR_RED if self.bad == "flux" else ("#ff9a1f" if self.bad == "son" else "#ffb03b"))
+        cx, top, base = 29.0, 13.0, 51.0
+        dim = QColor("#4a5266" if not LIGHT else "#b4bac6")
         if act and ANIM:
-            for k in range(3):
-                ph = (t * (1.4 if self.bad else .9) + k / 3) % 1.0
-                c = QColor(col)
-                c.setAlphaF(.75 * (1 - ph))
-                p.setPen(QPen(c, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                r = 9 + ph * 16
-                p.drawArc(QRectF(cx - r, 15 - r, 2 * r, 2 * r), 30 * 16, 60 * 16)
-                p.drawArc(QRectF(cx - r, 15 - r, 2 * r, 2 * r), 90 * 16, 60 * 16)
-        # le phare lui-même ne change qu'avec l'état : image pré-rendue (sauf en panne, où sa couleur clignote)
-        if self.bad:
-            self._tower(p, act, col, dim)
-            return
-        dpr = self.devicePixelRatioF()
-        key = (act, col.name(), dpr)
-        if getattr(self, "_tk", None) != key:
-            pm = QPixmap(int(math.ceil(64 * dpr)), int(math.ceil(54 * dpr)))
-            pm.setDevicePixelRatio(dpr)
-            pm.fill(Qt.GlobalColor.transparent)
-            q = new_painter(pm)
-            self._tower(q, act, col, dim)
-            q.end()
-            self._tpm, self._tk = pm, key
-        p.drawPixmap(QPointF(0, 0), self._tpm)
-
-    def _tower(self, p, act, col, dim):
-        cx, base = 32, 51
-        body = QPainterPath(QPointF(cx - 5, 22))
-        body.lineTo(QPointF(cx + 5, 22))
-        body.lineTo(QPointF(cx + 8, base))
-        body.lineTo(QPointF(cx - 8, base))
+            # faisceau qui tourne : un cône de lumière en dégradé, vu de face (il s'élargit puis s'efface en passant derrière)
+            ang = (t * (1.6 if self.bad else 0.9)) % (2 * math.pi)
+            for side in (1, -1):
+                k = math.cos(ang) * side
+                if k <= 0:
+                    continue
+                L = 28 * k
+                w = 7 + 9 * k
+                g = QLinearGradient(QPointF(cx, top), QPointF(cx + side * L, top))
+                g.setColorAt(0, qc(col.name(), int(170 * k)))
+                g.setColorAt(1, qc(col.name(), 0))
+                path = QPainterPath(QPointF(cx, top - 1.5))
+                path.lineTo(QPointF(cx + side * L, top - w / 2))
+                path.lineTo(QPointF(cx + side * L, top + w / 2))
+                path.lineTo(QPointF(cx, top + 1.5))
+                path.closeSubpath()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(g))
+                p.drawPath(path)
+            br = .55 + .45 * (math.sin(t * (6 if self.bad else 2.4)) + 1) / 2      # halo qui respire
+            halo = QRadialGradient(cx, top, 14)
+            halo.setColorAt(0, qc(col.name(), int(150 * br)))
+            halo.setColorAt(1, qc(col.name(), 0))
+            p.setBrush(QBrush(halo))
+            p.drawEllipse(QPointF(cx, top), 14, 14)
+        # tour : silhouette fine, deux bandes, lanterne
+        body = QPainterPath(QPointF(cx - 3.6, 19))
+        body.lineTo(QPointF(cx + 3.6, 19))
+        body.lineTo(QPointF(cx + 6.4, base))
+        body.lineTo(QPointF(cx - 6.4, base))
         body.closeSubpath()
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#f1f3f7") if act else dim)
+        p.setBrush(QColor("#eef1f6") if act else dim)
         p.drawPath(body)
         if act:
             p.save()
             p.setClipPath(body)
-            p.setBrush(QColor("#d94a4a"))
-            for y0 in (27, 39):
-                p.drawRect(QRectF(cx - 10, y0, 20, 5.5))
+            p.setBrush(QColor(ONAIR_RED2))
+            for y0 in (26, 37):
+                p.drawRect(QRectF(cx - 8, y0, 16, 4.5))
             p.restore()
+        p.setBrush(col if act else mixc(dim, PAGE, .2))
+        p.drawRoundedRect(QRectF(cx - 3.2, top - 3.2, 6.4, 6.4), 1.6, 1.6)
         p.setBrush(QColor("#2a3040") if act else dim)
-        p.drawRoundedRect(QRectF(cx - 8, 20, 16, 3), 1.2, 1.2)
-        if act:
-            glow = QRadialGradient(cx, 15, 11)
-            glow.setColorAt(0, qc(col.name(), 170))
-            glow.setColorAt(1, qc(col.name(), 0))
-            p.setBrush(QBrush(glow))
-            p.drawEllipse(QPointF(cx, 15), 11, 11)
-        p.setBrush(mixc(col, "#ffffff", .35) if act else mixc(dim, PAGE, .3))
-        p.drawRoundedRect(QRectF(cx - 4, 12, 8, 8), 2, 2)
-        p.setBrush(col if act else dim)
-        dome = QPainterPath(QPointF(cx - 5.5, 12.5))
-        dome.cubicTo(QPointF(cx - 5, 6), QPointF(cx + 5, 6), QPointF(cx + 5.5, 12.5))
+        p.drawRoundedRect(QRectF(cx - 5.5, top + 3.4, 11, 2.4), 1.2, 1.2)
+        dome = QPainterPath(QPointF(cx - 3.8, top - 3))
+        dome.cubicTo(QPointF(cx - 3.4, top - 8), QPointF(cx + 3.4, top - 8), QPointF(cx + 3.8, top - 3))
         dome.closeSubpath()
         p.drawPath(dome)
-        p.drawRect(QRectF(cx - .8, 4, 1.6, 4))
         p.setBrush(QColor("#3a4152") if not LIGHT else QColor("#c9ced8"))
-        p.drawRoundedRect(QRectF(cx - 13, base - 1, 26, 4), 2, 2)
+        p.drawRoundedRect(QRectF(cx - 11, base - 1, 22, 3.5), 1.7, 1.7)
 
 
 class Segmented(QWidget):
@@ -7832,7 +7960,7 @@ Problèmes fréquents
 """
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
 
 
@@ -12867,8 +12995,22 @@ class PagesMixin1:
         self.l_duck.setText(f"{self.sl_duck.value()} %")
         self.sl_duck.valueChanged.connect(self.duck_changed)
         c.lay.addWidget(self.sl_duck)
+        sec = lab("SÉCURITÉ DE L'ANTENNE", "mut")
+        sec.setStyleSheet(f"color:{MUT};font-size:10px;font-weight:800;letter-spacing:1px;margin-top:6px;")
+        c.lay.addWidget(sec)
+        for key, label, tip in (            # (anciennes « Propositions » : rangées ici, explication au survol)
+                ("siren", "Bip répété tant qu'une panne dure", "Un bip toutes les 10 s sur cet ordinateur, jusqu'au retour de l'antenne (au lieu d'un seul)."),
+                ("resume_crash", "Reprendre l'antenne après une fermeture brutale", "Si Bev ou l'ordinateur a planté en pleine émission, la diffusion repart toute seule au prochain lancement."),
+                ("daily_log", "Garder un journal par jour dans un fichier", "Un fichier texte par jour dans le dossier « Bev_journaux » de votre dossier personnel."),
+                ("disk_warn", "Prévenir quand le disque des enregistrements se remplit", "Alerte (bip + journal) sous 2 Go libres, rappelée toutes les 30 minutes."),
+                ("panic_key", "Raccourci d'urgence Ctrl + Maj + S", "Bascule tout de suite sur la playlist de secours, et revient au direct en réappuyant.")):
+            w = Switch(label)
+            w.setToolTip(tip)
+            w.setChecked(bool(S.get(key, False)))
+            w.toggled.connect(lambda on, k=key: self.set_val(k, bool(on)))
+            c.lay.addWidget(w)
         c.lay.addStretch(1)
-        g.addWidget(c, 0, 1)
+        g.addWidget(c, 0, 1, 2, 1)
         # ma radio
         c = Card("Ma radio", "Identité de la station et démarrage")
         self.ed_station = QLineEdit(S.get("station", ""))
@@ -12887,25 +13029,6 @@ class PagesMixin1:
             c.lay.addWidget(w)
         c.lay.addStretch(1)
         g.addWidget(c, 1, 0)
-        # propositions
-        c = Card("Propositions", "Des idées pour sécuriser l'antenne : à activer si elles vous parlent")
-        for key, label, tip in (
-                ("siren", "Bip répété tant qu'une panne dure", "Un bip toutes les 10 s sur cet ordinateur, jusqu'au retour de l'antenne (au lieu d'un seul)."),
-                ("resume_crash", "Reprendre l'antenne après une fermeture brutale", "Si Bev ou l'ordinateur a planté en pleine émission, la diffusion repart toute seule au prochain lancement."),
-                ("daily_log", "Garder un journal par jour dans un fichier", "Un fichier texte par jour dans le dossier « Bev_journaux » de votre dossier personnel."),
-                ("disk_warn", "Prévenir quand le disque des enregistrements se remplit", "Alerte (bip + journal) sous 2 Go libres, rappelée toutes les 30 minutes."),
-                ("panic_key", "Raccourci d'urgence Ctrl + Maj + S", "Bascule tout de suite sur la playlist de secours, et revient au direct en réappuyant.")):
-            w = Switch(label)
-            w.setToolTip(tip)
-            w.setChecked(bool(S.get(key, False)))
-            w.toggled.connect(lambda on, k=key: self.set_val(k, bool(on)))
-            c.lay.addWidget(w)
-            t = lab(tip, "mut", True)
-            t.setStyleSheet(f"color:{MUT};font-size:11px;margin-left:52px;margin-bottom:2px;")
-            t.setMinimumHeight(36)
-            c.lay.addWidget(t)
-        c.lay.addStretch(1)
-        g.addWidget(c, 1, 1)
         # sauvegarde
         c = Card()
         c.lay.setContentsMargins(18, 10, 18, 10)
@@ -13914,7 +14037,7 @@ class PagesMixin2:
         same = (FX["chains"] == now) and not self.fx_dirty
         self.l_fxinfo.setText("Réglages envoyés aux flux." if same else
                               "Réglages modifiés : clique sur « Appliquer aux flux »"
-                              + (" (coupure d'une seconde)." if self.on_air else " (pris en compte au prochain démarrage)."))
+                              + (" : bascule en direct, sans couper les flux." if self.on_air else " (actif dès le démarrage de la diffusion)."))
         set_ss(self.l_fxinfo, f"color:{MUT if same else ACC2};")
 
     def fx_push(self):
@@ -13923,13 +14046,11 @@ class PagesMixin2:
         self.fx_refresh()
         self.save_settings()
         if self.on_air and self.engine:
-            self.log("Traitement son appliqué : redémarrage des flux...")
-            outs = list(self.engine.outputs)
-            for o in outs:
-                o.stop()
-            QTimer.singleShot(1200, lambda: [o.start() for o in outs if self.on_air and o.cfg.get("enabled", True)])
+            # nouveau réglage envoyé au moteur, qui bascule chaque flux à chaud (fondu de 0,3 s) : aucun flux n'est coupé
+            self.engine.set_out_fx({c["id"]: c.get("fxmode", FX_PAGE) for c in self.outputs_cfg})
+            self.log("Traitement son : application en direct, sans couper les flux…")
         else:
-            self.log("Traitement son enregistré : il sera actif au prochain démarrage.")
+            self.log("Traitement son enregistré : il sera actif dès le démarrage de la diffusion.")
 
     def fx_flux_rows(self):
         while self.fx_rows.count():
@@ -14646,8 +14767,41 @@ NO = ("non", "annule", "laisse tomber", "stop", "pas maintenant", "plus tard", "
 SKIP = ("par defaut", "defaut", "passe", "peu importe", "je sais pas", "je ne sais pas", "standard", "normal")
 
 
+# Compréhension souple : synonymes, mots familiers et fautes de frappe courantes ramenés au vocabulaire de Gaël
+GAEL_SYN = (
+    (r"\bstreams?\b|\bwebradios?\b|\bsortie internet\b", "flux"), (r"\bplaylists?\b|\bplayliste\b|\bplay list\b", "playlist"),
+    (r"\bsecour\b|\bbackup\b|\bfallback\b|\brelai(s)?\b|\breleve\b", "secours"), (r"\bmicros?\b|\bmic\b|\bmicrophone\b", "micro"),
+    (r"\bzik\b|\bmusic\b|\bmusiques?\b|\bsons? de la playlist\b", "musique"), (r"\bjingles?\b|\bvirgules?\b|\bcartouches?\b|\btuiles?\b", "cartouche"),
+    (r"\bcasque\b|\becouteurs?\b|\bheadphones?\b", "casque"), (r"\bmuet\b|\bmute\b", "mute"),
+    (r"\bon air\b|\ben direct\b|\ba l'antenne\b", "antenne"), (r"\bplus de son\b|\bpas de son\b|\baucun son\b", "pas de son"),
+    (r"\bmaj\b|\bmise a jour\b|\bmises a jour\b|\bupdate\b|\bnouvelle version\b", "mise a jour"),
+    (r"\btraitement\b|\bprocessing\b|\begaliseur\b|\beq\b|\bcompresseur\b", "traitement"),
+    (r"\bstp\b|\bsvp\b|\bs'il te plait\b|\bs'il vous plait\b|\bplease\b", ""),
+)
+GAEL_VOCAB = ("flux", "playlist", "secours", "antenne", "diffusion", "cartouche", "cartoucheur", "micro", "entree", "casque", "ecouter",
+              "musique", "traitement", "enregistrement", "monitoring", "reseau", "alerte", "demarre", "arrete", "active", "desactive",
+              "lance", "coupe", "seuil", "delai", "debit", "gain", "volume", "auditeurs", "serveur", "icecast", "shoutcast", "jingle",
+              "redemarre", "relance", "retour", "direct", "ordinateur", "table", "mixage", "tonalite", "playlist", "mise", "version")
+
+
 class GaelBrain:
     pending = None
+
+    @staticmethod
+    def normalize(n):
+        """Phrase déjà sans accents ni majuscules : synonymes ramenés à un mot connu, fautes de frappe corrigées
+        (« secour », « plyalist », « antene »…), politesse retirée. Gaël comprend ainsi bien plus de façons de dire."""
+        import difflib
+        for pat, rep_ in GAEL_SYN:
+            n = re.sub(pat, rep_, n)
+        out = []
+        for w in re.findall(r"[a-z0-9'@:/._+-]+|[^a-z0-9'@:/._+-]+", n):
+            if re.fullmatch(r"[a-z]{5,}", w) and w not in GAEL_VOCAB:
+                c = difflib.get_close_matches(w, GAEL_VOCAB, 1, 0.84)
+                if c:
+                    w = c[0]
+            out.append(w)
+        return re.sub(r"\s+", " ", "".join(out)).strip()
 
     # ---------------------------------------------------------- outils de lecture de phrase
     @staticmethod
@@ -14708,7 +14862,7 @@ class GaelBrain:
 
     # ---------------------------------------------------------- point d'entrée
     def answer(self, q):
-        n = norm_txt(q).strip()
+        n = self.normalize(norm_txt(q).strip())
         if self.pending:
             r = self.continue_pending(q, n)
             if r is not None:
@@ -14776,7 +14930,117 @@ class GaelBrain:
         return None
 
     # ---------------------------------------------------------- intentions reconnues
+    def direct(self, q, n):
+        """Commandes directes de la régie : entrée, écoute, playlist, cartouches, mute, traitement, auditeurs, mise à jour…"""
+        a = self.app
+        H = self.has
+        e = a.engine
+        # --- écoute de contrôle au casque
+        if H(n, "casque", "ecouter l'antenne", "ecoute l'antenne", "entendre l'antenne", "ecouter ce qui part", "entendre la playlist", "ecouter la playlist") \
+                and not H(n, "cartouche", "pre-ecoute", "preecoute"):
+            on = not H(n, "arrete", "coupe", "stop", "enleve")
+            if bool(e and e.listen) == on:
+                return "C'est déjà " + ("en cours : l'antenne part dans le casque." if on else "arrêté.")
+            return ("Je " + ("mets l'antenne dans le casque (carte son du cartoucheur)." if on else "coupe l'écoute au casque."),
+                    [("Écouter l'antenne" if on else "Arrêter l'écoute", a.toggle_listen, "primary")])
+        # --- contrôle d'entrée / changement d'entrée
+        if H(n, "teste le micro", "tester le micro", "teste l'entree", "tester l'entree", "voir l'entree", "verifie l'entree", "controle d'entree", "niveau du micro"):
+            if a.on_air:
+                return "Pendant l'antenne, le niveau d'entrée s'affiche déjà en permanence (vumètre ENTRÉE)."
+            return ("J'ouvre l'entrée pour voir son niveau, sans rien diffuser.", [("Voir l'entrée", lambda: (a.go_tab("diff"), a.toggle_preview() if not a.preview else None), "primary")])
+        if H(n, "entree", "source", "micro", "table de mixage", "mixage", "interface", "carte son", "son de l'ordinateur", "line in") and \
+                H(n, "change", "utilise", "prends", "passe sur", "bascule sur", "mets", "choisis", "selectionne", "branche"):
+            words = [w for w in re.findall(r"[a-z0-9]{3,}", n) if w not in ("change", "utilise", "prends", "passe", "bascule", "entree", "source", "mets", "choisis",
+                                                                           "selectionne", "sur", "les", "des", "une", "son", "pour", "avec", "table",
+                                                                           "mixage", "comme", "branche", "carte")]
+            if H(n, "table de mixage", "mixage", "interface"):
+                words += ["line", "usb", "mix", "interface", "behringer", "focusrite", "yamaha", "mackie", "umc"]
+            if H(n, "ordinateur", "pc", "loopback", "spotify", "navigateur"):
+                words += ["ordinateur"]
+            best, score = None, 0
+            for lbl, val in a.dev_map.items():
+                t = norm_txt(lbl)
+                sc = sum(1 for w in words if w in t)
+                if sc > score:
+                    best, score = (lbl, val), sc
+            if best:
+                lbl, val = best
+                return self.propose("Entrée audio", [("Nouvelle entrée", lbl), ("Pendant l'antenne", "changement immédiat")],
+                                    lambda: (a.dev_pick.set_current(lbl), a.on_dev_select(lbl), a.log(f"Gaël : entrée changée pour « {lbl} ».")))
+            return ("Laquelle ? Voici les entrées détectées :", [(l[:32], (lambda l=l: (a.dev_pick.set_current(l), a.on_dev_select(l)))) for l in list(a.dev_map)[:6]])
+        # --- playlist de secours : lancer / revenir au direct / jouer un titre
+        if H(n, "revien au direct", "reviens au direct", "retour au direct", "repasse au direct", "remets le direct", "arrete la playlist", "coupe la playlist"):
+            if not (e and a.on_air and e.manual):
+                return "Le direct est déjà à l'antenne." if a.on_air else "Rien n'est à l'antenne pour l'instant."
+            return ("Je repasse au direct ?", [("Revenir au direct", a.toggle_manual, "primary")])
+        if H(n, "lance la playlist", "lancer la playlist", "passe la playlist", "mets la playlist", "envoie la playlist", "lance la musique", "mets de la musique", "passe de la musique"):
+            if not a.on_air:
+                return "Démarre d'abord la diffusion : la playlist part à l'antenne."
+            if not a.playlist:
+                return ("La playlist de secours est vide.", [("Ajouter des morceaux…", a.pl_add, "primary")])
+            return ("Je lance la playlist de secours à l'antenne (tu reviens au direct quand tu veux) ?", [("Lancer la playlist", a.toggle_manual, "primary")])
+        m = re.match(r"^(?:joue|jouer|passe|lance|envoie|mets)\s+(?:le titre |la chanson |le morceau |l'emission )?(.{3,})$", n)
+        if m and not H(n, "playlist", "diffusion", "antenne", "flux", "cartouche"):
+            want = m.group(1).strip()
+            best, sc0 = None, 0.0
+            import difflib
+            for i, f in enumerate(a.playlist):
+                inf = a.pl_info.get(f) or {}
+                t = norm_txt((inf.get("title") or os.path.splitext(os.path.basename(f))[0]) + " " + (inf.get("artist") or ""))
+                sc = difflib.SequenceMatcher(None, want, t).ratio() + (0.5 if want in t else 0)
+                if sc > sc0:
+                    best, sc0 = i, sc
+            for si, pg in enumerate(a.carts()):
+                for ci, d in enumerate(pg):
+                    t = norm_txt(d.get("name") or os.path.basename(d.get("file", "")))
+                    sc = difflib.SequenceMatcher(None, want, t).ratio() + (0.5 if want in t else 0)
+                    if sc > sc0:
+                        best, sc0 = ("cart", si, ci, d), sc
+            if best is not None and sc0 >= .55:
+                if isinstance(best, tuple):
+                    _, si, ci, d = best
+                    return (f"Je joue la cartouche « {d.get('name') or os.path.basename(d['file'])} »" + ("" if a.on_air else " (au casque, hors antenne)") + " ?",
+                            [("Jouer", lambda: a.trigger(d, si * CID + ci, True), "primary")])
+                f = a.playlist[best]
+                nm = (a.pl_info.get(f) or {}).get("title") or os.path.basename(f)
+                if a.on_air:
+                    return (f"Je passe « {nm} » à l'antenne maintenant ?", [("Jouer à l'antenne", lambda: a.pl_play(best), "primary"),
+                                                                          ("Pré-écouter au casque", lambda: a.pl_prelisten(best))])
+                return (f"Hors antenne, je peux te faire pré-écouter « {nm} » au casque.", [("Pré-écouter", lambda: a.pl_prelisten(best), "primary")])
+        # --- cartouches
+        if H(n, "cartouche") and H(n, "arrete", "stop", "coupe", "silence", "tais"):
+            return ("J'arrête toutes les cartouches (fondu) ?", [("Tout arrêter", a.stop_all_btn, "primary")])
+        # --- mute / tonalité
+        if H(n, "mute", "coupe le son de l'antenne", "coupe l'antenne", "rends l'antenne muette") and not H(n, "flux"):
+            if not a.on_air:
+                return "Rien n'est à l'antenne pour l'instant."
+            on = not (e and e.mute)
+            return ("Antenne " + ("coupée (mute)" if on else "rétablie") + " ?", [("Couper l'antenne" if on else "Rétablir le son", a.sos_mute, "danger" if on else "primary")])
+        if H(n, "tonalite", "bip de test", "1 khz", "1khz", "son de test"):
+            return ("Tonalité de test 1 kHz à l'antenne ?", [("Lancer / arrêter la tonalité", a.sos_tone, "primary")])
+        # --- traitement du son
+        if H(n, "traitement") and H(n, "voix", "musique", "punchy", "nuit", "neutre", "doux", "parole"):
+            name = ("Voix parlée" if H(n, "voix", "parole") else "Musique" if H(n, "musique") else "Radio punchy" if H(n, "punchy")
+                    else "Doux (nuit)" if H(n, "nuit", "doux") else "Neutre")
+            return self.propose("Traitement son", [("Page", a.fx_page), ("Style", name), ("Appliqué aux flux", "en direct, sans coupure")],
+                                lambda: (a.fx_apply_preset(name, True), a.fx_push()))
+        # --- redémarrer les flux, auditeurs, mise à jour
+        if H(n, "redemarre les flux", "relance les flux", "reconnecte", "redemarre le flux", "relance le flux"):
+            return ("Je relance tous les flux ?", [("Redémarrer les flux", a.sos_restart, "primary")])
+        if H(n, "auditeurs", "combien de personnes", "combien d'auditeurs", "qui ecoute", "nombre d'auditeurs"):
+            L = [f"{s_['name']} : {st[2]} auditeur(s)" for s_ in a.mon_streams for st in [a.mon_state.get(s_["url"])] if st and st[2] is not None]
+            return ("\n".join(L) if L else "Je n'ai pas de compte d'auditeurs : ajoute ton flux dans l'onglet Monitoring (Icecast les donne).",
+                    [("Ouvrir Monitoring", lambda: a.go_tab("mon"))])
+        if H(n, "mise a jour"):
+            return ("Je regarde s'il existe une nouvelle version de Bev.", [("Vérifier maintenant", lambda: a.update_start(True), "primary")])
+        if H(n, "depuis combien", "depuis quand") and H(n, "antenne", "direct", "diffusion"):
+            return self.state().splitlines()[0] if a.on_air else "On est hors antenne."
+        return None
+
     def intent(self, q, n):
+        r = self.direct(q, n)
+        if r is not None:
+            return r
         a = self.app
         H = self.has
         make = H(n, "cree", "creer", "ajoute", "ajouter", "nouveau", "nouvelle", "configure", "configurer", "monte", "monter", "mets en place",
@@ -16998,33 +17262,30 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         self.last = None
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(8)
-        # en-tête : tête de Gaël, nom, état
+        v.setSpacing(6)
+        # en-tête compact : petite tête de Gaël, nom + état sur une ligne, deux petits boutons
         hd = QHBoxLayout()
-        hd.setSpacing(10)
+        hd.setSpacing(8)
         self.bot = GaelView("head", app=app)
-        self.bot.setFixedSize(46, 62)
+        self.bot.setFixedSize(30, 40)
         hd.addWidget(self.bot)
-        col = QVBoxLayout()
-        col.setSpacing(0)
-        n = lab("Gaël, le radio-bot", "")
-        n.setStyleSheet("font-weight:800;font-size:15px;")
-        col.addWidget(n)
+        n = lab("Gaël", "")
+        n.setStyleSheet("font-weight:800;font-size:14px;")
+        hd.addWidget(n)
         self.l_st = lab("", "")
-        col.addWidget(self.l_st)
-        hd.addLayout(col, 1)
-        self.b_set = btn("Réglages", "", lambda: self.app.gael_settings())
-        self.b_set.setStyleSheet("padding:5px 12px;font-size:12px;")
-        self.b_set.setToolTip("Clé API et modèle pour la conversation avancée")
-        hd.addWidget(self.b_set, 0, Qt.AlignmentFlag.AlignTop)
-        self.b_clear = btn("Effacer", "", self.clear)
-        self.b_clear.setStyleSheet("padding:5px 12px;font-size:12px;")
-        hd.addWidget(self.b_clear, 0, Qt.AlignmentFlag.AlignTop)
+        hd.addWidget(self.l_st, 1)
+        self.b_set = QPushButton("⚙")
+        self.b_clear = QPushButton("↺")
+        for b_, tip, fn in ((self.b_set, "Conversation avancée (clé API, modèle)", lambda: self.app.gael_settings()),
+                            (self.b_clear, "Effacer la conversation", self.clear)):
+            b_.setFixedSize(28, 28)
+            b_.setCursor(Qt.CursorShape.PointingHandCursor)
+            b_.setToolTip(tip)
+            b_.setStyleSheet(f"QPushButton{{border-radius:14px;padding:0;font-size:14px;background:{FIELD};color:{MUT};}}"
+                             f"QPushButton:hover{{color:{TXT};}}")
+            b_.clicked.connect(lambda _=False, f=fn: f())
+            hd.addWidget(b_)
         v.addLayout(hd)
-        line = QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background:{LINE};")
-        v.addWidget(line)
         # fil de discussion
         self.sa = QScrollArea()
         self.sa.setWidgetResizable(True)
@@ -17042,18 +17303,17 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         v.addWidget(self.sa, 1)
         # suggestions (pastilles discrètes)
         cs = QWidget()
-        cl = QGridLayout(cs)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(6)
+        cl = WrapRow(cs, 5)
+        cl.vsp = 5
         for i, (c, qq) in enumerate(self.CHIPS):
             b = QPushButton(c)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip(qq)
             b.setMinimumWidth(0)
-            b.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {LINE};border-radius:12px;padding:4px 8px;font-size:12px;"
+            b.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {LINE};border-radius:11px;padding:2px 9px;font-size:11px;"
                             f"font-weight:500;color:{MUT};}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
             b.clicked.connect(lambda _=False, x=qq: self.ask(x))
-            cl.addWidget(b, i // 3, i % 3)
+            cl.addWidget(b)
         self.chips_sa = cs
         v.addWidget(cs)
         # saisie : champ arrondi + bouton envoyer
@@ -17061,17 +17321,17 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         box.setObjectName("inbox")
         box.setStyleSheet(f"#inbox{{background:{FIELD};border:1px solid {LINE};border-radius:20px;}}")
         r = QHBoxLayout(box)
-        r.setContentsMargins(14, 3, 4, 3)
+        r.setContentsMargins(12, 2, 3, 2)
         self.ed = QLineEdit()
         self.ed.setPlaceholderText("Écris à Gaël comme à un collègue…")
-        self.ed.setStyleSheet("background:transparent;border:none;padding:6px 0;font-size:13px;")
+        self.ed.setStyleSheet("background:transparent;border:none;padding:4px 0;font-size:13px;")
         self.ed.returnPressed.connect(self.ask)
         r.addWidget(self.ed, 1)
         sb = QPushButton("↑")
         sb.setProperty("kind", "primary")
-        sb.setFixedSize(32, 32)
+        sb.setFixedSize(28, 28)
         sb.setCursor(Qt.CursorShape.PointingHandCursor)
-        sb.setStyleSheet("border-radius:16px;font-size:16px;font-weight:800;padding:0;")
+        sb.setStyleSheet("border-radius:14px;font-size:15px;font-weight:800;padding:0;")
         sb.clicked.connect(lambda: self.ask())
         r.addWidget(sb)
         v.addWidget(box)
@@ -17086,12 +17346,12 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
     def greet(self):
         h = time.localtime().tm_hour
         hi = "Noz vat" if h >= 21 or h < 5 else ("Demat" if h < 18 else "Bonsoir")
-        self.say(f"{hi} ! Moi c'est Gaël, le radio-bot. Dis-moi ce qui se passe, comme tu le dirais à un collègue : "
-                 "un souci de son, un flux qui coupe, un réglage à faire… Je te propose la solution, tu valides d'un clic.")
+        self.say(f"{hi} ! Moi c'est Gaël. Dis-moi ce qui se passe ou ce que tu veux faire (« passe sur la table de mixage », "
+                 "« lance la playlist », « joue Tri Martolod »…) : je propose, tu valides d'un clic.")
 
     def set_status(self):
         on = self.llm_on()
-        self.l_st.setText(("● en ligne · conversation avancée" if on else "● en ligne · réponses en local"))
+        self.l_st.setText(("● conversation avancée" if on else "● en ligne"))
         self.l_st.setStyleSheet(f"color:{OKC};font-size:11px;")
         self.l_st.setToolTip("Conversation avancée : réglable avec le bouton « Réglages » ci-contre.")
 
@@ -17540,6 +17800,122 @@ class CLabel(QLabel):
         p.drawText(self.contentsRect(), fl, txt)
 
 
+class OnAirPill(CLabel):
+    """Voyant « EN ANTENNE » façon studio : pastille rouge pleine, texte blanc bien lisible, point qui pulse et halo doux.
+    Ambre pendant la connexion, rouge sombre si aucun flux ne passe, discret (gris) hors antenne."""
+
+    def __init__(self):
+        super().__init__("Hors antenne", color=MUT)
+        self.mode, self.t = "off", 0.0
+        self.setMinimumHeight(36)
+        f = self.font()
+        f.setBold(True)
+        f.setPixelSize(14)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104)
+        self.setFont(f)
+        Ticker.add(self, self.step, 30)
+
+    def set_mode(self, mode):
+        if mode != self.mode:
+            self.mode = mode
+            self.update()
+
+    def step(self, t, dt):
+        self.t = t
+        return self.mode in ("air", "wait")
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        rad = r.height() / 2
+        t, m = self.t, self.mode
+        if m == "air":
+            br = (math.sin(t * 2.6) + 1) / 2 if ANIM else .5
+            glow = QColor(ONAIR_RED)
+            for i in range(3):                                   # halo doux autour de la pastille
+                glow.setAlphaF(.10 + .10 * br - i * .03)
+                p.setPen(QPen(glow, 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(r.adjusted(-1 - i, -1 - i, 1 + i, 1 + i), rad + 1 + i, rad + 1 + i)
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())
+            g.setColorAt(0, QColor(ONAIR_RED))
+            g.setColorAt(1, QColor(ONAIR_RED2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(r, rad, rad)
+            fg, dot = QColor("#ffffff"), qc("#ffffff", int(255 * (.55 + .45 * br)))
+        elif m == "wait":
+            p.setPen(QPen(QColor("#ffb020"), 1.6))
+            p.setBrush(qc("#ffb020", 30))
+            p.drawRoundedRect(r, rad, rad)
+            k = (math.sin(t * 5) + 1) / 2 if ANIM else .5
+            fg, dot = QColor("#ffc04d"), qc("#ffb020", int(255 * (.35 + .65 * k)))
+        elif m == "bad":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#7a1426"))
+            p.drawRoundedRect(r, rad, rad)
+            fg, dot = QColor("#ffd5da"), QColor(ONAIR_RED)
+        elif m == "preview":
+            p.setPen(QPen(QColor(ACC), 1.4))
+            p.setBrush(qc(ACC, 26))
+            p.drawRoundedRect(r, rad, rad)
+            fg, dot = QColor(ACCT), QColor(ACC)
+        else:
+            p.setPen(QPen(QColor(LINE), 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, rad, rad)
+            fg, dot = QColor(MUT), None
+        p.setFont(self.font())
+        fm = QFontMetrics(self.font())
+        txt = self.text()
+        tw = fm.horizontalAdvance(txt) + (16 if dot is not None else 0)
+        x = r.center().x() - tw / 2
+        if dot is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(dot)
+            p.drawEllipse(QPointF(x + 4.5, r.center().y()), 4.5, 4.5)
+            x += 16
+        p.setPen(fg)
+        p.drawText(QRectF(x, r.top(), tw, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+
+
+class SpeechBubble(QFrame):
+    """Bulle de dialogue de Gaël (annonce de mise à jour) : coins arrondis, petite pointe vers Gaël, ombre douce."""
+
+    def __init__(self, parent, tail="left"):
+        super().__init__(parent)
+        self.tail = tail
+        self.lay = QVBoxLayout(self)
+        m = (24, 12, 14, 12) if tail == "left" else (14, 22, 14, 12)
+        self.lay.setContentsMargins(*m)
+        self.lay.setSpacing(6)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        r = QRectF(self.rect()).adjusted(11 if self.tail == "left" else 1, 11 if self.tail == "top" else 1, -2, -3)
+        path = QPainterPath()
+        path.addRoundedRect(r, 16, 16)
+        tip = QPainterPath()
+        if self.tail == "left":
+            y = r.bottom() - 26
+            tip.moveTo(r.left() + 1, y - 8)
+            tip.lineTo(QPointF(1, y + 6))
+            tip.lineTo(r.left() + 1, y + 8)
+        else:
+            x = r.right() - 30
+            tip.moveTo(x - 8, r.top() + 1)
+            tip.lineTo(QPointF(x + 4, 1))
+            tip.lineTo(x + 8, r.top() + 1)
+        tip.closeSubpath()
+        path = path.united(tip)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc("#000000", 60))
+        p.drawPath(path.translated(0, 2))
+        p.setBrush(QColor(mixc(PANEL, ACC, .10)))
+        p.setPen(QPen(mixc(LINE, ACC, .55), 1.2))
+        p.drawPath(path)
+
+
 class Banner(QLabel):
     """Bandeau d'alerte (rupture de flux…) : la couleur qui pulse est peinte directement, sans feuille de style."""
 
@@ -17655,6 +18031,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             QTimer.singleShot(2500, lambda: None if self.on_air else self.start())
         if (UPDATE_REPO or S.get("update_repo")) and S.get("update_check", True):
             QTimer.singleShot(4000, lambda: self.update_start(False))
+            self.upd_tm = QTimer(self)                        # puis toutes les 6 h (Bev reste souvent ouvert des jours entiers)
+            self.upd_tm.timeout.connect(lambda: self.update_start(False))
+            self.upd_tm.start(6 * 3600 * 1000)
         if not self.data.get("np_tried") and np is None:
             self.data["np_tried"] = True
             QTimer.singleShot(4000, lambda: self.install("numpy"))
@@ -17767,8 +18146,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         QTimer.singleShot(0, self.fit_air_label)
         self.air_fx = AirWaves()
         hd.addWidget(self.air_fx)
-        self.l_air = CLabel("○ Hors antenne", color=MUT)
-        self.l_air.setStyleSheet("font-weight:700;")
+        self.l_air = OnAirPill()
         self.l_air.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.fit_air_label()
         hd.addWidget(self.l_air)
@@ -17927,8 +18305,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         f.setBold(True)
         fmb = QFontMetrics(f)
         need = max(max(fm.horizontalAdvance(t), fmb.horizontalAdvance(t)) for t in
-                   ("●  EN ANTENNE  00:00:00", "●  EN ANTENNE  88:88:88", "Cartoucheur hors antenne", "Contrôle d'entrée",
-                    "◌  Connexion des flux…", "✕  Aucun flux en ligne", text)) + 22
+                   ("EN ANTENNE  00:00:00", "EN ANTENNE  88:88:88", "Contrôle d'entrée",
+                    "Connexion des flux…", "Aucun flux en ligne", text)) + 16 + 34
         if need > l.minimumWidth():
             l.setFixedWidth(need)
 
@@ -17973,6 +18351,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def resizeEvent(self, e):
         super().resizeEvent(e)
         RZ[0] = time.time() + .3
+        QTimer.singleShot(0, self.place_upd_bubble)
         if hasattr(self, "l_beta"):
             self.compact_header()
         QTimer.singleShot(0, self.apply_compact)
@@ -19524,21 +19903,21 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if self.bot_btn:
             self.bot_btn.air = n_live > 0
         if self.on_air:
-            pulse = (math.sin(time.time() * 4) + 1) / 2
             if n_live:
-                head = f"●  EN ANTENNE  {fmt_dur(time.time() - e.started)}"
+                head, mode = f"EN ANTENNE  {fmt_dur(time.time() - e.started)}", "air"
                 self.l_air.setToolTip(f"{n_live} flux sur {n_all} en ligne")
-                fgc = mixc("#ffb3ba", BADC, pulse).name()
             elif any(o.state == "connecting" for o in e.outputs):
-                head, fgc = "◌  Connexion des flux…", ACC2
+                head, mode = "Connexion des flux…", "wait"
             else:
-                head, fgc = "✕  Aucun flux en ligne", BADC
-            self.set_label(self.l_air, head, fgc)
+                head, mode = "Aucun flux en ligne", "bad"
+            self.l_air.set_mode(mode)
+            self.set_label(self.l_air, head, TXT)
             if self.l_air.fontMetrics().horizontalAdvance(head) + 12 > self.l_air.width():
                 self.fit_air_label(head)
             self.set_kind(self.btn_start, "Arrêter", "stop")
         else:
-            self.set_label(self.l_air, "Contrôle d'entrée" if self.preview else "○ Hors antenne", ACCT if self.preview else MUT)
+            self.l_air.set_mode("preview" if self.preview else "off")
+            self.set_label(self.l_air, "Contrôle d'entrée" if self.preview else "Hors antenne", MUT)
             self.set_kind(self.btn_start, "Démarrer", "primary")
         if self.on_air:
             self.btn_prev.setText("● Entrée affichée")
@@ -19852,45 +20231,63 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 info(self, "Mise à jour", (r or {}).get("error") or "Recherche impossible.")
             return
         newer = parse_ver(r["tag"]) > parse_ver(VERSION)
-        skip = self.data.get("settings", {}).get("update_skip") == r["tag"]
-        if newer and (manual or not skip):
+        if newer and (manual or self.upd_bubble is None):
             self.update_bubble(r)
         elif manual:
             info(self, "Mise à jour", f"Tu as déjà la dernière version ({VERSION}). Dernière version publiée : {r['tag'] or '—'}.")
 
     def update_bubble(self, r):
+        """Nouvelle version : Gaël l'annonce en bas à gauche avec une bulle qui reste affichée (jusqu'à « Installer » ou
+        « Plus tard »). En barre du haut, la bulle part du petit Gaël en haut à droite."""
         self.update_bubble_close()
         self.upd_info = r
         self.bot_talk = 60
-        b = Card(parent=self.centralWidget())
-        b.lay.setContentsMargins(16, 12, 16, 14)
-        t = lab(f"Nouvelle version {r['tag']} disponible !", "")
-        t.setStyleSheet("font-weight:700;font-size:14px;")
+        b = SpeechBubble(self.centralWidget(), tail="top" if NAVTOP else "left")
+        t = lab(f"Nouvelle version {r['tag'].lstrip('v')} disponible !", "")
+        t.setStyleSheet("font-weight:800;font-size:13px;")
         b.lay.addWidget(t)
-        notes = " ".join(r["notes"].split())[:160]
-        m = lab(f"Tu as la {VERSION}." + (f"  {notes}" if notes else ""), "mut", True)
-        m.setMaximumWidth(320)
+        notes = " ".join(r["notes"].split())[:140]
+        m = lab(f"Tu as la {VERSION}." + (f" {notes}" if notes else ""), "mut", True)
+        m.setStyleSheet(f"color:{MUT};font-size:12px;")
+        m.setMaximumWidth(250)
         b.lay.addWidget(m)
         h = QHBoxLayout()
+        h.setSpacing(6)
         inst = SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy()
         h.addWidget(btn("Installer" if inst else "Télécharger", "primary",
                         lambda: (self.update_bubble_close(), self.update_install(r) if inst else webbrowser.open(r.get("asset") or r["url"]))))
-
-        def later():
-            self.data.setdefault("settings", {})["update_skip"] = r["tag"]
-            self.save_settings()
-            self.update_bubble_close()
-        h.addWidget(btn("Plus tard", "", later))
+        h.addWidget(btn("Plus tard", "", self.update_bubble_close))      # elle reviendra au prochain lancement
         h.addStretch(1)
         b.lay.addLayout(h)
         b.adjustSize()
-        if NAVTOP:
-            b.move(self.width() - b.width() - 14, TopNav.H + 14)
-        else:
-            b.move(self.rail.width() + 10, 14)
         b.show()
         b.raise_()
         self.upd_bubble = b
+        self.place_upd_bubble()
+        g = getattr(self.rail, "gael", None)
+        if g is not None and g.isVisible():
+            try:
+                g.play(G_HELLO)
+                g.say(40)
+            except Exception:
+                pass
+
+    def place_upd_bubble(self):
+        b = getattr(self, "upd_bubble", None)
+        if b is None:
+            return
+        b.adjustSize()
+        cw = self.centralWidget()
+        if NAVTOP:
+            b.move(cw.width() - b.width() - 14, TopNav.H + 6)
+        else:
+            g = getattr(self.rail, "gael", None)
+            if g is not None and g.isVisible():                  # à hauteur de la tête de Gaël, sous le menu
+                y = g.geometry().top() + 30
+            else:
+                y = cw.height() - b.height() - 40
+            b.move(self.rail.width() - 4, max(10, min(y, cw.height() - b.height() - 10)))
+        b.raise_()
 
     def update_install(self, r):
         """Télécharge l'installateur de la nouvelle version, vérifie le fichier, puis le lance et ferme Bev : l'installateur
