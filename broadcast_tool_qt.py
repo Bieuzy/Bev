@@ -47,7 +47,7 @@ from urllib.parse import quote, urlencode
 # RUNTIME est à augmenter quand le socle change (nouvelle bibliothèque, nouvelle version de Python, de PySide6, de ffmpeg…) :
 # les versions concernées passent alors par l'installateur complet.
 # ======================================================================================================================
-VERSION = "1.2.0"
+VERSION = "1.1.1"
 RUNTIME = 1
 UPD_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
     "~/Library/Application Support" if sys.platform == "darwin" else "~/.local/share"), "Bev", "maj")
@@ -8562,7 +8562,7 @@ Problèmes fréquents
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
-    "1.2.0": """## Des mises à jour qui passent toutes seules
+    "1.1.1": """## Des mises à jour qui passent toutes seules
 
 - **Mise à jour express** : la plupart des versions ne pèsent plus que ~1 Mo. Bev récupère son nouveau code, vérifie son empreinte, et redémarre en quelques secondes. Pas d'installateur à lancer, pas de droits administrateur : Smart App Control, SmartScreen, l'antivirus et le pare-feu n'ont plus rien à bloquer.
 - Si une version a besoin de l'installateur complet (nouvelles bibliothèques), Bev le dit clairement, affiche la progression (taille, débit, temps restant), puis ouvre **l'installateur normal**, comme un double-clic : on voit ce qui se passe et Windows peut poser ses questions. Bev ne se ferme que si l'installateur a vraiment démarré ; si Windows le bloque, Bev reste ouvert et montre le fichier pour le lancer à la main.
@@ -21949,7 +21949,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     # ------------------------------------------------------------ mise à jour : annonce
     def upd_title(self, r):
-        """« 1.1.0 → 1.2.0 » suivi du titre de la version s'il apporte quelque chose (« Processeur d'antenne »)."""
+        """« 1.1.0 → 1.1.1 » suivi du titre de la version s'il apporte quelque chose (« Processeur d'antenne »)."""
         new = r.get("tag", "").lstrip("vV")
         t = re.sub(r"(?i)^\s*bev\s*", "", r.get("title", "")).strip()
         t = re.sub(r"(?i)^v?\d+(\.\d+)*\s*", "", t).strip(" ·:-–")
