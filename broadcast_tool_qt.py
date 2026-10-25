@@ -8565,7 +8565,7 @@ NEWS = {
     "1.2.0": """## Des mises à jour qui passent toutes seules
 
 - **Mise à jour express** : la plupart des versions ne pèsent plus que ~1 Mo. Bev récupère son nouveau code, vérifie son empreinte, et redémarre en quelques secondes. Pas d'installateur à lancer, pas de droits administrateur : Smart App Control, SmartScreen, l'antivirus et le pare-feu n'ont plus rien à bloquer.
-- Si une version a besoin de l'installateur complet (nouvelles bibliothèques), Bev le dit clairement, affiche la progression (taille, débit, temps restant) et **ne se ferme que si l'installation a vraiment démarré**. Si Windows la bloque, Bev reste ouvert et explique quoi faire.
+- Si une version a besoin de l'installateur complet (nouvelles bibliothèques), Bev le dit clairement, affiche la progression (taille, débit, temps restant), puis ouvre **l'installateur normal**, comme un double-clic : on voit ce qui se passe et Windows peut poser ses questions. Bev ne se ferme que si l'installateur a vraiment démarré ; si Windows le bloque, Bev reste ouvert et montre le fichier pour le lancer à la main.
 - Garde-fou : si une nouvelle version ne démarre pas, Bev revient tout seul à la précédente.
 - À l'antenne, rien ne coupe le direct : la mise à jour s'applique au prochain démarrage.
 
@@ -22074,8 +22074,11 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if not res.get("ok"):
             self.gael_maj("err")
             self.log(f"Mise à jour express {new} impossible : {res.get('err')}")
+            btns = [("Réessayer", "primary", lambda: self.express_install(r))]
+            if SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy():
+                btns.append(("Installateur complet", "", lambda: self.full_install(r)))
             self.gael_bubble("Le téléchargement n'a pas abouti.", f"{res.get('err')}\nRien n'a changé : Bev continue normalement.",
-                             [("Réessayer", "primary", lambda: self.express_install(r)), ("Fermer", "", self.close_maj)], mode="err")
+                             btns + [("Fermer", "", self.close_maj)], mode="err")
             return
         self._upd_express_ready = r.get("tag")
         self.log(f"Mise à jour express {new} téléchargée et vérifiée.")
@@ -22173,15 +22176,15 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.gael_bubble("Installateur prêt ✓", "Il s'installera quand tu fermeras Bev : le direct n'est pas coupé.",
                              [("Parfait", "primary", self.close_maj)], mode="ready")
             return
-        self.gael_bubble("Installateur prêt ✓", f"Bev va se fermer le temps de l'installation (une fenêtre de progression "
-                         f"s'affiche, environ 30 s), puis Bev {new} se rouvre tout seul.",
+        self.gael_bubble("Installateur prêt ✓", f"L'installateur de Bev {new} va s'ouvrir et Bev se fermera : suis ses "
+                         "étapes (Suivant, Installer). Tes réglages sont conservés.",
                          [("Installer maintenant", "primary", self.full_launch_now), ("À la fermeture de Bev", "", self.close_maj)],
                          mode="ready")
 
     def full_launch_now(self):
         """Lance l'installateur, et ne ferme Bev que lorsqu'il a vraiment démarré : si Windows (Smart App Control,
         SmartScreen) ou un antivirus le bloque, Bev reste ouvert et explique quoi faire, au lieu de disparaître."""
-        self.bubble_set(title="Lancement de l'installation…", line="Windows peut demander une confirmation.", buttons=[], progress=-1)
+        self.bubble_set(title="Ouverture de l'installateur…", line="Si Windows demande une confirmation, accepte-la.", buttons=[], progress=-1)
         p, why = self.update_launch(relaunch=True)
         if p is None:
             return self.full_blocked(why)
@@ -22192,7 +22195,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 return QTimer.singleShot(400, lambda: check(n + 1))
             if rc not in (None, 0):
                 return self.full_blocked(f"l'installateur s'est arrêté tout de suite (code {rc})")
-            self.log("Installation de la mise à jour : Bev se ferme et se rouvrira tout seul.")
+            self.log("Installateur de la mise à jour ouvert : Bev se ferme pour le laisser faire.")
             self._closing = True
             self.close()
         QTimer.singleShot(400, check)
@@ -22203,24 +22206,36 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.log(f"Mise à jour bloquée : {why}")
         r = self.upd_info or {}
         self.gael_bubble(why[:1].upper() + why[1:] + ".",
-                         "Rien n'a changé : Bev continue normalement. Installe cette version depuis la page des versions ; "
-                         "les suivantes arriveront en express, sans installateur à lancer.",
-                         [("Page des versions", "primary", lambda: (self.close_maj(), webbrowser.open(r.get("url") or ""))),
+                         "Rien n'a changé : Bev continue normalement. Ouvre le dossier et double-clique sur l'installateur "
+                         "(Windows peut proposer « Exécuter quand même »), ou installe depuis la page des versions.",
+                         [("Ouvrir le dossier", "primary", self.open_installer_folder),
+                          ("Page des versions", "", lambda: (self.close_maj(), webbrowser.open(r.get("url") or ""))),
                           ("Fermer", "", self.close_maj)], mode="err")
 
+    def open_installer_folder(self):
+        """Montre l'installateur téléchargé dans l'Explorateur : un double-clic le lance (Windows peut alors proposer
+        « Exécuter quand même »)."""
+        dst = getattr(self, "_upd_last_dst", None)
+        self.close_maj()
+        try:
+            if dst and os.path.isfile(dst) and SYS == "Windows":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(dst)])
+            elif dst:
+                webbrowser.open("file://" + os.path.dirname(dst))
+        except Exception as ex:
+            self.log(f"Ouverture du dossier impossible : {ex}")
+
     def update_launch(self, relaunch):
-        """Lance l'installateur téléchargé (fenêtre de progression seulement, aucune question). Renvoie (processus, None)
-        ou (None, raison). relaunch=False : Bev a été fermé par l'utilisateur, il ne se rouvre pas."""
+        """Lance l'installateur téléchargé NORMALEMENT (assistant d'installation visible, comme un double-clic) : c'est le
+        plus sûr, Windows peut poser ses questions et l'on voit ce qui se passe. Bev se rouvre via la case « Lancer Bev »
+        de fin d'installation. Renvoie (processus, None) ou (None, raison)."""
         dst = getattr(self, "upd_pending", None)
         if not dst or not os.path.isfile(dst):
             return None, "installateur introuvable"
         self._upd_last_dst = dst
         try:
             kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {}
-            args = [dst, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
-                    "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")]
-            if not relaunch:
-                args.append("/NORELAUNCH=1")
+            args = [dst, "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")]
             env = clean_env(True)
             env.pop("BEV_CODE", None)
             p = subprocess.Popen(args, env=env, close_fds=True, **kw)
