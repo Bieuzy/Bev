@@ -6,7 +6,7 @@
 ;   lancée depuis Bev (bouton « Installer »), elle attend que Bev soit fermé puis le rouvre toute seule.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "1.0.3"
 #endif
 
 [Setup]
@@ -63,12 +63,18 @@ Name: "{autodesktop}\Bev"; Filename: "{app}\Bev.exe"; Tasks: desktopicon
 ; installation normale : case « Lancer Bev » à la fin
 Filename: "{app}\Bev.exe"; Description: "{cm:LaunchProgram,Bev}"; Flags: nowait postinstall skipifsilent
 ; mise à jour lancée depuis Bev (mode silencieux) : Bev se rouvre tout seul
-Filename: "{app}\Bev.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent
+; (sauf /NORELAUNCH=1 : mise à jour installée à la fermeture de Bev, qu'on a fermé exprès)
+Filename: "{app}\Bev.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent and Relaunch
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Code]
+function Relaunch(): Boolean;
+begin
+  Result := ExpandConstant('{param:NORELAUNCH|0}') <> '1';
+end;
+
 function BevRunning(): Boolean;
 begin
   Result := CheckForMutexes('BevRadioApp') or CheckForMutexes('BevRadioEngine');

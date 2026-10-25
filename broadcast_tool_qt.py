@@ -617,14 +617,95 @@ def list_devices():
     return devs, raw
 
 
-def list_output_devices():
-    """Cartes son de sortie (pour la sortie FM) : [(libellé, index)]."""
+_SD_STREAMS = []          # flux sounddevice ouverts dans CE processus (on ne réinitialise pas PortAudio sous leurs pieds)
+_SD_SCAN = [0.0]
+SDLIST_ARG = "--bev-sd-list"
+
+
+def sd_track(st):
+    _SD_STREAMS[:] = [x for x in _SD_STREAMS if not getattr(x, "closed", True)] + [st]
+    return st
+
+
+def sd_rescan(force=False):
+    """PortAudio ne relit la liste des cartes son qu'à son démarrage : une carte débranchée restait affichée pendant des
+    jours. On le redémarre (rapide) pour relire les cartes réellement branchées, sauf si un son joue dans ce processus."""
+    import sounddevice as sd
+    if any(not getattr(x, "closed", True) for x in _SD_STREAMS):
+        return False
+    if not force and time.time() - _SD_SCAN[0] < 2.0:
+        return True
+    try:
+        sd._terminate()
+        sd._initialize()
+        _SD_SCAN[0] = time.time()
+        return True
+    except Exception:
+        return False
+
+
+def _sd_query():
     import sounddevice as sd
     apis = sd.query_hostapis()
     out = []
     for i, d in enumerate(sd.query_devices()):
         if d["max_output_channels"] >= 2:
             out.append((f"{d['name']} [{apis[d['hostapi']]['name']}]", i))
+    return out
+
+
+def list_output_devices(fresh=True):
+    """Cartes son de sortie : [(libellé, index)]. fresh : liste relue (cartes débranchées retirées, nouvelles ajoutées)."""
+    if fresh and not sd_rescan():
+        # un son joue dans ce processus : la liste fraîche est lue par un petit processus à part (libellés seulement)
+        try:
+            import tempfile
+            fn = os.path.join(tempfile.gettempdir(), f"bev-sd-{os.getpid()}.json")
+            subprocess.run(worker_cmd() + [SDLIST_ARG, fn], timeout=12, env=clean_env(False, False),
+                           creationflags=0x08000000 if SYS == "Windows" else 0, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(fn, encoding="utf-8") as fh:
+                labels = json.load(fh)
+            os.remove(fn)
+            known = dict(_sd_query())
+            return [(l, known.get(l, -1)) for l in labels]
+        except Exception:
+            pass
+    return _sd_query()
+
+
+if SDLIST_ARG in sys.argv and __name__ in ("__main__", "__mp_main__"):
+    try:
+        _fn = sys.argv[sys.argv.index(SDLIST_ARG) + 1]
+        with open(_fn, "w", encoding="utf-8") as _fh:
+            json.dump([l for l, _ in _sd_query()], _fh)
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def out_name(label):
+    """« Haut-parleurs (Realtek) [Windows WASAPI] » -> « Haut-parleurs (Realtek) »."""
+    return re.sub(r"\s*\[[^\]]*\]\s*$", "", label or "").strip() or (label or "")
+
+
+def out_choices(labels, keep=""):
+    """Une seule ligne par carte son : Windows liste chaque carte 3 ou 4 fois (MME, DirectSound, WASAPI, WDM-KS). On
+    garde la version WASAPI (la plus fiable et la plus réactive) ; ailleurs, tout reste. `keep` (choix enregistré) reste
+    toujours visible."""
+    labels = list(labels)
+    if SYS == "Windows":
+        best = [l for l in labels if l.endswith("[Windows WASAPI]")] or [l for l in labels if l.endswith("[MME]")] or labels
+    else:
+        best = labels
+    seen, out = set(), []
+    for l in best:
+        n = out_name(l).lower()
+        if n not in seen:
+            seen.add(n)
+            out.append(l)
+    if keep and keep not in out:
+        out.append(keep)
     return out
 
 
@@ -853,8 +934,8 @@ class CartMonitor:
         try:
             import sounddevice as sd
             idx = dict(list_output_devices()).get(label)
-            if idx is None:
-                raise RuntimeError("carte son introuvable")
+            if idx is None or idx < 0:
+                raise RuntimeError("carte son introuvable (débranchée ?)")
 
             def cb(outdata, frames, t, status):
                 need = frames * 4
@@ -867,8 +948,8 @@ class CartMonitor:
                         self.primed = False
                 outdata[:need] = chunk + bytes(need - len(chunk))
             extra = sd.WasapiSettings(auto_convert=True) if "WASAPI" in label else None
-            st = sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
-                                    callback=cb, latency="low", extra_settings=extra)
+            st = sd_track(sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
+                                             callback=cb, latency="low", extra_settings=extra))
             st.start()
             if self.label != label:
                 return st.close()
@@ -925,6 +1006,8 @@ class Engine:
         self.live_buf, self.pl_buf = bytearray(), bytearray()
         self.pl_marks, self.pl_in, self.pl_out = deque(), 0, 0
         self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+        self.pl_pause = False                 # playlist de secours en pause (reprend exactement où elle s'était arrêtée)
+        self.pl_stop = False                  # playlist de secours arrêtée à la main (pas de relève auto avant le retour du son)
         self.silent_ms = self.loud_ms = 0
         self.mix_g, self.rec_ms = 0.0, 2000.0
         self.peak = [-90.0, -90.0]
@@ -985,7 +1068,7 @@ class Engine:
                     self.pl_buf.clear()
                     self.pl_marks.clear()
                     self.pl_in = self.pl_out = 0
-                self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+                self.backup = self.manual = self.mute = self.tone = self.pl_active = self.pl_pause = self.pl_stop = False
                 self.silent_ms = self.loud_ms = 0
                 self.mix_g, self.track, self.pl_cur, self.next_file, self.pl_skip = 0.0, "", None, None, False
                 self.delay_q.clear()
@@ -1016,7 +1099,7 @@ class Engine:
                 for b in list(self.buses.values()):
                     b.stop()
                 self.buses = {}
-                self.backup = self.manual = self.mute = self.tone = self.pl_active = False
+                self.backup = self.manual = self.mute = self.tone = self.pl_active = self.pl_pause = self.pl_stop = False
                 self.silent_ms = self.loud_ms = 0
                 self.track, self.pl_cur = "", None
                 if self.pl_proc:
@@ -1253,27 +1336,59 @@ class Engine:
         self.counts_ver += 1
         self.history("Secours", title or os.path.splitext(os.path.basename(f))[0], f)
 
+    JINGLE_WORDS = ("jingle", "virgule", "habillage", "pub", "annonce", "promo", "id station", "liner")
+
+    def avoid_repeat(self, files, fb):
+        """Pas deux fois d'affilée le même titre, ni deux jingles du même dossier à la suite (dossier « Jingles »,
+        « Virgules », « Habillage »…). S'il n'y a pas d'autre choix, la liste reste telle quelle."""
+        prev = getattr(self, "pl_prev", None)
+        if not prev or len(files) < 2:
+            return files
+        fo = fb.get("folder_of") or {}
+        fold = fo.get(prev, "")
+        jing = self.is_jingle(prev, fb)
+        out = [f for f in files if f != prev and not (jing and (fo.get(f, "") == fold or self.is_jingle(f, fb)))]
+        return out or [f for f in files if f != prev] or files
+
+    def is_jingle(self, f, fb):
+        """Fichier de la liste des jingles du secours, ou rangé dans un dossier de jingles de la playlist."""
+        if not f:
+            return False
+        if f in (fb.get("jingle") or {}).get("files", []):
+            return True
+        fold = (fb.get("folder_of") or {}).get(f, "").lower()
+        return bool(fold) and any(w in fold for w in self.JINGLE_WORDS)
+
     def jingle_loop(self):
-        """Pendant le secours, joue un jingle à intervalle régulier (le moins lu d'abord)."""
+        """Pendant le secours, signale qu'un jingle est dû à intervalle régulier. Il ne coupe jamais la musique : la playlist
+        le place ENTRE deux morceaux (juste après le titre en cours), tant pis s'il passe un peu après l'heure prévue."""
         since = None
         while not self.ev.wait(1):
             j = self.prof["fallback"].get("jingle", {})
             files = [f for f in j.get("files", []) if os.path.exists(f)] if (self.air and self.backup and j.get("enabled")) else []
             if not (j.get("enabled") and files and self.backup and self.air):
-                since = None
+                since, self.jingle_due = None, False
                 continue
             now = time.time()
             since = since or now
+            if getattr(self, "jingle_at", 0.0) > since:        # un jingle vient de passer : le compte repart de là
+                since = self.jingle_at
             try:
                 every = max(0.01, float(j.get("every", 15))) * 60
             except (TypeError, ValueError):
                 every = 900.0
             if now - since >= every:
-                since = now
-                f = self.least_played(files)
-                self.count_play(f)
-                self.play_cart(-1, {"file": f, "name": "Jingle secours", "mode": "Par-dessus",
-                                    "vol": 100, "loop": False})
+                self.jingle_due = True
+
+    def next_jingle(self, fb):
+        """Le jingle à placer entre deux morceaux (le moins lu ; jamais le même deux fois d'affilée)."""
+        j = fb.get("jingle", {})
+        files = [f for f in j.get("files", []) if os.path.isfile(f)]
+        if not (j.get("enabled") and files):
+            return None
+        last = getattr(self, "last_jingle", None)
+        cand = [f for f in files if f != last] or files
+        return self.least_played(cand, True)
 
     # --- cartoucheur
     def get_pcm(self, path, trim=False, maxi=False):
@@ -1416,8 +1531,9 @@ class Engine:
             for v in self.voices:
                 if v["id"] == cid and not v["stopping"]:
                     lim = v.get("end") or len(v["pcm"])
-                    v["pos"] = max(v.get("st0", 0), min(lim - 4, int(max(0.0, sec) * 176400) // 4 * 4))
-                    v["g"], v["fi"] = 0.0, 0.015
+                    # demande de saut appliquée par le mélangeur lui-même, au bloc suivant : avant, le mélangeur pouvait
+                    # réécrire l'ancienne position juste après le saut (la lecture ne suivait pas la tête déplacée)
+                    v["seek_to"] = max(v.get("st0", 0), min(lim - 4, int(max(0.0, sec) * 176400) // 4 * 4))
                     return True
         return False
 
@@ -1656,7 +1772,12 @@ class Engine:
                     missing.clear()                       # un fichier revenu (clé USB rebranchée) sera réessayé
                 self.ev.wait(0.1)
                 continue
-            if self.next_file and self.next_file in full:  # morceau / émission choisi(e)
+            jf = (self.next_jingle(fb) if (getattr(self, "jingle_due", False) and not self.next_file
+                                           and not self.is_jingle(getattr(self, "pl_prev", None), fb)) else None)
+            if jf:                                          # jingle dû : il passe entre le morceau qui finit et le suivant
+                f = jf
+                self.jingle_due, self.jingle_at, self.last_jingle = False, time.time(), jf
+            elif self.next_file and self.next_file in full:  # morceau / émission choisi(e)
                 f, self.next_file = self.next_file, None
                 with self.lock:  # le saut demandé est pris en compte : on repart d'un tampon vide
                     if self.pl_skip:
@@ -1665,7 +1786,8 @@ class Engine:
                         self.pl_in = self.pl_out = 0
                         self.pl_skip = False
             else:
-                f = self.least_played(files, fb.get("shuffle"))  # les moins lus d'abord
+                f = self.least_played(self.avoid_repeat(files, fb), fb.get("shuffle"))  # les moins lus d'abord
+            self.pl_prev = f
             if not os.path.isfile(f):
                 missing.add(f)
                 self.log(f"Playlist de secours : fichier introuvable, ignoré : {f}")
@@ -1682,7 +1804,7 @@ class Engine:
                     stderr=subprocess.PIPE)
                 threading.Thread(target=self.drain, args=(p, err), daemon=True).start()
                 with self.lock:
-                    self.pl_marks.append((self.pl_in, title, full.index(f), f, dur))
+                    self.pl_marks.append((self.pl_in, title, full.index(f) if f in full else -1, f, dur))
                 while self.air and self.pl_active and not self.ev.is_set() and not self.pl_skip:
                     if len(self.pl_buf) > 250 * CH:
                         self.ev.wait(0.02)
@@ -1759,7 +1881,7 @@ class Engine:
                         del self.live_buf[:CH]
                     else:
                         live_ok = False
-                if air and (self.backup or g > 0):
+                if air and (self.backup or g > 0) and not self.pl_pause:
                     if len(self.pl_buf) >= CH * (10 if starved else 1):
                         pl = bytes(self.pl_buf[:CH])
                         del self.pl_buf[:CH]
@@ -1793,9 +1915,18 @@ class Engine:
             # --- bascule direct / secours (antenne seulement)
             if air:
                 has = bool(p["files"])
-                if self.manual:
+                if self.pl_stop:                    # « Stop » : retour au direct, et pas de relève automatique tant que
+                    if self.backup or self.manual:  # le son n'est pas revenu (ou qu'on n'a pas relancé la playlist)
+                        self.backup = self.manual = by_hand = False
+                        self.pl_pause = False
+                        self.log("Playlist de secours arrêtée : retour au direct.")
+                    if self.loud_ms >= p["rec"]:
+                        self.pl_stop = False
+                elif self.manual:
                     by_hand = True
-                if self.manual and not self.backup:
+                if self.pl_stop:
+                    pass
+                elif self.manual and not self.backup:
                     if has:
                         self.backup = True
                         self.log("Bascule manuelle sur la playlist de secours.")
@@ -1892,6 +2023,9 @@ class Engine:
         listen = self.listen and self.air
         master = self.cart_master()
         for v in voices:
+            sk = v.pop("seek_to", None)
+            if sk is not None:                   # saut demandé (tête de lecture déplacée) : micro-fondu anti-clic
+                v["pos"], v["g"], v["fi"] = sk, 0.0, 0.015
             if v.get("paused") and v["g"] <= 0.0:
                 continue                         # en pause : la tête de lecture ne bouge plus
             pcm, pos, chunk = v["pcm"], v["pos"], b""
@@ -2481,7 +2615,7 @@ class FMOutput(Output):
         import sounddevice as sd
         label = self.cfg.get("device", "")
         idx = dict(list_output_devices()).get(label)
-        if idx is None:
+        if idx is None or idx < 0:
             raise RuntimeError("carte son de sortie introuvable : choisis-la dans la sortie")
         buf, lk = bytearray(), threading.Lock()
         hi, lo = int(1.6 * SR) * 4, int(0.9 * SR) * 4      # le traitement livre parfois le son par paquets de 0,5 s
@@ -2524,8 +2658,8 @@ class FMOutput(Output):
         extra = None
         if "WASAPI" in label:
             extra = sd.WasapiSettings(auto_convert=True)
-        stream = sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
-                                    callback=cb, latency="high", extra_settings=extra)
+        stream = sd_track(sd.RawOutputStream(samplerate=SR, channels=2, dtype="int16", device=idx,
+                                             callback=cb, latency="high", extra_settings=extra))
         try:
             t0 = time.time()
             while len(buf) < int(0.6 * SR) * 4 and time.time() - t0 < 10:
@@ -2966,7 +3100,7 @@ class EngineWorker:
             self.counts_sent = e.counts_ver
             self.out_q.put(("counts", dict(e.counts())))
         return {"t": time.time(), "running": e.running, "started": e.started, "backup": e.backup, "manual": e.manual,
-                "air": e.air, "monitor": e.monitor, "listen": e.listen, "cap_state": e.cap_state, "cap_err": e.cap_err,
+                "pl_pause": e.pl_pause, "pl_stop": e.pl_stop, "air": e.air, "monitor": e.monitor, "listen": e.listen, "cap_state": e.cap_state, "cap_err": e.cap_err,
                 "src_dev": e.src_dev,
                 "mute": e.mute, "tone": e.tone, "silent_ms": e.silent_ms, "loud_ms": e.loud_ms, "rec_ms": e.rec_ms,
                 "track": e.track, "meta": e.meta, "meta_manual": e.meta_manual, "pl_cur": dict(e.pl_cur) if e.pl_cur else None,
@@ -3288,7 +3422,7 @@ class _CmonProxy:
 class EngineProxy:
     """Le moteur vu depuis l'interface : mêmes attributs et mêmes commandes qu'Engine, mais le travail se fait dans le
     processus moteur. Les valeurs changées ici (coupure, tonalité…) sont prises en compte tout de suite à l'écran."""
-    SETTABLE = ("tone", "mute", "meta_manual", "manual")
+    SETTABLE = ("tone", "mute", "meta_manual", "manual", "pl_pause", "pl_stop")
     HOLD = 0.8
 
     def __init__(self, slot, prof, log, alert=None, standalone=False, on_dead=None):
@@ -3302,7 +3436,7 @@ class EngineProxy:
         d["outputs"] = []
         d["counts_in"] = None
         d["_fbp"], d["_fbp_ver"], d["fb_ver"] = None, -1, 0
-        d["_s"] = {"t": time.time(), "running": True, "started": time.time(), "backup": False, "manual": False, "mute": False,
+        d["_s"] = {"t": time.time(), "running": True, "started": time.time(), "backup": False, "manual": False, "pl_pause": False, "pl_stop": False, "mute": False,
                    "tone": False, "silent_ms": 0, "loud_ms": 0, "rec_ms": 2000.0, "track": "", "meta": "",
                    "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
                    "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": [],
@@ -3441,12 +3575,12 @@ class EngineProxy:
                         self._hold_out[c.get("id")] = time.time()
                     outs.append(o)
                 self.__dict__["outputs"] = outs
-                for k, v in (("started", time.time()), ("backup", False), ("manual", False), ("mute", False), ("tone", False),
+                for k, v in (("started", time.time()), ("backup", False), ("manual", False), ("pl_pause", False), ("pl_stop", False), ("mute", False), ("tone", False),
                              ("silent_ms", 0), ("loud_ms", 0), ("track", ""), ("pl_cur", None)):
                     self._s[k] = v
             else:
                 self.__dict__["outputs"] = []
-                for k in ("backup", "manual", "mute", "tone"):
+                for k in ("backup", "manual", "mute", "tone", "pl_pause", "pl_stop"):
                     self._hold_set(k, False)
             self._hold_set("air", on)
         self._call("set_air", on, prof if on else None)
@@ -3522,8 +3656,16 @@ class EngineProxy:
         s = self._s
         dt = max(0.0, time.time() - s["t"])
         out = {}
+        sk = self.__dict__.get("_seek") or {}
+        now = time.time()
         for cid, v in s["carts"].items():
-            if not v[6]:                                         # en lecture (ou en fondu) : la position avance d'elle-même
+            h = sk.get(cid)
+            if h is not None and now - h[1] > .5:
+                sk.pop(cid, None)
+                h = None
+            if h is not None:                                    # saut tout juste demandé : on part de la nouvelle position
+                v = (h[0] + (0.0 if v[6] else now - h[1]),) + tuple(v[1:])
+            elif not v[6]:                                       # en lecture (ou en fondu) : la position avance d'elle-même
                 pos = v[0] + dt
                 if not v[2]:
                     pos = min(pos, v[1])
@@ -3566,10 +3708,9 @@ class EngineProxy:
         v = self._s["carts"].get(cid)
         if v is None or v[4]:
             return False
-        carts = dict(self._s["carts"])
-        carts[cid] = (max(0.0, sec - (v[7] if len(v) > 7 else 0.0)),) + tuple(v[1:])
-        self._s["carts"] = carts
-        self._s["t"] = time.time()
+        # la tête affichée part tout de suite de la nouvelle position (les mesures du moteur encore en route sont ignorées
+        # un court instant, sinon elle revenait en arrière avant de sauter)
+        self.__dict__.setdefault("_seek", {})[cid] = (max(0.0, sec - (v[7] if len(v) > 7 else 0.0)), time.time())
         self._call("seek_cart", cid, sec)
         return True
 
@@ -3626,7 +3767,7 @@ ACCENTS = {"Phare": ("#ffb03b", "#ffd27a"), "Orange": ("#ff7a45", "#ffb347"), "R
 MINI = bool(SET.get("mini"))        # mode minimaliste : austère, sans animation, centré sur la diffusion
 NEWLOOK = SET.get("look_v") == 2          # tant que l'utilisateur n'a rien choisi, l'ambiance « Phare » (celle du logo) s'applique partout
 MOOD = "sobre" if MINI else (SET.get("mood", "phare") if NEWLOOK else "phare")
-if MOOD not in ("phare", "psyche", "sobre", "ocean"):
+if MOOD not in ("phare", "psyche", "sobre"):     # (l'ambiance « Océan » a été retirée : on revient à « Phare Ouest »)
     MOOD = "phare"
 OCEAN, PSYCHE, PHARE = MOOD == "ocean", MOOD == "psyche", MOOD == "phare"
 NAVTOP = SET.get("nav") == "top" or MINI
@@ -4498,7 +4639,21 @@ def dev_short(label):
     return (l[:1].upper() + l[1:]) if l else label
 
 
-DEV_KIND_LABEL = {"pc": "Son de l'ordinateur", "line": "Entrée ligne", "usb": "Interface ou table de mixage", "mic": "Micro / entrée audio"}
+DEV_KIND_LABEL = {"pc": "Son de l'ordinateur", "line": "Entrée ligne", "usb": "Interface ou table de mixage", "mic": "Micro / entrée audio",
+                  "phones": "Casque", "speaker": "Haut-parleurs", "screen": "Écran ou télévision (HDMI)", "none": ""}
+
+
+def out_kind(label):
+    l = (label or "").lower()
+    if not l:
+        return "none"
+    if any(k in l for k in ("casque", "headphone", "headset", "écouteur", "ecouteur", "airpods", "buds")):
+        return "phones"
+    if any(k in l for k in ("hdmi", "displayport", "display audio", "nvidia", "amd high definition", "tv", "écran", "ecran", "monitor")):
+        return "screen"
+    if any(k in l for k in ("usb", "interface", "scarlett", "focusrite", "mixer", "table", "behringer", "yamaha", "rode", "zoom", "motu", "steinberg")):
+        return "usb"
+    return "speaker"
 
 
 def draw_dev_icon(p, kind, cx, cy, col, s=1.0):
@@ -4517,6 +4672,28 @@ def draw_dev_icon(p, kind, cx, cy, col, s=1.0):
         path = QPainterPath(QPointF(0, 4))
         path.cubicTo(QPointF(0, 10), QPointF(8, 10), QPointF(8, 4))
         p.drawPath(path)
+    elif kind == "phones":
+        p.drawArc(QRectF(-8, -9, 16, 16), 0, 180 * 16)
+        p.drawRoundedRect(QRectF(-9.5, -1, 5, 9), 2, 2)
+        p.drawRoundedRect(QRectF(4.5, -1, 5, 9), 2, 2)
+    elif kind == "speaker":
+        path = QPainterPath(QPointF(-8, -3.5))
+        path.lineTo(QPointF(-4, -3.5))
+        path.lineTo(QPointF(1, -8))
+        path.lineTo(QPointF(1, 8))
+        path.lineTo(QPointF(-4, 3.5))
+        path.lineTo(QPointF(-8, 3.5))
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawArc(QRectF(-1, -5, 8, 10), -50 * 16, 100 * 16)
+        p.drawArc(QRectF(-2, -9, 13, 18), -50 * 16, 100 * 16)
+    elif kind == "screen":
+        p.drawRoundedRect(QRectF(-9.5, -8, 19, 13), 2.5, 2.5)
+        p.drawLine(QPointF(-5, 9), QPointF(5, 9))
+        p.drawLine(QPointF(-6, -3), QPointF(-2, -3))
+    elif kind == "none":
+        p.drawEllipse(QRectF(-8, -8, 16, 16))
+        p.drawLine(QPointF(-5.5, 5.5), QPointF(5.5, -5.5))
     elif kind == "usb":
         for dx, ky in ((-6, -2), (0, 3), (6, -4)):
             p.drawLine(QPointF(dx, -8), QPointF(dx, 8))
@@ -4543,15 +4720,18 @@ def dev_icon_pm(kind, col, size=20):
 
 
 class DevicePicker(QWidget):
-    """Sélecteur d'entrée façon macOS : icône, nom, type d'entrée, chevron. Le menu liste les entrées détectées."""
+    """Sélecteur de carte son façon macOS : icône, nom, type, chevron ; le menu liste les cartes détectées. Le même pour
+    les entrées (Diffusion) et les sorties (pré-écoute du cartoucheur, écoute du monitoring) : mode « in » ou « out ».
+    En sortie, chaque carte n'apparaît qu'une fois (nom lisible, sans la technologie Windows entre crochets)."""
     picked = Signal(str)
     refresh = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, mode="in", height=54, role="", none_label="Aucune"):
         super().__init__(parent)
         self.devs, self.cur, self.hov, self.lift = [], "", False, 0.0
+        self.mode, self.role, self.none_label = mode, role, none_label
         self.extra = []                     # [(libellé, fonction)] : entrées spéciales (ex. activer la capture du son de l'ordinateur)
-        self.setFixedHeight(54)
+        self.setFixedHeight(height)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -4588,7 +4768,16 @@ class DevicePicker(QWidget):
         if e.button() == Qt.MouseButton.LeftButton:
             self.popup()
 
+    def kind(self, l):
+        return out_kind(l) if self.mode == "out" else dev_kind(l)
+
+    def name(self, l):
+        return out_name(l) if self.mode == "out" else dev_short(l)
+
     def popup(self):
+        if self.mode == "out":                  # sorties : liste relue à chaque ouverture (cartes débranchées retirées)
+            self.refresh.emit()
+            return self.popup_out()
         m = QMenu(self)
         m.setMinimumWidth(self.width())
         ins = [l for l in self.devs if dev_kind(l) != "pc"]
@@ -4615,6 +4804,27 @@ class DevicePicker(QWidget):
         m.addAction("Actualiser la liste", self.refresh.emit)
         m.exec(self.mapToGlobal(QPoint(0, self.height() + 4)))
 
+    def popup_out(self):
+        m = QMenu(self)
+        m.setMinimumWidth(self.width())
+        hd = m.addAction(self.role.upper() if self.role else "SORTIES AUDIO")
+        hd.setEnabled(False)
+        a = m.addAction(dev_icon_pm("none", ACCT if not self.cur else MUT), "  " + self.none_label)
+        a.setCheckable(True)
+        a.setChecked(not self.cur)
+        a.triggered.connect(lambda _=False: self._pick(""))
+        for l in out_choices(self.devs, self.cur):
+            gone = l not in self.devs
+            a = m.addAction(dev_icon_pm(out_kind(l), ACCT if l == self.cur else MUT), "  " + out_name(l) + ("  (débranchée)" if gone else ""))
+            a.setCheckable(True)
+            a.setChecked(l == self.cur)
+            a.setToolTip(l)
+            a.triggered.connect(lambda _=False, l=l: self._pick(l))
+        if not self.devs:
+            na = m.addAction("Aucune sortie audio détectée (branche-la puis rouvre ce menu)")
+            na.setEnabled(False)
+        m.exec(self.mapToGlobal(QPoint(0, self.height() + 4)))
+
     def _manual(self):
         t, ok = QInputDialog.getText(self, "Entrée audio", "Nom exact de l'entrée (tel que le système l'affiche) :", text=self.cur)
         if ok and t.strip():
@@ -4635,31 +4845,141 @@ class DevicePicker(QWidget):
         p.setPen(QPen(mixc(LINE, ACC, .5 * self.lift) if not self.hasFocus() else QColor(ACC), 1))
         p.setBrush(mixc(FIELD, TXT, .035 * self.lift))
         p.drawRoundedRect(r, 14, 14)
-        kind = dev_kind(self.cur)
-        ic = QRectF(9, 9, H - 18, H - 18)
+        kind = self.kind(self.cur)
+        pad = 9 if H >= 50 else 6
+        ic = QRectF(pad, pad, H - 2 * pad, H - 2 * pad)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(mixc(FIELD, ACC, .20))
-        p.drawRoundedRect(ic, 10, 10)
-        draw_dev_icon(p, kind, ic.center().x(), ic.center().y(), ACCT, 1.0)
-        x0 = ic.right() + 12
+        p.drawRoundedRect(ic, 10 if H >= 50 else 8, 10 if H >= 50 else 8)
+        draw_dev_icon(p, kind, ic.center().x(), ic.center().y(), ACCT if self.cur else MUT, 1.0 if H >= 50 else .85)
+        x0 = ic.right() + (12 if H >= 50 else 10)
+        sm = H < 50
         f = QFont(self.font())
-        f.setPointSizeF(10.5)
+        f.setPointSizeF(10.5 if not sm else 9.8)
         f.setBold(True)
         p.setFont(f)
         p.setPen(QColor(TXT if self.cur else MUT))
         fm = QFontMetrics(f)
-        name = fm.elidedText(dev_short(self.cur) if self.cur else "Choisir une entrée audio", Qt.TextElideMode.ElideRight, int(W - x0 - 40))
-        p.drawText(QRectF(x0, 8, W - x0 - 40, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+        if self.mode == "out":
+            ph, sub = self.none_label, (self.role + " · " if self.role else "") + DEV_KIND_LABEL.get(kind, "")
+            if not self.cur:
+                sub = self.role or "Choisir une sortie audio"
+        else:
+            ph = "Choisir une entrée audio"
+            sub = DEV_KIND_LABEL[kind] if self.cur else "Micro, table de mixage ou son de l'ordinateur"
+        name = fm.elidedText(self.name(self.cur) if self.cur else ph, Qt.TextElideMode.ElideRight, int(W - x0 - 36))
+        y1, y2 = (8, 27) if not sm else (H / 2 - 17, H / 2 - 1)
+        p.drawText(QRectF(x0, y1, W - x0 - 36, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
         f2 = QFont(self.font())
-        f2.setPointSizeF(8.8)
+        f2.setPointSizeF(8.8 if not sm else 8.2)
         p.setFont(f2)
         p.setPen(QColor(MUT))
-        p.drawText(QRectF(x0, 27, W - x0 - 40, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   DEV_KIND_LABEL[kind] if self.cur else "Micro, table de mixage ou son de l'ordinateur")
+        sub = QFontMetrics(f2).elidedText(sub.rstrip(" ·"), Qt.TextElideMode.ElideRight, int(W - x0 - 36))
+        p.drawText(QRectF(x0, y2, W - x0 - 36, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, sub)
         cx, cy = W - 22, H / 2
         p.setPen(ppen(mixc(MUT, TXT, .4 * self.lift), 1.8))
         p.drawPolyline([QPointF(cx - 4, cy - 3), QPointF(cx, cy - 7), QPointF(cx + 4, cy - 3)])
         p.drawPolyline([QPointF(cx - 4, cy + 3), QPointF(cx, cy + 7), QPointF(cx + 4, cy + 3)])
+
+
+class Stepper(QWidget):
+    """Réglage numérique compact « −  12 s  + » (remplace la boîte à flèches, dont les deux petits boutons s'affichaient en
+    carrés noirs). Clic sur − / +, maintien = répétition, molette, flèches du clavier. Même interface que QSpinBox."""
+    valueChanged = Signal(int)
+
+    def __init__(self, lo=0, hi=99, suffix="", parent=None):
+        super().__init__(parent)
+        self.lo, self.hi, self.v, self.suffix, self.hov = lo, hi, lo, suffix, 0
+        self.setFixedHeight(34)
+        self.setMinimumWidth(112)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.rep = QTimer(self)
+        self.rep.timeout.connect(lambda: (self.rep.setInterval(70), self.step(self._dir)))
+        self._dir = 0
+
+    def setRange(self, lo, hi):
+        self.lo, self.hi = lo, hi
+        self.setValue(self.v)
+
+    def setSuffix(self, s_):
+        self.suffix = s_
+        self.update()
+
+    def value(self):
+        return self.v
+
+    def setValue(self, v):
+        v = int(max(self.lo, min(self.hi, int(v))))
+        if v != self.v:
+            self.v = v
+            self.update()
+            self.valueChanged.emit(v)
+
+    def step(self, d):
+        if d:
+            self.setValue(self.v + d)
+
+    def zone(self, x):
+        return -1 if x < 34 else (1 if x > self.width() - 34 else 0)
+
+    def mousePressEvent(self, e):
+        d = self.zone(e.position().x())
+        if e.button() == Qt.MouseButton.LeftButton and d:
+            self._dir = d
+            self.step(d)
+            self.rep.start(380)
+
+    def mouseReleaseEvent(self, e):
+        self.rep.stop()
+        self._dir = 0
+
+    def mouseMoveEvent(self, e):
+        h = self.zone(e.position().x())
+        if h != self.hov:
+            self.hov = h
+            self.setCursor(Qt.CursorShape.PointingHandCursor if h else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, e):
+        self.hov = 0
+        self.update()
+
+    def wheelEvent(self, e):
+        self.step(1 if e.angleDelta().y() > 0 else -1)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Up, Qt.Key.Key_Right, Qt.Key.Key_Plus):
+            return self.step(1)
+        if e.key() in (Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Minus):
+            return self.step(-1)
+        super().keyPressEvent(e)
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        r = QRectF(.5, .5, W - 1, H - 1)
+        p.setPen(QPen(QColor(ACC) if self.hasFocus() else QColor(LINE), 1))
+        p.setBrush(QColor(FIELD))
+        p.drawRoundedRect(r, H / 2, H / 2)
+        for d, cx in ((-1, 17.0), (1, W - 17.0)):
+            can = (self.v > self.lo) if d < 0 else (self.v < self.hi)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(mixc(FIELD, TXT, .16 if self.hov == d and can else .07))
+            p.drawEllipse(QPointF(cx, H / 2), 12, 12)
+            col = QColor(TXT if can else MUT)
+            if not can:
+                col.setAlphaF(.4)
+            p.setPen(ppen(col, 1.8))
+            p.drawLine(QPointF(cx - 4.5, H / 2), QPointF(cx + 4.5, H / 2))
+            if d > 0:
+                p.drawLine(QPointF(cx, H / 2 - 4.5), QPointF(cx, H / 2 + 4.5))
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPointSizeF(10.5)
+        p.setFont(f)
+        p.setPen(QColor(TXT))
+        p.drawText(QRectF(32, 0, W - 64, H), Qt.AlignmentFlag.AlignCenter, f"{self.v}{self.suffix}")
 
 
 class IconButton(QWidget):
@@ -4999,6 +5319,8 @@ def new_painter(w):
 
 from PySide6.QtGui import QPolygonF
 PH_NAVY, PH_AMBER, PH_RED, PH_SEA, PH_WHITE = "#0b1f3a", "#ffb03b", "#e5483f", "#5b7fa8", "#f5f7fb"
+if MINI:                                        # mode minimaliste : logo en gris, aucune couleur décorative
+    PH_NAVY, PH_AMBER, PH_RED, PH_SEA, PH_WHITE = "#202022", "#9a9aa0", "#5c5c62", "#46464b", "#d8d8dc"
 
 
 def draw_logo(p, cx, cy, r, cols=None, width=3, rot=0.0, tile=True, sea=None, pulse=None):
@@ -5192,60 +5514,19 @@ def soft_pill(p, rect, c1, c2, r=14):
 
 
 def paint_bot(p, x, y, width, blink=False, talk=0, on_air=False):
-    """Radiobot : poste de radio avec casque, dessiné en vectoriel."""
-    sc = width / 96.0
+    """Petit Gaël (le Marin), en buste : même dessin que le grand, à l'échelle."""
+    gp = globals().get("_BOT_GP")
+    if gp is None:
+        gp = globals()["_BOT_GP"] = GaelPainter()
+    P = dict(POSE0)
+    P.update(blink=1.0 if blink else 0.0, la1=14, ra1=14)
+    sc = width / 64.0
     p.save()
-    p.translate(x, y)
+    p.translate(x + width / 2, y + 128 * sc)
     p.scale(sc, sc)
-    p.setPen(Qt.PenStyle.NoPen)
-    cx, yy = 48, 2
-
-    def rr(x0, y0, x1, y1, r, fill):
-        p.setBrush(QColor(fill))
-        p.drawRoundedRect(QRectF(x0, y0, x1 - x0, y1 - y0), r, r)
-    rr(cx - 12, yy, cx + 12, yy + 46, 8, "#f7f4ec")
-    p.setPen(ppen("#cfc8b6", 1, Qt.PenCapStyle.FlatCap))
-    for k in range(5):
-        p.drawLine(QPointF(cx - 9, yy + 6 + k * 8), QPointF(cx + 9, yy + 6 + k * 8))
-    p.setPen(Qt.PenStyle.NoPen)
-    rr(cx - 14, yy + 40, cx + 14, yy + 47, 3, "#1b1b22")
-    rr(cx - 24, yy + 44, cx + 24, yy + 86, 14, "#eef1f7")
-    rr(cx - 19, yy + 49, cx + 19, yy + 81, 10, "#10131b")
-    h = 1 if blink else 5
-    for xx in (cx - 9, cx + 9):
-        rr(xx - 4, yy + 62 - h, xx + 4, yy + 62 + h, 4, "#ffffff" if talk else ACC2)
-    if talk:
-        for i in range(5):
-            hh = 2 + abs(((talk * 3 + i * 5) % 10) - 5) * .7
-            rr(cx - 13 + i * 6, yy + 74 - hh / 2, cx - 10 + i * 6, yy + 74 + hh / 2, 1, ACC)
-    else:
-        p.setPen(ppen(ACC, 2, Qt.PenCapStyle.FlatCap))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawArc(QRectF(cx - 8, yy + 68, 16, 10), -160 * 16, 140 * 16)
-        p.setPen(Qt.PenStyle.NoPen)
-    rr(cx - 30, yy + 54, cx - 22, yy + 76, 5, ACC)
-    rr(cx + 22, yy + 54, cx + 30, yy + 76, 5, ACC)
-    p.setPen(ppen(ACC, 3, Qt.PenCapStyle.FlatCap))
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawArc(QRectF(cx - 29, yy + 42, 58, 38), -340 * 16, 140 * 16)
-    p.setPen(Qt.PenStyle.NoPen)
-    rr(cx - 30, yy + 88, cx + 30, yy + 128, 12, "#c9742e")
-    rr(cx - 26, yy + 92, cx + 26, yy + 124, 9, "#e8a45a")
-    p.setPen(ppen("#7a4a1e", 2, Qt.PenCapStyle.FlatCap))
-    for k in range(5):
-        p.drawLine(QPointF(cx - 22 + k * 5, yy + 98), QPointF(cx - 22 + k * 5, yy + 118))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor("#10131b"))
-    p.drawEllipse(QRectF(cx + 2, yy + 97, 20, 20))
-    tc = OKC if on_air else ACC
-    p.setPen(ppen(tc, 2, Qt.PenCapStyle.FlatCap))
-    for k in range(3):
-        a = math.radians(k * 120 + 90)
-        p.drawLine(QPointF(cx + 12, yy + 107), QPointF(cx + 12 + 6 * math.cos(a), yy + 107 - 6 * math.sin(a)))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(OKC if on_air else "#8a93a6"))
-    p.drawEllipse(QRectF(cx + 24, yy + 94, 4, 4))
+    gp.draw(p, P, talk=min(1.0, talk / 20.0) if talk else 0.0, on_air=on_air, t=time.time() % 1000)
     p.restore()
+
 
 
 class Ticker(QObject):
@@ -5493,8 +5774,8 @@ ONAIR_RED, ONAIR_RED2 = "#ff3150", "#e0123a"        # rouge « ON AIR » des stu
 
 
 class AirWaves(QWidget):
-    """Phare d'antenne, version moderne : silhouette épurée et faisceau ambre (la couleur des ondes du logo) qui TOURNE
-    comme un vrai phare, avec un halo qui respire. Éteint hors antenne ; orange si plus de son ; rouge en cas de rupture."""
+    """Phare d'antenne, version moderne : silhouette épurée qui émet des ondes ambre, comme le logo de Bev, avec un halo
+    qui respire. Éteint hors antenne ; orange si plus de son ; rouge en cas de rupture."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5521,32 +5802,37 @@ class AirWaves(QWidget):
         col = QColor(ONAIR_RED if self.bad == "flux" else ("#ff9a1f" if self.bad == "son" else "#ffb03b"))
         cx, top, base = 29.0, 13.0, 51.0
         dim = QColor("#4a5266" if not LIGHT else "#b4bac6")
-        if act and ANIM:
-            # faisceau qui tourne : un cône de lumière en dégradé, vu de face (il s'élargit puis s'efface en passant derrière)
-            ang = (t * (1.6 if self.bad else 0.9)) % (2 * math.pi)
-            for side in (1, -1):
-                k = math.cos(ang) * side
-                if k <= 0:
-                    continue
-                L = 28 * k
-                w = 7 + 9 * k
-                g = QLinearGradient(QPointF(cx, top), QPointF(cx + side * L, top))
-                g.setColorAt(0, qc(col.name(), int(170 * k)))
-                g.setColorAt(1, qc(col.name(), 0))
-                path = QPainterPath(QPointF(cx, top - 1.5))
-                path.lineTo(QPointF(cx + side * L, top - w / 2))
-                path.lineTo(QPointF(cx + side * L, top + w / 2))
-                path.lineTo(QPointF(cx, top + 1.5))
-                path.closeSubpath()
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(g))
-                p.drawPath(path)
-            br = .55 + .45 * (math.sin(t * (6 if self.bad else 2.4)) + 1) / 2      # halo qui respire
-            halo = QRadialGradient(cx, top, 14)
-            halo.setColorAt(0, qc(col.name(), int(150 * br)))
+        # ondes comme sur le logo : deux arcs de chaque côté de la lanterne, émis l'un après l'autre (de l'intérieur vers
+        # l'extérieur) à l'antenne ; immobiles et discrets hors antenne
+        per = .9 if self.bad else 1.5
+        ph = (t / per) % 1.0 if (act and ANIM) else None
+        if act:
+            halo = QRadialGradient(cx, top, 12)
+            br = .55 + .45 * math.sin(math.pi * ph) if ph is not None else .8
+            halo.setColorAt(0, qc(col.name(), int(120 * br)))
             halo.setColorAt(1, qc(col.name(), 0))
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(halo))
-            p.drawEllipse(QPointF(cx, top), 14, 14)
+            p.drawEllipse(QPointF(cx, top), 12, 12)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i, (dx, hh, bul) in enumerate(((9.5, 7.5, 2.4), (15.0, 11.0, 4.2))):
+            if not act:
+                a = .35
+                c = dim
+            elif ph is None:
+                a, c = 1.0, col
+            else:                                         # chaque onde s'allume puis s'éteint, la suivante prend le relais
+                d = (ph - i * .28) % 1.0
+                a = .28 + .72 * max(0.0, 1 - abs(d - .25) / .3) if d < .6 else .28
+                c = col
+            pc = QColor(c)
+            pc.setAlphaF(_cl(a))
+            p.setPen(ppen(pc, 2.1 if i == 0 else 2.0, Qt.PenCapStyle.RoundCap))
+            for sd in (-1, 1):
+                x0 = cx + sd * dx
+                pa = QPainterPath(QPointF(x0, top - hh))
+                pa.cubicTo(QPointF(x0 + sd * bul / .75, top - hh * .25), QPointF(x0 + sd * bul / .75, top + hh * .25), QPointF(x0, top + hh))
+                p.drawPath(pa)
         # tour : silhouette fine, deux bandes, lanterne
         body = QPainterPath(QPointF(cx - 3.6, 19))
         body.lineTo(QPointF(cx + 3.6, 19))
@@ -7960,7 +8246,7 @@ Problèmes fréquents
 """
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
 
 
@@ -8002,6 +8288,7 @@ def check_update(repo, timeout=10):
         assets.sort(key=lambda a: "setup" not in str(a.get("name", "")).lower())     # l'installateur d'abord
         a = assets[0] if assets else {}
         return {"tag": str(js.get("tag_name", "")), "url": js.get("html_url", ""), "notes": (js.get("body") or "").strip(),
+                "title": str(js.get("name") or "").strip(),
                 "asset": a.get("browser_download_url", ""), "asset_name": a.get("name", ""), "size": int(a.get("size") or 0),
                 "digest": str(a.get("digest") or "")}
     except urllib.error.HTTPError as ex:
@@ -8328,12 +8615,17 @@ class AssistantKB:
 from PySide6.QtCore import QElapsedTimer, QThread
 from PySide6.QtGui import QTransform, QPolygonF
 
-G_COIF, G_LACE, G_VELVET = "#f7f4ec", "#cfc8b6", "#1b1b22"
-G_HEAD, G_SCREEN = "#eef1f7", "#10131b"
-G_BODY_D, G_BODY_L, G_GRILLE = "#c9742e", "#e8a45a", "#7a4a1e"
-G_LIMB = "#5d6678" if LIGHT else "#c5ccd8"
-G_HAND, G_HAND_LINE = "#ffffff", "#9aa3b5"
-G_SHOE = "#1b1b22"
+# Gaël « le Marin » : marinière, béret à pompon, antenne qui capte. Quatre couleurs : marine, blanc, rouge, ambre.
+G_NAVY, G_WHITE, G_RED, G_AMBER = "#12294a", "#ffffff", "#d9263d", "#f2a33a"
+G_OUT = "#12294a" if LIGHT else "#0a1830"      # contour (sur fond sombre, un marine plus profond reste lisible)
+G_COIF, G_LACE, G_VELVET = G_NAVY, G_NAVY, G_NAVY  # (anciens noms : béret)
+G_HEAD, G_SCREEN = "#eef2f7", G_NAVY
+G_BODY_D, G_BODY_L, G_GRILLE = G_NAVY, G_WHITE, G_NAVY
+G_LIMB = G_NAVY if LIGHT else "#1d3a63"
+G_HAND, G_HAND_LINE = G_WHITE, G_NAVY
+G_SHOE = G_NAVY if LIGHT else "#1d3a63"
+G_BLUSH = "#8a2b48"
+G_EDGE = "#b9c6da"                              # liseré des bras et jambes sur fond sombre
 ARM_A, ARM_B = 19.0, 18.0          # bras, avant-bras
 LEG_A, LEG_B = 9.5, 9.0            # cuisse, tibia
 HIP_Y = -24.0                      # hanches (le sol est en y = 0)
@@ -8452,6 +8744,7 @@ class GaelPainter:
         return self.body_transform(P).map(QPointF(x, y))
 
     def draw(self, p, P, talk=0.0, on_air=False, t=0.0, hand_r=None, hand_l=None, dial=0.0):
+        self.on_air = on_air
         p.save()
         sq = P["sq"]
         # ombre au sol (rétrécit pendant les sauts)
@@ -8468,13 +8761,16 @@ class GaelPainter:
             kx, ky = hx + side * kx * LEG_A, hy + ky * LEG_A
             fx, fy = dir_r(a1 - a2)
             fx, fy = kx + side * fx * LEG_B, ky + fy * LEG_B
-            p.setPen(ppen(G_LIMB, 6))
-            p.drawPolyline([QPointF(hx, hy), QPointF(kx, ky), QPointF(fx, fy)])
-            p.setPen(Qt.PenStyle.NoPen)
+            leg = [QPointF(hx, hy), QPointF(kx, ky), QPointF(fx, fy)]
+            if not LIGHT:                       # liseré clair : le marine reste visible sur le fond sombre
+                p.setPen(ppen(G_EDGE, 9.5))
+                p.drawPolyline(leg)
+            p.setPen(ppen(G_LIMB, 7))
+            p.drawPolyline(leg)
+            p.setPen(QPen(QColor(G_EDGE), 1.4) if not LIGHT else Qt.PenStyle.NoPen)
             p.setBrush(QColor(G_SHOE))
-            p.drawRoundedRect(QRectF(fx - 7 + side * 2.5, fy - 2.5, 14, 6.5), 3.2, 3.2)
-            p.setBrush(QColor("#c9ced8"))
-            p.drawRect(QRectF(fx - 1.5 + side * 2.5, fy - 1.5, 3, 2.4))
+            p.drawEllipse(QRectF(fx - 9 + side * 3, fy - 3, 18, 7.5))
+            p.setPen(Qt.PenStyle.NoPen)
         p.translate(0, HIP_Y)
         p.rotate(P["rot"])
         self._torso(p, on_air, dial)
@@ -8491,18 +8787,22 @@ class GaelPainter:
             ex, ey = sx + side * ex * ARM_A, sy + ey * ARM_A
             hx, hy = dir_r(a1 + a2)
             hx, hy = ex + side * hx * ARM_B, ey + hy * ARM_B
-            p.setPen(ppen(G_LIMB, 6))
+            arm = [QPointF(sx, sy), QPointF(ex, ey), QPointF(hx, hy)]
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPolyline([QPointF(sx, sy), QPointF(ex, ey), QPointF(hx, hy)])
+            if not LIGHT:
+                p.setPen(ppen(G_EDGE, 8))
+                p.drawPolyline(arm)
+            p.setPen(ppen(G_LIMB, 5.4))
+            p.drawPolyline(arm)
             if cb:
                 p.save()
                 p.translate(hx, hy)
                 ang = a1 + a2
                 cb(p, -ang if side > 0 else ang)
                 p.restore()
-            p.setPen(QPen(QColor(G_HAND_LINE), 1))
+            p.setPen(QPen(QColor(G_HAND_LINE), 2.2))
             p.setBrush(QColor(G_HAND))
-            p.drawEllipse(QPointF(hx, hy), 4.6, 4.6)
+            p.drawEllipse(QPointF(hx, hy), 4.8, 4.8)
         p.restore()
 
     @staticmethod
@@ -8511,52 +8811,73 @@ class GaelPainter:
         p.drawRoundedRect(QRectF(x0, y0, x1 - x0, y1 - y0), r, r)
 
     def _torso_static(self, p):
-        rr = self._rr
-        rr(p, -30, -40, 30, 0, 12, G_BODY_D)
-        rr(p, -26, -36, 26, -4, 9, G_BODY_L)
-        p.setPen(ppen(G_GRILLE, 2, Qt.PenCapStyle.FlatCap))
-        for k in range(5):
-            p.drawLine(QPointF(-22 + k * 5, -30), QPointF(-22 + k * 5, -10))
+        """Marinière : corps arrondi rayé marine et blanc, contour franc, petit foulard rouge au col."""
+        r = QRectF(-27, -42, 54, 42)
+        path = QPainterPath()
+        path.addRoundedRect(r, 13, 13)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#10131b"))
-        p.drawEllipse(QRectF(2, -31, 20, 20))
-        self._rr(p, -14, -44, 14, -38, 3, G_VELVET)
+        p.setBrush(QColor(G_WHITE))
+        p.drawPath(path)
+        p.save()
+        p.setClipPath(path)
+        p.setBrush(QColor(G_NAVY))
+        for k in range(4):
+            p.drawRect(QRectF(-30, -31 + k * 8.4, 60, 4.4))
+        p.restore()
+        p.setPen(QPen(QColor(G_OUT), 2.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.setPen(QPen(QColor(G_OUT), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(QColor(G_RED))
+        p.drawPolygon(QPolygonF([QPointF(-10, -42.5), QPointF(10, -42.5), QPointF(0, -34)]))
+        p.setPen(Qt.PenStyle.NoPen)
 
     def _torso(self, p, on_air, dial):
-        """Corps : poste de radio d'autrefois (origine = hanches, haut du corps en y = -40)."""
+        """Corps (origine = hanches, haut du corps en y = -42)."""
         p.setPen(Qt.PenStyle.NoPen)
-        self.cached(p, "torso", QRectF(-31, -45, 62, 46), self._torso_static)
-        c = QColor(OKC if on_air else ACC)
-        p.setPen(ppen(c, 1.6))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(12, -21), 6.2, 6.2)
-        p.save()
-        p.translate(12, -21)
-        p.rotate(math.degrees(dial))
-        p.drawLine(QPointF(0, -1.5), QPointF(0, -5.2))
-        p.restore()
-        p.setBrush(QColor(OKC if on_air else "#8a93a6"))
-        p.drawEllipse(QRectF(24, -34, 4, 4))
+        self.cached(p, "torso", QRectF(-30, -46, 60, 49), self._torso_static)
 
     def _head(self, p, P, talk, t):
-        """Tête (origine = base du cou), écran-visage, casque, et la haute coiffe pourlet."""
+        """Tête (origine = base du cou) : visage-écran marine, oreillettes, béret à pompon (qui suit les mouvements
+        avec un léger retard) et antenne qui capte (ondes ambre quand on est à l'antenne)."""
         rr = self._rr
         p.setPen(Qt.PenStyle.NoPen)
-        # coiffe (oscille autour de sa base) ; en version mini, juste le bas de la coiffe
-        if P.get("mini"):
-            rr(p, -11, -58, 11, -40, 6, G_COIF)
-            rr(p, -14, -46, 14, -39, 3, G_VELVET)
-        else:
+        mini = P.get("mini")
+        if not mini:                            # antenne, derrière la tête
             p.save()
-            p.translate(0, -42)
-            p.rotate(P["coif"])
-            self.cached(p, "coif", QRectF(-15, -47, 30, 51), self._coif_static)
+            p.translate(13, -44)
+            p.rotate(P["coif"] * .8)
+            p.setPen(ppen(G_NAVY if LIGHT else "#c9d3e3", 2.2))
+            p.drawLine(QPointF(0, 0), QPointF(13, -24))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(G_AMBER))
+            p.drawEllipse(QPointF(13, -25), 3.4, 3.4)
+            air = getattr(self, "on_air", False)
+            for k in range(2):
+                if air and ANIM:
+                    u = (t * .9 + k * .5) % 1.0
+                    c = qc(G_AMBER, int(255 * (1 - u)))
+                    rad = 6 + u * 9
+                else:
+                    c, rad = QColor(G_AMBER), 6.5 + k * 5
+                p.setPen(ppen(c, 1.8))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawArc(QRectF(13 - rad, -25 - rad, 2 * rad, 2 * rad), -55 * 16, 110 * 16)
             p.restore()
-        self.cached(p, "head", QRectF(-31, -47, 62, 46), self._head_static)
+        self.cached(p, "head", QRectF(-30, -47, 60, 47), self._head_static)
+        # béret à pompon (par-dessus la tête ; il bascule un peu avec la tête)
+        p.save()
+        p.translate(0, -43)
+        p.rotate(P["coif"] * (.35 if not mini else 0))
+        self.cached(p, "beret", QRectF(-31, -20, 63, 24), self._coif_static)
+        p.restore()
         # yeux
         lx, ly = P["look"] * 2.6, P["lookv"] * 2.2
         e, bl = int(P["eye"]), P["blink"]
-        col = QColor(P.get("eyec") or ("#ffffff" if talk else ACC2))
+        col = QColor(P.get("eyec") or ("#ffd38a" if talk else G_AMBER))
+        p.setBrush(QColor(G_BLUSH))                    # joues
+        p.drawEllipse(QPointF(-14.5, -17), 2.4, 2.4)
+        p.drawEllipse(QPointF(14.5, -17), 2.4, 2.4)
         for xx in (-9, 9):
             cx, cy = xx + lx, -26 + ly
             if e == 1:                          # heureux : ^ ^
@@ -8577,13 +8898,13 @@ class GaelPainter:
                 p.setBrush(col)
                 p.drawRoundedRect(QRectF(cx - 4, cy - .5, 8, 3), 1.5, 1.5)
                 continue
-            hgt = 5.0 if e != 3 else 6.5
+            hgt = 4.2 if e != 3 else 5.6
             if e == 4:
-                hgt = 3.0
+                hgt = 2.6
             hgt = max(.8, hgt * (1 - bl))
-            wd = 4.0 if e != 3 else 4.8
+            wd = 4.2 if e != 3 else 5.0
             p.setBrush(col)
-            p.drawRoundedRect(QRectF(cx - wd, cy - hgt, wd * 2, hgt * 2), 4, 4)
+            p.drawEllipse(QRectF(cx - wd, cy - hgt, wd * 2, hgt * 2))
             if e == 3 and bl < .5:
                 p.setBrush(QColor(G_SCREEN))
                 p.drawEllipse(QPointF(cx + .8, cy - 1.2), 1.4, 1.4)
@@ -8592,18 +8913,18 @@ class GaelPainter:
         if talk:
             for i in range(5):
                 hh = 2 + abs(math.sin(t * 13 + i * 1.3)) * 4.2 * min(1.0, talk)
-                rr(p, -13 + i * 6, -14 - hh / 2, -10 + i * 6, -14 + hh / 2, 1, ACC)
+                rr(p, -13 + i * 6, -14 - hh / 2, -10 + i * 6, -14 + hh / 2, 1, G_AMBER)
         elif m == 1:
-            p.setBrush(QColor(ACC))
+            p.setBrush(QColor(G_AMBER))
             p.drawEllipse(QPointF(0, -14), 3.2, 3.6)
         elif m == 2:
             path = QPainterPath(QPointF(-8, -17))
             path.cubicTo(QPointF(-6, -8), QPointF(6, -8), QPointF(8, -17))
             path.closeSubpath()
-            p.setBrush(QColor(ACC))
+            p.setBrush(QColor(G_AMBER))
             p.drawPath(path)
         elif m == 4:                            # grimace (pas content)
-            p.setPen(ppen(P.get("eyec") or ACC, 2.2))
+            p.setPen(ppen(P.get("eyec") or G_AMBER, 2.2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             path = QPainterPath(QPointF(-8, -12))
             for k in range(1, 5):
@@ -8611,39 +8932,40 @@ class GaelPainter:
             p.drawPath(path)
             p.setPen(Qt.PenStyle.NoPen)
         elif m == 3:                            # moue
-            p.setPen(ppen(ACC, 2))
+            p.setPen(ppen(G_AMBER, 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawArc(QRectF(-6, -15, 12, 8), 20 * 16, 140 * 16)
             p.setPen(Qt.PenStyle.NoPen)
         else:
-            p.setPen(ppen(ACC, 2, Qt.PenCapStyle.FlatCap))
+            p.setPen(ppen(G_AMBER, 2.4))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawArc(QRectF(-8, -20, 16, 10), -160 * 16, 140 * 16)
             p.setPen(Qt.PenStyle.NoPen)
 
     def _coif_static(self, p):
-        rr = self._rr
-        rr(p, -12, -46, 12, 2, 8, G_COIF)
-        p.setPen(QPen(QColor(G_LACE), 1, Qt.PenStyle.DashLine))
-        for k in range(5):
-            p.drawLine(QPointF(-9, -40 + k * 8), QPointF(9, -40 + k * 8))
-        p.setPen(QPen(QColor(G_LACE), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        for k in (-1, 0, 1):
-            p.drawEllipse(QPointF(k * 6, -42), 2, 2)
+        """Béret marine à pompon rouge (origine = haut de la tête)."""
+        path = QPainterPath(QPointF(-28, 1.5))
+        path.cubicTo(QPointF(-25, -9), QPointF(-9, -13), QPointF(2, -13))
+        path.cubicTo(QPointF(15, -13), QPointF(28, -7), QPointF(30, 1.5))
+        path.cubicTo(QPointF(16, -1), QPointF(-14, -1), QPointF(-28, 1.5))
+        p.setPen(QPen(QColor(G_OUT if LIGHT else G_EDGE), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(QColor(G_NAVY))
+        p.drawPath(path)
         p.setPen(Qt.PenStyle.NoPen)
-        rr(p, -14, -4, 14, 3, 3, G_VELVET)
+        p.setBrush(QColor(G_RED))
+        p.drawEllipse(QPointF(1, -14.5), 4.6, 4.6)
+        p.setBrush(qc("#ffffff", 70))
+        p.drawEllipse(QPointF(-.4, -16), 1.4, 1.4)
 
     def _head_static(self, p):
         rr = self._rr
-        rr(p, -24, -44, 24, -2, 14, G_HEAD)
-        rr(p, -19, -39, 19, -7, 10, G_SCREEN)
-        # casque
-        rr(p, -30, -34, -22, -12, 5, ACC)
-        rr(p, 22, -34, 30, -12, 5, ACC)
-        p.setPen(ppen(ACC, 3, Qt.PenCapStyle.FlatCap))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawArc(QRectF(-29, -46, 58, 38), -340 * 16, 140 * 16)
+        p.setPen(QPen(QColor(G_OUT if LIGHT else G_EDGE), 1.4))
+        rr(p, -28, -32, -21, -16, 3.5, G_NAVY)       # oreillettes
+        rr(p, 21, -32, 28, -16, 3.5, G_NAVY)
+        p.setPen(QPen(QColor(G_OUT), 2.6))
+        rr(p, -23, -45, 23, -2, 15, G_HEAD)
+        p.setPen(Qt.PenStyle.NoPen)
+        rr(p, -18, -38, 18, -8, 9, G_SCREEN)
         p.setPen(Qt.PenStyle.NoPen)
 
 
@@ -9305,6 +9627,15 @@ class GaelView(QWidget):
         if mode == "rail":
             self.setToolTip("Gaël, ton assistant d'antenne · clic : une animation · clic droit : menu")
 
+    def head_point(self):
+        """Point juste à droite de la tête de Gaël (coordonnées du widget) : la bulle de BD y pointe."""
+        W, H = self.width(), self.height()
+        box = self.BOX[self.mode]
+        name_h = 18 if self.mode == "rail" else 0
+        s = min(W / box.width(), (H - name_h) / box.height())
+        ox, oy = W / 2 - box.center().x() * s, (H - name_h) - box.bottom() * s
+        return QPointF(ox + 40 * s, oy - 112 * s)
+
     # --- cadence : 60 i/s pendant une animation, 30 i/s au repos, arrêt complet si invisible
     def now(self):
         return self.clock.elapsed() / 1000.0
@@ -9518,6 +9849,11 @@ class GaelHead(QWidget):
             for r in rects:
                 p.drawRoundedRect(r, bw / 2, bw / 2)
             return
+        if MINI:                                # minimaliste : un simple voyant, pas de robot
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor({"bad": BADC, "warn": "#ffb347"}.get(self.mood, MUT)))
+            p.drawEllipse(QPointF(W / 2, H / 2), W * .16, W * .16)
+            return
         if self.mood == "bad":
             P["head"] = math.sin(self.tt * 4.2) * 2.4
         if self.mood == "bad":
@@ -9531,14 +9867,17 @@ class GaelHead(QWidget):
 
 
 class Splash(QWidget):
-    """Écran de chargement : Gaël écoute de la musique sous une antenne FM."""
+    """Écran de démarrage : le phare de Bev émet ses ondes. Une seule animation, du double-clic à l'ouverture : l'image
+    affichée par l'exécutable avant même que Python démarre (build/splash.png) est la toute première image de cette
+    animation (même taille, même place, même dessin), qui prend le relais sans saut."""
+    W, H = 460, 270
 
-    def __init__(self):
+    def __init__(self, t0=None):
         super().__init__(None, Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setFixedSize(380, 400)
-        self.gp = GaelPainter()
+        self.setFixedSize(self.W, self.H)
         self.clock = QElapsedTimer()
         self.clock.start()
+        self.t_fixed = t0
         try:
             g = QApplication.primaryScreen().availableGeometry()
             self.move(g.center() - self.rect().center())
@@ -9553,72 +9892,77 @@ class Splash(QWidget):
             QApplication.processEvents()
             QThread.msleep(10)
 
+    def tick(self):
+        """Une image de plus pendant la construction de la fenêtre (dessin immédiat, sans traiter d'autres événements)."""
+        try:
+            self.repaint()
+        except Exception:
+            pass
+
     def paintEvent(self, e):
-        t = self.clock.elapsed() / 1000.0
+        t = self.t_fixed if self.t_fixed is not None else self.clock.elapsed() / 1000.0
         p = new_painter(self)
         W, H = self.width(), self.height()
-        p.setPen(QPen(QColor(LINE), 1))
-        p.setBrush(QColor(PAGE))
-        p.drawRoundedRect(QRectF(.5, .5, W - 1, H - 1), 16, 16)
-        # antenne FM
-        ax, ay = W / 2, 168
-        p.setPen(QPen(QColor(MUT), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawLine(QPointF(ax, ay), QPointF(ax, ay - 56))
-        for i, w in enumerate((30, 24, 18)):
-            y = ay - 54 + i * 11
-            p.drawLine(QPointF(ax - w, y), QPointF(ax + w, y))
-        p.setBrush(QColor(ACC))
+        g = QLinearGradient(0, 0, 0, H)
+        g.setColorAt(0, QColor(11, 31, 58))
+        g.setColorAt(1, QColor(17, 45, 80))
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(ax, ay - 58), 4, 4)
-        for k in range(3):                       # ondes qui descendent vers Gaël
-            u = ((t * .8) + k / 3) % 1.0
-            c = QColor(ACC)
-            c.setAlphaF((1 - u) * .75)
-            p.setPen(QPen(c, 2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            r = 12 + u * 40
-            p.drawArc(QRectF(ax - r, ay - 58 - r, 2 * r, 2 * r), 200 * 16, 140 * 16)
-        # Gaël
-        P = dict(POSE0)
-        b = t * 2 * math.pi / .6
-        k = win(t, .15, .6)
-        P.update(head=6 * math.sin(b) * k, y=-1.8 * abs(math.sin(b / 2)) * k, eye=1, mouth=2,
-                 la1=60, la2=90, ra1=-10 + 8 * math.sin(b), ra2=8)
-        p.save()
-        s = 1.05
-        p.translate(W / 2, 352)
-        p.scale(s, s)
-        self.gp.draw(p, P, t=t, on_air=True, dial=t * 1.5)
-        for i in range(4):
-            u = ((t * .6) + i / 4) % 1.0
-            col = QColor(ACC)
-            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.6)))
-            draw_note(p, (45 if i % 2 else -52) + math.sin(u * 5 + i) * 8, -100 - u * 60, col, .85, i % 2 == 1)
-        p.restore()
-        # titre + barre
+        p.setBrush(QBrush(g))
+        p.drawRect(QRectF(0, 0, W, H))
+        p.setPen(QPen(QColor(40, 66, 104), 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(1, 1, W - 2, H - 2))
+        cx, cy, r = 102.0, 124.0, 66.0
+        lx, ly = cx, cy - r + 129 * 2 * r / 560          # lanterne du phare
+        # ondes émises : elles partent de la lanterne et s'éloignent en s'effaçant (à t = 0 : rien encore)
+        for k in range(3):
+            u = (t * .7 - k / 3.0)
+            if u < 0:
+                continue
+            u %= 1.0
+            rr = 40 + u * 52
+            c = QColor(255, 176, 59)
+            c.setAlphaF(_cl((1 - u) * .7 * min(1.0, t * 2)))
+            p.setPen(QPen(c, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for a0 in (-38, 142):
+                p.drawArc(QRectF(lx - rr, ly - rr, 2 * rr, 2 * rr), int(a0 * 16), int(76 * 16))
+        pulse = 1.0 if t <= 0 else .6 + .4 * (math.cos(t * 4.4) + 1) / 2
+        draw_logo(p, cx, cy, r, None, 3, 0.0, False, True, pulse=pulse)   # sans tuile : les ondes partent bien du phare
         f = QFont(self.font())
-        f.setPointSizeF(20)
+        f.setPixelSize(64)
         f.setWeight(QFont.Weight.ExtraBold)
         p.setFont(f)
-        p.setPen(QColor(TXT))
-        draw_logo(p, W / 2 - 44, 40, 22, None, 3, 0.0)
-        p.drawText(QRectF(W / 2 - 12, 14, 120, 40), Qt.AlignmentFlag.AlignVCenter, APP)
-        f.setPointSizeF(7.5)
-        f.setWeight(QFont.Weight.Normal)
-        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
-        p.setFont(f)
-        p.setPen(QColor(MUT))
-        p.drawText(QRectF(0, 70, W, 16), Qt.AlignmentFlag.AlignCenter, "BROADCAST TOOL")
-        bw = 120
-        x0 = (W - bw) / 2
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(196, 52, 250, 80), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, APP)
+        f2 = QFont(self.font())
+        f2.setPixelSize(14)
+        f2.setWeight(QFont.Weight.DemiBold)
+        f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.5)
+        p.setFont(f2)
+        p.setPen(QColor(255, 210, 122))
+        p.drawText(QRectF(200, 134, 250, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "BROADCAST TOOL")
+        f3 = QFont(self.font())
+        f3.setPixelSize(14)
+        p.setFont(f3)
+        p.setPen(QColor(170, 186, 210))
+        p.drawText(QRectF(200, 166, 250, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "Démarrage…")
+        bw, x0, y0 = 150.0, 200.0, 200.0
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(LINE))
-        p.drawRoundedRect(QRectF(x0, H - 22, bw, 4), 2, 2)
-        p.setBrush(QColor(ACC))
-        u = (t * .9) % 1.0
-        a, bb = max(0, u * 1.5 - .5), min(1, u * 1.5)
-        p.drawRoundedRect(QRectF(x0 + a * bw, H - 22, (bb - a) * bw, 4), 2, 2)
+        p.setBrush(QColor(40, 66, 104))
+        p.drawRoundedRect(QRectF(x0, y0, bw, 4), 2, 2)
+        if t > 0:
+            p.setBrush(QColor(255, 176, 59))
+            u = (t * .9) % 1.0
+            a, bb = max(0, u * 1.5 - .5), min(1, u * 1.5)
+            p.drawRoundedRect(QRectF(x0 + a * bw, y0, (bb - a) * bw, 4), 2, 2)
         p.end()
+
+
+def render_splash(path):
+    """Première image de l'écran de démarrage, enregistrée pour l'exécutable (construction GitHub : tools/prepare.py)."""
+    sp = Splash(t0=0.0)
+    sp.grab().save(path)
+
 
 # ------------------------------------------------------------------ bibliothèque du secours (façon Apple Musique)
 # Lecture des étiquettes et pochettes directement dans les fichiers (ID3, FLAC, MP4/M4A) : pas besoin de ffmpeg,
@@ -10303,11 +10647,12 @@ class TrackList(QWidget):
         p.setPen(QPen(mixc(LINE, PANEL, .4), 1))
         p.drawLine(QPointF(4, self.HEAD - .5), QPointF(W0 - 4, self.HEAD - .5))
         if not self.rows:
-            for dx, dy in ((-22, -6), (22, 2)):
-                draw_ermine(p, W0 / 2 + dx, (H + self.HEAD) / 2 + dy, mixc(PANEL, TXT, .22), 1.6)
+            if not MINI:                         # minimaliste : juste la consigne, sans décor
+                for dx, dy in ((-22, -6), (22, 2)):
+                    draw_ermine(p, W0 / 2 + dx, (H + self.HEAD) / 2 + dy, mixc(PANEL, TXT, .22), 1.6)
             p.setPen(QColor(MUT))
             p.drawText(QRectF(0, (H + self.HEAD) / 2 + 26, W0, 24), Qt.AlignmentFlag.AlignCenter,
-                       "Glisse des morceaux ici ou clique « ＋ Ajouter »  ·  Sonerezh !")
+                       "Glisse des morceaux ici ou clique « ＋ Ajouter »" + ("" if MINI else "  ·  Sonerezh !"))
             if self.dropping:
                 p.setPen(QPen(QColor(ACC), 1.6, Qt.PenStyle.DashLine))
                 p.setBrush(Qt.BrushStyle.NoBrush)
@@ -10561,6 +10906,21 @@ FACTS = [
     (None, None, None, "le décibel doit son nom à Alexander Graham Bell, l'inventeur du téléphone : le « bel » était à l'origine l'unité de mesure d'un rapport de puissances (le décibel en est le dixième)."),
     (None, None, None, "le DAB+ utilise le codec HE-AAC v2, le même genre de compression que beaucoup de flux Internet : à 64 kbit/s, il reste très correct pour de la voix."),
     (None, None, None, "dans le jargon radio anglophone, un silence à l'antenne s'appelle « dead air » : l'air mort, hantise de tous les animateurs."),
+    (5, 11, 1898, "Eugène Ducretet réalisait une liaison par télégraphie sans fil entre la tour Eiffel et le Panthéon, à Paris."),
+    (None, None, 1921, "la tour Eiffel diffusait ses premiers concerts radiophoniques pour le public : la radio française faisait ses débuts."),
+    (26, 12, 1933, "l'Américain Edwin Armstrong obtenait ses brevets sur la modulation de fréquence : la FM était née."),
+    (None, None, 1947, "John Bardeen, Walter Brattain et William Shockley inventaient le transistor aux laboratoires Bell : la fin des postes à lampes s'annonçait."),
+    (None, None, 1954, "sortait la Regency TR-1, premier poste de radio à transistors vendu dans le commerce : la radio devenait vraiment portable."),
+    (18, 6, 1940, "le général de Gaulle lançait son appel depuis les studios de la BBC, à Londres."),
+    (30, 10, 1938, "Orson Welles adaptait « La Guerre des mondes » à la radio américaine ; la panique qu'elle aurait causée a depuis été largement exagérée par la presse."),
+    (13, 2, 2012, "on célébrait la première Journée mondiale de la radio, proclamée par l'UNESCO."),
+    (None, None, 1963, "Philips présentait la cassette audio compacte, qui allait accompagner des générations d'animateurs et de bricoleurs du son."),
+    (None, None, None, "pour la FM, une antenne quart d'onde mesure environ 75 cm : la longueur d'onde vers 100 MHz est d'à peu près 3 mètres."),
+    (None, None, None, "la stéréo FM tient grâce à une « fréquence pilote » à 19 kHz : le récepteur s'en sert pour retrouver la différence gauche-droite, cachée vers 38 kHz."),
+    (None, None, None, "en Europe, la FM renforce les aigus à l'émission avec une préaccentuation de 50 µs (75 µs en Amérique du Nord) ; le récepteur les rabaisse d'autant, et le souffle avec."),
+    (None, None, None, "les ondes courtes rebondissent sur l'ionosphère, ce qui permet d'entendre certaines radios à l'autre bout de la planète, surtout la nuit."),
+    (None, None, None, "une minute de son en qualité CD non compressé (WAV) pèse environ 10 Mo ; en MP3 à 128 kbit/s, moins d'1 Mo."),
+    (None, None, None, "dans un studio, le voyant rouge « ON AIR » s'allume dès qu'un micro est ouvert : à partir de là, on n'entre plus et on chuchote, au mieux."),
 ]
 MOIS_LONG = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre")
 
@@ -11033,10 +11393,14 @@ def regrid(g, narrow, cols=1):
             g.addLayout(obj, r, c, rs, cs, al)
     if narrow:
         order = sorted(g._wide, key=lambda x: (x[1], x[2]))
+        any_st = False
         for k, (obj, r, c, rs, cs, al) in enumerate(order):
             put(obj, k // cols, k % cols, 1, 1, al)
             if r < len(g._rs) and g._rs[r]:
                 g.setRowStretch(k // cols, g._rs[r])
+                any_st = True
+        if not any_st and order:                    # rien d'extensible : le surplus va sous les cartes, pas dans l'une d'elles
+            g.setRowStretch((len(order) - 1) // cols + 1, 1)
         for c in range(cols):
             g.setColumnStretch(c, 1)
     else:
@@ -11321,7 +11685,7 @@ class JingleDialog(QDialog):
         self.app, self.files, self.result = app, list(files), None
         self.setMinimumSize(520, 380)
         v = QVBoxLayout(self)
-        v.addWidget(lab("Le jingle le moins lu est joué à chaque échéance.", "mut"))
+        v.addWidget(lab("À chaque échéance, le jingle le moins lu passe entre deux morceaux (jamais en coupant la musique).", "mut", True))
         self.tb = QTableWidget(0, 2)
         self.tb.setHorizontalHeaderLabels(["JINGLE", "LECTURES"])
         self.tb.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -11922,13 +12286,13 @@ class CartMixin:
         self.cb_cdev = QComboBox()
         self.cb_cdev.hide()                              # liste réelle des sorties (le bouton ci-dessous l'affiche en menu)
         self.cb_cdev.activated.connect(self.cart_dev_changed)
-        self.b_cdev = btn("Casque : aucun")
-        self.b_cdev.setToolTip("Carte son de pré-écoute : là où les tuiles se jouent hors antenne ou avec Maj + clic")
-        self.b_cdev.setMinimumWidth(150)
-        self.b_cdev.setMaximumWidth(210)
-        self.m_cdev = QMenu(self.b_cdev)
-        self.m_cdev.aboutToShow.connect(self.cdev_menu)
-        self.b_cdev.setMenu(self.m_cdev)
+        # même sélecteur que la source audio de Diffusion (une ligne par carte, liste relue à chaque ouverture)
+        self.b_cdev = DevicePicker(mode="out", height=40, role="Sortie audio", none_label="Aucune sortie")
+        self.b_cdev.setToolTip("Sortie audio du cartoucheur")
+        self.b_cdev.setMinimumWidth(220)
+        self.b_cdev.setMaximumWidth(300)
+        self.b_cdev.picked.connect(self.cdev_pick)
+        self.b_cdev.refresh.connect(self.set_cart_devices)
         h.addWidget(self.b_cdev)
         self.cb_route = QComboBox()
         self.cb_route.addItems(ROUTES)
@@ -12303,7 +12667,7 @@ class CartMixin:
         """Moteur prêt pour jouer une tuile (lance le moteur hors antenne au besoin). None si impossible."""
         dev = self.prof["carts"].get("device", "")
         if pre and not dev:
-            QMessageBox.information(self, "Carte son", "Choisis d'abord la carte son de pré-écoute (en haut à droite du cartoucheur) : "
+            QMessageBox.information(self, "Carte son", "Choisis d'abord la sortie audio du cartoucheur (en haut à droite) : "
                                     "c'est là que les sons se jouent hors antenne.")
             return None
         e = self.ensure_engine()
@@ -12351,19 +12715,18 @@ class CartMixin:
             self.engine.stop_cart(None, fade)
 
     def cdev_label(self):
-        t = self.cb_cdev.currentText() if self.cb_cdev.currentData() else ""
-        t = dev_short(t) if t else ""
-        self.b_cdev.setText("Casque : " + (t if t else "aucun"))
-        self.b_cdev.setToolTip("Carte son de pré-écoute : " + (self.cb_cdev.currentText() if t else "aucune choisie"))
+        p = self.b_cdev
+        p.set_devices(getattr(self, "_cart_outs", None) or [self.cb_cdev.itemData(i) for i in range(self.cb_cdev.count()) if self.cb_cdev.itemData(i)])
+        p.set_current(self.cb_cdev.currentData() or "")
+        p.setToolTip("Sortie audio du cartoucheur : " + (out_name(self.cb_cdev.currentData()) if self.cb_cdev.currentData() else "aucune choisie"))
 
-    def cdev_menu(self):
-        m = self.m_cdev
-        m.clear()
-        for i in range(self.cb_cdev.count()):
-            a = m.addAction(self.cb_cdev.itemText(i) if self.cb_cdev.itemData(i) else "Aucun (pas de pré-écoute)")
-            a.setCheckable(True)
-            a.setChecked(i == self.cb_cdev.currentIndex())
-            a.triggered.connect(lambda _=False, i=i: (self.cb_cdev.setCurrentIndex(i), self.cart_dev_changed(i)))
+    def cdev_pick(self, label):
+        i = self.cb_cdev.findData(label or "")
+        if i < 0:
+            self.cb_cdev.addItem(label, label)
+            i = self.cb_cdev.count() - 1
+        self.cb_cdev.setCurrentIndex(i)
+        self.cart_dev_changed(i)
 
     def master_changed(self, v):
         self.prof["carts"]["master"] = v
@@ -12569,8 +12932,6 @@ class CartMixin:
         for t in self.tiles:
             t.set_state(st.get(t.cid))
         self.ci_tick(st.get(self.cart_sel) if self.cart_sel is not None else None)
-        if self.b_cdev.text() == "":
-            self.cdev_label()
 
     # ---- raccourcis clavier et MIDI
     def find_key(self, tok, field="key"):
@@ -12941,9 +13302,9 @@ class PagesMixin1:
         s1.setValue({"dark": 0, "light": 1, "auto": 2}.get(S.get("theme", "dark"), 0))
         s1.changed.connect(lambda k: self.need_restart("theme", ("dark", "light", "auto")[k]))
         c.lay.addLayout(row("Mode", s1))
-        s2 = Segmented(["Phare", "Sobre", "Psyché", "Océan"], 84)
-        s2.setValue({"sobre": 1, "psyche": 2, "ocean": 3}.get(S.get("mood", "phare") if S.get("look_v") == 2 else "phare", 0))
-        s2.changed.connect(lambda k: self.need_restart("mood", ("phare", "sobre", "psyche", "ocean")[k]))
+        s2 = Segmented(["Phare Ouest", "Sobre", "Psyché"], 100)
+        s2.setValue({"sobre": 1, "psyche": 2}.get(S.get("mood", "phare") if S.get("look_v") == 2 else "phare", 0))
+        s2.changed.connect(lambda k: self.need_restart("mood", ("phare", "sobre", "psyche")[k]))
         c.lay.addLayout(row("Ambiance", s2))
         s3 = Segmented(["Menu latéral", "Barre du haut"], 120)
         s3.setValue(1 if S.get("nav") == "top" else 0)
@@ -13732,7 +14093,10 @@ class PagesMixin1:
                                     ("F11", "plein écran"), ("Glisser un son sur une touche", "l'affecter à la touche"),
                                     ("Glisser des fichiers sur la liste", "les ajouter à la playlist de secours"), ("Ctrl + Z  /  Ctrl + Y", "annuler / rétablir la dernière modification"))):
             l = QLabel(f"<b style='color:{ACCT}'>{k}</b>  {v}")
+            l.setWordWrap(True)
             grid.addWidget(l, i // 2, i % 2)
+        grid.setHorizontalSpacing(18)
+        self._sk = (grid, [grid.itemAt(i).widget() for i in range(grid.count())])
         sk.lay.addLayout(grid)
         g.addWidget(sk, 1, 0, 1, 2)
         g.setRowStretch(2, 1)
@@ -14298,9 +14662,13 @@ class PagesMixin3:
         h = QHBoxLayout()
         h.addWidget(lab("Écouter sur", "mut"))
         self.cb_listen = QComboBox()
-        self.cb_listen.setMinimumWidth(200)
         self.cb_listen.addItem(NODEV)
-        h.addWidget(self.cb_listen, 1)
+        self.cb_listen.hide()                   # liste réelle ; on affiche le même sélecteur que la source audio de Diffusion
+        self.listen_pick = DevicePicker(mode="out", height=40, role="Écoute du flux", none_label="Sortie par défaut de l'ordinateur")
+        self.listen_pick.setMinimumWidth(240)
+        self.listen_pick.picked.connect(lambda l: (self.cb_listen.setCurrentText(l or NODEV), self.listen_pick_sync()))
+        self.listen_pick.refresh.connect(self.listen_devices)
+        h.addWidget(self.listen_pick, 1)
         self.l_listen = lab("Clique « Écouter » sur un flux.", "mut")
         h.addWidget(self.l_listen, 1)
         self.btn_lstop = btn("Arrêter", "", self.mon_listen_stop)
@@ -14538,6 +14906,14 @@ class PagesMixin3:
         else:
             cart = self.cb_cdev.currentText() if hasattr(self, "cb_cdev") else NODEV
             self.cb_listen.setCurrentText(cart if cart in vals else NODEV)
+        self.listen_pick_sync()
+
+    def listen_pick_sync(self):
+        p = getattr(self, "listen_pick", None)
+        if p is not None:
+            p.set_devices([self.cb_listen.itemText(i) for i in range(1, self.cb_listen.count())])
+            t = self.cb_listen.currentText()
+            p.set_current("" if t == NODEV else t)
 
     def mon_listen(self, url):
         if self.listen_url == url:
@@ -14906,7 +15282,7 @@ class GaelBrain:
         if H(n, "merci", "trugarez", "thanks", "cool merci", "top merci", "c'est gentil"):
             return pick(("Avec plaisir !", "Trugarez à toi !", "De rien, c'est pour ça que je suis là.", "Pas de quoi, bonne émission !"))
         if H(n, "qui es-tu", "qui es tu", "t'es qui", "tu es qui", "ton nom", "tu t'appelles", "c'est qui gael", "qui est gael", "presente-toi"):
-            return ("Je suis Gaël, le radio-bot : un vieux poste de radio avec une coiffe bigoudène… enfin pourlet, et un casque sur les oreilles. "
+            return ("Je suis Gaël, le radio-bot : un petit robot marin : marinière, béret à pompon et antenne qui capte. "
                     "Je veille sur l'antenne, j'explique les pannes et je prépare les réglages pour toi.")
         if H(n, "que sais-tu", "tu sais faire quoi", "tu fais quoi", "a quoi tu sers", "tu peux faire quoi", "aide-moi", "aide moi") and len(words) <= 6:
             return ("Je peux te dire comment va l'antenne, expliquer une erreur de flux, dépanner un souci de son ou de réseau, lancer un diagnostic, "
@@ -15643,11 +16019,11 @@ class HeroCard(Card):
             p.setBrush(qc("#000000", 18 if not LIGHT else 10))
             p.drawRoundedRect(r.translated(0, 2), 18, 18)
             g = QLinearGradient(r.topLeft(), r.topRight())
-            g.setColorAt(0, mixc(PANEL, self.col, .13))
+            g.setColorAt(0, mixc(PANEL, self.col, .13) if not MINI else QColor(PANEL))
             g.setColorAt(.55, QColor(PANEL))
-            g.setColorAt(1, mixc(PANEL, ACC, .05))
+            g.setColorAt(1, mixc(PANEL, ACC, .05) if not MINI else QColor(PANEL))
             p.setBrush(QBrush(g))
-            p.setPen(QPen(mixc(LINE, self.col, .55), 1.2))
+            p.setPen(QPen(mixc(LINE, self.col, .55) if not MINI else QColor(LINE), 1.2))
             p.drawRoundedRect(r, 18, 18)
             p.end()
             self._bgpm, self._bgk = pm, key
@@ -15663,7 +16039,7 @@ API_URL = "https://api.anthropic.com/v1/messages"
 LLM_MODELS = (("claude-haiku-5-5", "Rapide (Claude Haiku)"), ("claude-sonnet-5-5", "Plus fin (Claude Sonnet)"))
 
 GAEL_SYSTEM = """Tu es Gaël, le radio-bot de l'application de diffusion radio « {app} », portée par des radios associatives de Bretagne.
-Tu as l'apparence d'un petit poste de radio d'autrefois coiffé d'une haute coiffe bretonne, avec un casque.
+Tu as l'apparence d'un petit robot breton en marinière, avec un béret à pompon rouge et une antenne qui capte les ondes.
 Tu parles en français, tu tutoies, chaleureux et direct, avec à l'occasion un mot de breton (demat, trugarez, kenavo) sans en abuser.
 Tu réponds comme dans une vraie conversation : phrases courtes, pas de listes à rallonge, pas de titres markdown, pas de gras.
 Les utilisateurs sont souvent bénévoles et pas techniciens : explique simplement, sans jargon inutile.
@@ -15944,6 +16320,7 @@ class ResourceStrip(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
+        self.TH, self.rows = 74, 1
         self.setFixedHeight(74)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.keys = ("cpu", "ram", "audio", "ui", "net", "disk")
@@ -16059,7 +16436,10 @@ class ResourceStrip(QWidget):
         W, H = self.width(), self.height()
         n = len(self.keys)
         gap = 10
-        tw = (W - gap * (n - 1)) / n
+        rows = self.rows
+        per = -(-n // rows)
+        tw = (W - gap * (per - 1)) / per
+        TH = self.TH
         cols = {"ok": OKC, "warn": "#ffb347", "bad": BADC, "idle": MUT}
         f1 = QFont(self.font())
         f1.setPointSizeF(7)
@@ -16075,8 +16455,9 @@ class ResourceStrip(QWidget):
         f3 = QFont(self.font())
         f3.setPointSizeF(8)
         for i, k in enumerate(self.keys):
-            x = i * (tw + gap)
-            r = QRectF(x, 0, tw, H)
+            p.save()
+            p.translate((i % per) * (tw + gap), (i // per) * (TH + gap))
+            r = QRectF(0, 0, tw, TH)
             col = QColor(cols.get(self.state[k], MUT))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(mixc(PANEL, TXT, .035))
@@ -16118,6 +16499,15 @@ class ResourceStrip(QWidget):
             p.setPen(QColor(MUT))
             p.drawText(QRectF(r.left() + 12, 40, tw - 18, 14), Qt.AlignmentFlag.AlignVCenter,
                        QFontMetrics(f3).elidedText(self.sub[k], Qt.TextElideMode.ElideRight, int(tw - 20)))
+            p.restore()
+
+    def resizeEvent(self, e):
+        """Fenêtre étroite (écran vertical) : deux rangées de trois indicateurs plutôt que six tuiles illisibles."""
+        rows = 2 if (self.width() - 50) / 6 < 128 else 1
+        if rows != self.rows:
+            self.rows = rows
+            self.setFixedHeight(self.TH * rows + 10 * (rows - 1))
+        super().resizeEvent(e)
 
 # ------------------------------------------------------------------ Réseau + SOS + Radiobot
 class Radar(QWidget):
@@ -16359,8 +16749,7 @@ class PagesMixin4:
         lf = Card("Incidents réseau")
         self.net_logbox = QPlainTextEdit()
         self.net_logbox.setReadOnly(True)
-        self.net_logbox.setMinimumHeight(44)
-        self.net_logbox.setMaximumHeight(80)
+        self.net_logbox.setMinimumHeight(44)        # la zone de texte occupe toute la carte (plus de titre flottant au milieu)
         lf.lay.addWidget(self.net_logbox)
         v.addWidget(lf, 1)
         QTimer.singleShot(800, self.net_refresh)
@@ -16758,6 +17147,8 @@ class PagesMixin4:
         h = QHBoxLayout()
         h.setSpacing(22)
         self.al_phone = PhoneAnim()
+        if MINI:                                          # minimaliste : pas de téléphone animé
+            self.al_phone.hide()
         h.addWidget(self.al_phone, 0, Qt.AlignmentFlag.AlignVCenter)
         left = QVBoxLayout()
         left.setSpacing(8)
@@ -16810,11 +17201,14 @@ class PagesMixin4:
         bt.addWidget(self.al_cfg)
         self.al_testb = btn("Envoyer un test", "", self.alert_test)
         bt.addWidget(self.al_testb)
-        bt.addWidget(btn("Demander à Gaël", "", lambda: (self.assistant.ed.setFocus(), self.assistant.ask("Préviens-moi en cas de panne"))))
+        if not MINI:                                      # minimaliste : pas de Gaël
+            bt.addWidget(btn("Demander à Gaël", "", lambda: (self.assistant.ed.setFocus(), self.assistant.ask("Préviens-moi en cas de panne"))))
         bt.addStretch(1)
         h.addLayout(bt)
         al.lay.addLayout(h)
         g.addWidget(al, 0, 0, 1, 2)
+        self.al_head.setWordWrap(True)
+        self._sos_lay = (h, bt, trg)
         # --- ressources et performances (+ retard de sécurité)
         rc = Card()
         rc.lay.setContentsMargins(14, 10, 14, 10)
@@ -16828,10 +17222,8 @@ class PagesMixin4:
         k0.setStyleSheet(f"color:{MUT};font-size:9px;font-weight:700;letter-spacing:1px;")
         dv.addWidget(k0)
         dr = QHBoxLayout()
-        self.sp_delay = QSpinBox()
-        self.sp_delay.setRange(0, 40)
-        self.sp_delay.setSuffix(" s")
-        self.sp_delay.setMinimumWidth(78)
+        self.sp_delay = Stepper(0, 40, " s")
+        self.sp_delay.setToolTip("Retard de sécurité : secondes retenues avant l'antenne (0 = direct)")
         self.sp_delay.valueChanged.connect(self.sos_delay_changed)
         dr.addWidget(self.sp_delay)
         dv.addLayout(dr)
@@ -16845,6 +17237,8 @@ class PagesMixin4:
         self.assistant = Assistant(self)
         faq.lay.addWidget(self.assistant, 1)
         g.addWidget(faq, 2, 0)
+        if MINI:                                          # minimaliste : pas de Gaël, le journal prend toute la largeur
+            faq.hide()
         jl = Card("Journal", "Historique des événements d'antenne")
         tb = QHBoxLayout()
         self.seg_jf = Segmented(["Tout", "Problèmes", "Secours"], 74, 26)
@@ -16867,7 +17261,7 @@ class PagesMixin4:
         self.logbox2.setReadOnly(True)
         self.logbox2.setMinimumHeight(100)
         jl.lay.addWidget(self.logbox2, 1)
-        g.addWidget(jl, 2, 1)
+        g.addWidget(jl, 2, 0 if MINI else 1, 1, 2 if MINI else 1)
         g.setRowStretch(2, 1)
         self.alert_summary()
         return pg
@@ -17298,20 +17692,42 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         self.bl = QVBoxLayout(self.body)
         self.bl.setContentsMargins(2, 6, 6, 6)
         self.bl.setSpacing(6)
-        self.bl.addStretch(1)
+        self.bl.addStretch(1)                      # les messages se posent en bas, près de la saisie (comme Messages)
         self.sa.setWidget(self.body)
         v.addWidget(self.sa, 1)
-        # suggestions (pastilles discrètes)
+        # accueil (conversation vide) : Gaël en grand, une phrase, et rien d'autre : pas de grand vide
+        self.welcome = QWidget()
+        wv = QVBoxLayout(self.welcome)
+        wv.setContentsMargins(0, 0, 0, 0)
+        wv.setSpacing(4)
+        wv.addStretch(1)
+        self.big = GaelView("chat", app=app)
+        self.big.setFixedSize(92, 150)
+        wv.addWidget(self.big, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.l_hi = lab("", "")
+        self.l_hi.setStyleSheet("font-size:17px;font-weight:800;")
+        self.l_hi.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        wv.addWidget(self.l_hi)
+        l2 = lab("Dis-moi ce qui se passe ou ce que tu veux faire : je propose, tu valides d'un clic.", "mut", True)
+        l2.setStyleSheet(f"color:{MUT};font-size:12px;")
+        l2.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        wv.addWidget(l2)
+        wv.addStretch(1)
+        v.addWidget(self.welcome, 1)
+        # suggestions : pastilles teintées, faciles à viser
         cs = QWidget()
-        cl = WrapRow(cs, 5)
-        cl.vsp = 5
+        cl = WrapRow(cs, 6)
+        cl.vsp = 6
         for i, (c, qq) in enumerate(self.CHIPS):
             b = QPushButton(c)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip(qq)
             b.setMinimumWidth(0)
-            b.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {LINE};border-radius:11px;padding:2px 9px;font-size:11px;"
-                            f"font-weight:500;color:{MUT};}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
+            ac = QColor(ACC)
+            rg = f"{ac.red()},{ac.green()},{ac.blue()}"
+            b.setStyleSheet(f"QPushButton{{background:rgba({rg},22);border:1px solid rgba({rg},80);border-radius:12px;padding:3px 11px;"
+                            f"min-height:18px;font-size:12px;font-weight:600;color:{ACCT};}}"
+                            f"QPushButton:hover{{background:rgba({rg},50);color:{TXT};}}")
             b.clicked.connect(lambda _=False, x=qq: self.ask(x))
             cl.addWidget(b)
         self.chips_sa = cs
@@ -17346,8 +17762,13 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
     def greet(self):
         h = time.localtime().tm_hour
         hi = "Noz vat" if h >= 21 or h < 5 else ("Demat" if h < 18 else "Bonsoir")
-        self.say(f"{hi} ! Moi c'est Gaël. Dis-moi ce qui se passe ou ce que tu veux faire (« passe sur la table de mixage », "
-                 "« lance la playlist », « joue Tri Martolod »…) : je propose, tu valides d'un clic.")
+        self.l_hi.setText(f"{hi} ! Moi c'est Gaël.")
+        self.set_welcome(True)
+
+    def set_welcome(self, on):
+        """Conversation vide : accueil (Gaël en grand) à la place du fil de discussion."""
+        self.welcome.setVisible(on)
+        self.sa.setVisible(not on)
 
     def set_status(self):
         on = self.llm_on()
@@ -17357,7 +17778,7 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
 
     def clear(self):
         while self.bl.count() > 1:
-            it = self.bl.takeAt(0)
+            it = self.bl.takeAt(1)
             if it.widget():
                 it.widget().hide()
                 it.widget().deleteLater()
@@ -17408,6 +17829,10 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
             l.setWordWrap(True)
             l.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             l.setMaximumWidth(470)
+            f_ = QFont(l.font())
+            f_.setPixelSize(13)
+            tw = max(QFontMetrics(f_).horizontalAdvance(x) for x in (text.strip() or " ").splitlines()) + 32
+            l.setMinimumWidth(int(min(tw, 470, max(160, self.sa.viewport().width() - 70))))   # bulle à la largeur du texte
             if me:
                 l.setStyleSheet(f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {ACC},stop:1 {'#ff5fa2' if PSYCHE else ACC2});"
                                 f"color:{ONACC};border-radius:18px;border-bottom-right-radius:6px;padding:8px 14px;font-size:13px;")
@@ -17457,9 +17882,10 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         if self._typing_w is not None:
             self._typing_w.deleteLater()
             self._typing_w = None
-        self.bl.insertWidget(self.bl.count() - 1, self.bubble(text, who == "me", actions))
+        self.set_welcome(False)
+        self.bl.addWidget(self.bubble(text, who == "me", actions))
         while self.bl.count() > 61:
-            it = self.bl.takeAt(0)
+            it = self.bl.takeAt(1)
             if it.widget():
                 it.widget().hide()
                 it.widget().deleteLater()
@@ -17473,7 +17899,8 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
             self._typing_w.deleteLater()
             self._typing_w = None
         w = self.bubble("· · ·", False, None)
-        self.bl.insertWidget(self.bl.count() - 1, w)
+        self.set_welcome(False)
+        self.bl.addWidget(w)
         self.scroll_end()
         w.lbl.setProperty("txt", "")
         return w.lbl
@@ -17501,7 +17928,7 @@ class Assistant(GaelLLM, GaelBrain, AssistantKB, QWidget):
         if self.llm_on() and not (self.pending and self.pending.get("ask")):
             return self.llm_ask(q)
         self._typing_w = self.bubble("· · ·", False, None)
-        self.bl.insertWidget(self.bl.count() - 1, self._typing_w)
+        self.bl.addWidget(self._typing_w)
 
         def reply():
             try:
@@ -17880,39 +18307,81 @@ class OnAirPill(CLabel):
 
 
 class SpeechBubble(QFrame):
-    """Bulle de dialogue de Gaël (annonce de mise à jour) : coins arrondis, petite pointe vers Gaël, ombre douce."""
+    """Bulle de BD de Gaël (mises à jour) : elle jaillit de Gaël (petit rebond depuis la pointe), contour franc, pointe
+    courbe qui va jusqu'à sa tête. tail = « left » (Gaël dans le menu de gauche) ou « top » (petit Gaël en haut à droite)."""
 
     def __init__(self, parent, tail="left"):
         super().__init__(parent)
         self.tail = tail
+        self.tip = QPointF(0, 0)                  # pointe de la queue, en coordonnées de la bulle
+        self.k = 1.0                              # 0 -> 1 : apparition
         self.lay = QVBoxLayout(self)
-        m = (24, 12, 14, 12) if tail == "left" else (14, 22, 14, 12)
+        m = (34, 12, 24, 20) if tail == "left" else (16, 30, 24, 20)
         self.lay.setContentsMargins(*m)
-        self.lay.setSpacing(6)
+        self.lay.setSpacing(8)
+        self.anim = QVariantAnimation(self)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setDuration(340 if ANIM else 1)
+        ec = QEasingCurve(QEasingCurve.Type.OutBack)
+        ec.setOvershoot(.9)                       # léger rebond (la bulle déborde à peine de sa taille finale)
+        self.anim.setEasingCurve(ec)
+        self.anim.valueChanged.connect(self._k)
+        self.anim.finished.connect(lambda: self._kids(True))
+        self.hide_t = QTimer(self)
+        self.hide_t.setSingleShot(True)
+
+    def _kids(self, on):
+        for w in self.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            w.setVisible(on)
+
+    def _k(self, v):
+        self.k = float(v)
+        self.update()
+
+    def pop(self):
+        """Apparition façon BD : la bulle grossit depuis la bouche de Gaël, puis le texte apparaît."""
+        self._kids(False)
+        self.k = 0.0
+        self.show()
+        self.raise_()
+        self.anim.stop()
+        self.anim.start()
+
+    def body(self):
+        return QRectF(self.rect()).adjusted(22 if self.tail == "left" else 2, 20 if self.tail == "top" else 2, -11, -11)
 
     def paintEvent(self, e):
         p = new_painter(self)
-        r = QRectF(self.rect()).adjusted(11 if self.tail == "left" else 1, 11 if self.tail == "top" else 1, -2, -3)
+        r = self.body()
+        k = max(0.0, self.k)
+        if k < 1.0 or abs(k - 1.0) > 1e-3:            # mise à l'échelle autour de la pointe (effet « pop »)
+            p.translate(self.tip)
+            p.scale(k, k)
+            p.translate(-self.tip)
         path = QPainterPath()
-        path.addRoundedRect(r, 16, 16)
-        tip = QPainterPath()
+        path.addRoundedRect(r, 18, 18)
+        tail = QPainterPath()
+        tp = self.tip
         if self.tail == "left":
-            y = r.bottom() - 26
-            tip.moveTo(r.left() + 1, y - 8)
-            tip.lineTo(QPointF(1, y + 6))
-            tip.lineTo(r.left() + 1, y + 8)
+            y0 = min(max(tp.y() - 4, r.top() + 14), r.bottom() - 30)
+            a1, a2 = QPointF(r.left() + 2, y0), QPointF(r.left() + 2, y0 + 20)
+            tail.moveTo(a1)
+            tail.quadTo(QPointF(r.left() - 4, y0 + 4), tp)
+            tail.quadTo(QPointF(r.left() - 2, y0 + 16), a2)
         else:
-            x = r.right() - 30
-            tip.moveTo(x - 8, r.top() + 1)
-            tip.lineTo(QPointF(x + 4, 1))
-            tip.lineTo(x + 8, r.top() + 1)
-        tip.closeSubpath()
-        path = path.united(tip)
+            x0 = min(max(tp.x() - 14, r.left() + 18), r.right() - 34)
+            a1, a2 = QPointF(x0, r.top() + 2), QPointF(x0 + 20, r.top() + 2)
+            tail.moveTo(a1)
+            tail.quadTo(QPointF(x0 + 6, r.top() - 4), tp)
+            tail.quadTo(QPointF(x0 + 16, r.top() - 2), a2)
+        tail.closeSubpath()
+        path = path.united(tail)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(qc("#000000", 60))
-        p.drawPath(path.translated(0, 2))
-        p.setBrush(QColor(mixc(PANEL, ACC, .10)))
-        p.setPen(QPen(mixc(LINE, ACC, .55), 1.2))
+        p.setBrush(qc("#000000", 70))
+        p.drawPath(path.translated(2, 3))
+        p.setBrush(QColor(mixc(PANEL, "#ffffff", .06)))
+        p.setPen(QPen(QColor(mixc(TXT, ACC, .25)), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(path)
 
 
@@ -17942,6 +18411,43 @@ class Banner(QLabel):
         p.drawText(QRectF(self.rect()).adjusted(10, 2, -10, -2), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.text())
 
 
+class AlertFrame(QWidget):
+    """Cadre d'alerte posé PAR-DESSUS toute la fenêtre (le menu latéral le cachait à gauche) : bordure tout autour et ligne
+    de démarcation rouge entre le menu et le contenu. Transparent aux clics ; caché hors alerte (aucun coût)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.col = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.hide()
+
+    def set_color(self, col):
+        self.col = col
+        self.setVisible(bool(col))
+        if col:
+            self.raise_()
+            self.update()
+
+    def paintEvent(self, e):
+        if not self.col:
+            return
+        p = QPainter(self)
+        c = QColor(self.col)
+        p.setPen(QPen(c, 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5))
+        w = self.window()
+        nav = getattr(w, "nav_w", None)
+        if nav is not None and nav.isVisible():
+            r = QRect(nav.mapTo(self, QPoint(0, 0)), nav.size())
+            p.setPen(QPen(c, 2))
+            if NAVTOP:
+                p.drawLine(QPointF(0, r.bottom() + 1), QPointF(self.width(), r.bottom() + 1))
+            else:
+                p.drawLine(QPointF(r.right() + 1, 0), QPointF(r.right() + 1, self.height()))
+
+
 class RootWidget(QWidget):
     """Fond de la fenêtre. En cas de rupture, un cadre coloré est peint ici : avant, une feuille de style posée sur la
     fenêtre entière forçait Qt à recalculer le style de TOUS les widgets (gel visible au début et à la fin d'une alerte)."""
@@ -17949,11 +18455,16 @@ class RootWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.border = None
+        self.frame = AlertFrame(self)
 
     def set_border(self, col):
         if col != self.border:
             self.border = col
+            self.frame.set_color(col)
             self.update()
+
+    def resizeEvent(self, e):
+        self.frame.setGeometry(self.rect())
 
     def paintEvent(self, e):
         if not self.border:
@@ -18065,6 +18576,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.bot_btn = BotButton()
             self.bot_btn.clicked.connect(lambda: self.go_tab("sos"))
             nh.addWidget(self.bot_btn)
+            if MINI:                                      # minimaliste : plus de robot
+                self.bot_btn.hide()
             ck = QVBoxLayout()
             ck.setSpacing(0)
             ck.setContentsMargins(0, 3, 0, 2)
@@ -18180,6 +18693,14 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.cart_now = CartNow()
         self.cart_now.clicked.connect(lambda: self.engine and self.engine.stop_cart())
         bh.addWidget(self.cart_now)
+        # flux à l'antenne : combien, et lesquels (en bref ; la liste complète en infobulle)
+        self.l_onair = CLabel("", color=OKC)
+        self.l_onair.setStyleSheet(f"background:{FIELD};font-weight:700;border-radius:12px;padding:4px 12px;")
+        self.l_onair.setMaximumWidth(330)
+        self.l_onair.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.l_onair.mouseReleaseEvent = lambda _e: self.go_tab("diff")
+        self.l_onair.hide()
+        bh.addWidget(self.l_onair)
         self.l_net = lab("Réseau : détection…", "")
         self.l_net.setStyleSheet(f"background:{FIELD};color:{MUT};font-weight:700;border-radius:12px;padding:4px 14px;")
         self.l_net.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -18200,6 +18721,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                     "mon": self._page_mon, "net": self._page_net, "sos": self._page_sos, "set": self._page_settings, "about": self._page_about}
         for k in PAGE_KEYS:
             self.stack.addWidget(builders[k]())
+            sp_ = globals().get("_SPLASH")
+            if sp_ is not None:                          # l'écran de démarrage continue d'émettre ses ondes
+                sp_.tick()
         for v in self.findChildren(QTableWidget) + self.findChildren(QListWidget):   # même surbrillance de ligne partout
             style_table(v)
         if hasattr(self.rail, "gael"):
@@ -18362,11 +18886,11 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         """Fenêtre étroite (écran vertical, demi-écran) : menu réduit aux icônes, en-tête allégé, et chaque page passe sur une
         seule colonne qui défile. Au-delà de 1180 px de large, la disposition habituelle revient."""
         on = self.width() < self.NARROW_W
+        if hasattr(self.rail, "set_compact"):         # écran vertical de 1080 px : on garde le menu complet (et Gaël)
+            self.rail.set_compact(self.width() < 980)
         if on == getattr(self, "_narrow", None):
             return
         self._narrow = on
-        if hasattr(self.rail, "set_compact"):
-            self.rail.set_compact(on)
         self.l_date.setVisible(not on)
         self.l_net.setVisible(not on)
         self.btn_prof.setMaximumWidth(170 if on else 230)
@@ -18417,6 +18941,23 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 ins.setFixedWidth(300)
                 side.setFixedWidth(170)
             QTimer.singleShot(0, self.resize_tiles)
+        sk = getattr(self, "_sk", None)
+        if sk:                                           # À propos : raccourcis sur une colonne (plus de texte coupé)
+            grid, labels = sk
+            for l in labels:
+                grid.removeWidget(l)
+            for i, l in enumerate(labels):
+                grid.addWidget(l, i, 0) if on else grid.addWidget(l, i // 2, i % 2)
+        sl = getattr(self, "_sos_lay", None)
+        if sl:                                           # SOS : téléphone replié, boutons sous le texte, interrupteurs empilés
+            h, bt, trg = sl
+            D = QHBoxLayout.Direction
+            h.setDirection(D.TopToBottom if on else D.LeftToRight)
+            bt.setDirection(D.LeftToRight if on else D.TopToBottom)
+            trg.setDirection(D.TopToBottom if on else D.LeftToRight)
+            trg.setSpacing(6 if on else 16)
+            h.setSpacing(10 if on else 22)
+            self.al_phone.setVisible(not on and not MINI)
         self.compact_header()
 
     def apply_compact(self):
@@ -18450,7 +18991,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         """Fenêtre étroite : on replie l'antenne décorative et « Plein écran » (F11 reste dispo) pour que l'en-tête ne se chevauche jamais."""
         wide = self.width() >= 1320
         self.l_beta.setVisible(self.page_key == "son" and not NAVTOP and wide)
-        self.air_fx.setVisible(wide)
+        self.air_fx.setVisible(wide and not MINI)
         self.btn_full.setVisible(wide or self.isFullScreen())
         if hasattr(self, "sa") and self.page_key == "cart":
             QTimer.singleShot(0, self.resize_tiles)
@@ -18751,8 +19292,17 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         r3.addStretch(1)
         self.btn_playsel = btn("Jouer la sélection", "", self.pl_play_sel)
         r3.addWidget(self.btn_playsel)
+        # transport de la playlist de secours : lecture / pause, et stop (retour au direct)
+        self.btn_plpause = TBtn("play", "", size=(40, 34))
+        self.btn_plpause.setToolTip("Lancer la playlist de secours à l'antenne")
+        self.btn_plpause.clicked.connect(self.pl_play_pause)
+        r3.addWidget(self.btn_plpause)
+        self.btn_plstop = TBtn("stop", "", size=(40, 34))
+        self.btn_plstop.setToolTip("Arrêter la playlist de secours : retour au direct (pas de relève automatique avant le retour du son)")
+        self.btn_plstop.clicked.connect(self.pl_stop_btn)
+        r3.addWidget(self.btn_plstop)
         self.btn_manual = btn("Lancer la playlist", "", self.toggle_manual)
-        r3.addWidget(self.btn_manual)
+        self.btn_manual.hide()                           # remplacé par lecture / pause / stop
         fb.lay.addLayout(r3)
         left.addWidget(fb, 1)
         # --- flux
@@ -18986,8 +19536,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.set_cart_devices()
             m = QMenu(self)
             m.addSection("Écouter sur quelle carte son ?")
-            for i in range(1, self.cb_cdev.count()):
-                m.addAction(self.cb_cdev.itemText(i), lambda i=i: (self.cb_cdev.setCurrentIndex(i), self.cart_dev_changed(i), self.toggle_listen()))
+            for l in out_choices([self.cb_cdev.itemData(i) for i in range(1, self.cb_cdev.count())]):
+                m.addAction(dev_icon_pm(out_kind(l), MUT), "  " + out_name(l), lambda l=l: (self.cdev_pick(l), self.toggle_listen()))
             if self.cb_cdev.count() <= 1:
                 return info(self, "Écoute", "Aucune carte son de sortie trouvée (module sounddevice requis, voir SOS).")
             return m.exec(QCursor.pos())
@@ -19361,7 +19911,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def live_pl(self):
         if self.engine:
-            self.engine.prof_update("fallback", playlist=list(self.playlist), off=sorted(self.pl_off))
+            self.engine.prof_update("fallback", playlist=list(self.playlist), off=sorted(self.pl_off), folder_of=dict(self.pl_folder))
 
     def pl_play_sel(self):
         sel = self.pl_tv.selection()
@@ -19373,6 +19923,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if not self.on_air:
             return self.pl_prelisten(i)            # hors antenne : double-clic = pré-écoute au casque
         self.live_pl()
+        self.engine.pl_stop = False
+        self.engine.pl_pause = False
         self.engine.play_now(self.playlist[i])
 
     def pl_prelisten(self, i):
@@ -19786,6 +20338,32 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def start_cart_engine(self):
         return self.ensure_engine()
 
+    def pl_play_pause(self):
+        """Lecture : lance la playlist de secours (ou la reprend si elle est en pause). Pause : la fige à l'antenne."""
+        e = self.engine
+        if not (e and self.on_air):
+            return info(self, "Playlist de secours", "Démarre d'abord la diffusion.")
+        if not self.playlist:
+            return info(self, "Playlist de secours", "Ajoute au moins un morceau à la playlist de secours.")
+        if e.backup and not e.pl_pause:
+            e.pl_pause = True
+            self.log("Playlist de secours en pause.")
+        elif e.backup:
+            e.pl_pause = False
+            self.log("Playlist de secours : reprise.")
+        else:
+            e.pl_stop = False
+            e.pl_pause = False
+            e.set_manual(True)
+
+    def pl_stop_btn(self):
+        e = self.engine
+        if not (e and self.on_air):
+            return
+        e.pl_pause = False
+        e.pl_stop = True
+        e.manual = False
+
     def toggle_manual(self):
         e = self.engine
         if not (e and self.on_air and self.playlist):
@@ -19799,6 +20377,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         except Exception:
             outs = []
         cur = self.prof["carts"].get("device", "")
+        self._cart_outs = [l for l, _ in outs]             # cartes réellement branchées (la carte choisie peut être débranchée)
         self.cb_cdev.blockSignals(True)
         self.cb_cdev.clear()
         self.cb_cdev.addItem(NODEV, "")
@@ -19952,6 +20531,13 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.btn_manual.setText("Lancer la playlist")
             return
         self.btn_manual.setText("Revenir au direct" if (e.manual and self.on_air) else "Lancer la playlist")
+        playing = bool(e.backup and self.on_air and not getattr(e, "pl_pause", False))
+        k = "pause" if playing else "play"
+        if self.btn_plpause.kind != k:
+            self.btn_plpause.kind = k
+            self.btn_plpause.setToolTip("Mettre la playlist de secours en pause" if playing else
+                                        ("Reprendre la playlist de secours" if e.backup else "Lancer la playlist de secours à l'antenne"))
+            self.btn_plpause.update()
         p = e.fb_params()
         covered = bool(p["enabled"] and p["files"])
         cap = getattr(e, "cap_state", "ok")
@@ -20025,6 +20611,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.en(self.btn_plrem, has_sel, "Sélectionne des titres à retirer")
         self.en(self.btn_playsel, has_sel and air, "Démarre la diffusion et sélectionne un titre")
         self.en(self.btn_manual, air and bool(self.playlist), "Démarre la diffusion avec au moins un titre dans la playlist de secours")
+        self.en(self.btn_plpause, air and bool(self.playlist), "Démarre la diffusion avec au moins un titre dans la playlist de secours")
+        self.en(self.btn_plstop, air and bool(e and (e.backup or e.manual)), "La playlist de secours n'est pas à l'antenne")
         if hasattr(self, "al_testb"):
             self.en(self.al_testb, bool(self.alerts.channels()), "Configure d'abord un mail, un SMS ou un message")
         if hasattr(self, "btn_lstop"):
@@ -20090,8 +20678,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if kind:
             if kind == "flux":
                 c, fg = "#c4263a", "white"
-                txt = ("⚠  RUPTURE DE FLUX  ·  " + ", ".join(bad[:3]) + "  ·  les auditeurs ne reçoivent plus l'antenne  ·  "
-                       "reconnexion automatique en cours")
+                hs = ", ".join(bad[:4]) + (f" (+{len(bad) - 4})" if len(bad) > 4 else "")
+                ok_n = [o.cfg.get("name") or "flux" for o in e.outputs if o.cfg.get("enabled", True) and o.state == "live"]
+                txt = (f"⚠  RUPTURE DE FLUX  ·  HS : {hs}  ·  " +
+                       (f"toujours à l'antenne : {', '.join(ok_n[:3])}" + (" …" if len(ok_n) > 3 else "") if ok_n
+                        else "plus aucun flux ne part : les auditeurs n'entendent plus l'antenne") +
+                       "  ·  reconnexion automatique en cours")
                 if silent == "dead":
                     txt += "  ·  et pas de son en entrée"
             elif kind == "son":
@@ -20125,8 +20717,39 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             if kind not in ("flux", "son"):
                 self._air_beeped.difference_update({"flux", "son"})
         self.alert_on = kind == "flux"
+        self.onair_chip(e, bad)
         air = bool(self.on_air)                           # hors antenne : le phare reste éteint et immobile
         self.air_fx.set(bool(air and n_live > 0), ("flux" if kind == "flux" else ("son" if kind == "son" else False)) if air else False)
+
+    def onair_chip(self, e, bad):
+        """« ● 3 flux · Web, FM, DAB+ » dans le bandeau : vert si tout passe, ambre si un flux est HS (nommé en infobulle)."""
+        l = getattr(self, "l_onair", None)
+        if l is None:
+            return
+        if not (self.on_air and e and not self.preview):
+            if l.isVisible():
+                l.hide()
+            return
+        act = [o for o in e.outputs if o.cfg.get("enabled", True)]
+        live = [o.cfg.get("name") or "flux" for o in act if o.state == "live"]
+        sig = (tuple(live), tuple(bad), len(act))
+        if sig != getattr(self, "_onair_sig", None):
+            self._onair_sig = sig
+            n = len(live)
+            if not act:
+                txt, col = "Aucun flux actif", MUT
+            elif n == len(act):
+                txt, col = f"● {n} flux à l'antenne · " + ", ".join(live), OKC
+            else:
+                txt, col = f"● {n}/{len(act)} flux · " + (", ".join(live) if live else "aucun ne passe"), (BADC if bad else ACC2)
+            l.setText(l.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, 300))
+            l.set_color(col)
+            tip = "À l'antenne : " + (", ".join(live) or "aucun")
+            if bad:
+                tip += "\nHS : " + ", ".join(bad)
+            l.setToolTip(tip + "\n(clic : onglet Diffusion)")
+        if not l.isVisible():
+            l.show()
 
     def update_playlist_visuals(self, e):
         cur = e.pl_cur if (e and e.backup) else None
@@ -20161,7 +20784,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         elif e.tone:
             txt, col = "Tonalité 1 kHz à l'antenne", "#5dade2"
         elif e.backup:
-            txt, col = "PLAYLIST DE SECOURS · " + (e.track or ""), "#f5b041"
+            txt, col = ("PLAYLIST DE SECOURS EN PAUSE · " if getattr(e, "pl_pause", False) else "PLAYLIST DE SECOURS · ") + (e.track or ""), "#f5b041"
         elif e.silent_ms >= 1000:
             txt, col = f"● Direct : aucun signal depuis {e.silent_ms // 1000} s", "#ff6b5e"
         else:
@@ -20226,51 +20849,81 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         threading.Thread(target=work, daemon=True).start()
 
     def update_result(self, r, manual):
+        first = not getattr(self, "_upd_greeted", False)
+        self._upd_greeted = True
         if not r or r.get("error"):
             if manual:
-                info(self, "Mise à jour", (r or {}).get("error") or "Recherche impossible.")
+                self.gael_bubble("Je n'ai pas pu vérifier les mises à jour.", (r or {}).get("error") or "Recherche impossible.", hide_after=9000)
             return
         newer = parse_ver(r["tag"]) > parse_ver(VERSION)
-        if newer and (manual or self.upd_bubble is None):
-            self.update_bubble(r)
-        elif manual:
-            info(self, "Mise à jour", f"Tu as déjà la dernière version ({VERSION}). Dernière version publiée : {r['tag'] or '—'}.")
+        if newer:
+            if manual or self.upd_bubble is None or getattr(self, "_upd_mode", "") == "info":
+                if getattr(self, "upd_pending", None) and getattr(self, "_upd_pending_tag", "") == r["tag"]:
+                    return self.update_ready_bubble(r)
+                self.update_bubble(r)
+        elif manual or first:                       # au lancement (ou sur demande) : Gaël dit bonjour, tout est à jour
+            self.gael_bubble("Demat ! Bev est à jour." if not manual else "Bev est à jour.", f"Version {VERSION}", hide_after=6000)
 
-    def update_bubble(self, r):
-        """Nouvelle version : Gaël l'annonce en bas à gauche avec une bulle qui reste affichée (jusqu'à « Installer » ou
-        « Plus tard »). En barre du haut, la bulle part du petit Gaël en haut à droite."""
+    def upd_title(self, r):
+        """« 1.0.2 → 1.0.3 · Titre de la version » (le titre seulement s'il dit autre chose que le numéro)."""
+        new = r.get("tag", "").lstrip("vV")
+        t = r.get("title", "")
+        if t and parse_ver(t) == parse_ver(new) and not re.sub(r"[\dvV.\s-]", "", t):
+            t = ""
+        return f"{VERSION}  →  {new}" + (f"  ·  {t}" if t else "")
+
+    def gael_bubble(self, title, line="", buttons=(), hide_after=0, mode="info", one_line=False):
+        """Bulle de BD qui sort de Gaël. buttons : [(texte, type, fonction)]. hide_after : disparaît seule (ms)."""
         self.update_bubble_close()
-        self.upd_info = r
-        self.bot_talk = 60
+        self._upd_mode = mode
+        self.bot_talk = 40
         b = SpeechBubble(self.centralWidget(), tail="top" if NAVTOP else "left")
-        t = lab(f"Nouvelle version {r['tag'].lstrip('v')} disponible !", "")
+        t = lab(title, "")
         t.setStyleSheet("font-weight:800;font-size:13px;")
         b.lay.addWidget(t)
-        notes = " ".join(r["notes"].split())[:140]
-        m = lab(f"Tu as la {VERSION}." + (f" {notes}" if notes else ""), "mut", True)
-        m.setStyleSheet(f"color:{MUT};font-size:12px;")
-        m.setMaximumWidth(250)
-        b.lay.addWidget(m)
-        h = QHBoxLayout()
-        h.setSpacing(6)
-        inst = SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy()
-        h.addWidget(btn("Installer" if inst else "Télécharger", "primary",
-                        lambda: (self.update_bubble_close(), self.update_install(r) if inst else webbrowser.open(r.get("asset") or r["url"]))))
-        h.addWidget(btn("Plus tard", "", self.update_bubble_close))      # elle reviendra au prochain lancement
-        h.addStretch(1)
-        b.lay.addLayout(h)
+        b.l_line = None
+        if line:
+            m = lab(line, "mut", not one_line)
+            m.setStyleSheet(f"color:{MUT};font-size:12px;")
+            if not one_line:
+                m.setMaximumWidth(300)
+            b.lay.addWidget(m)
+            b.l_line = m
+        if buttons:
+            h = QHBoxLayout()
+            h.setSpacing(6)
+            for txt, kind, fn in buttons:
+                h.addWidget(btn(txt, kind, fn))
+            h.addStretch(1)
+            b.lay.addLayout(h)
         b.adjustSize()
-        b.show()
-        b.raise_()
         self.upd_bubble = b
         self.place_upd_bubble()
+        b.pop()
+        if hide_after:
+            b.hide_t.timeout.connect(lambda b=b: self.update_bubble_close() if self.upd_bubble is b else None)
+            b.hide_t.start(hide_after)
         g = getattr(self.rail, "gael", None)
         if g is not None and g.isVisible():
             try:
                 g.play(G_HELLO)
-                g.say(40)
+                g.say(min(3.0, .9 + len(title) / 30))
             except Exception:
                 pass
+        return b
+
+    def update_bubble(self, r):
+        """Nouvelle version : une seule ligne (version actuelle → nouvelle, titre), et deux boutons."""
+        self.upd_info = r
+        inst = SYS == "Windows" and "setup" in str(r.get("asset_name", "")).lower() and installed_copy()
+        go = (lambda: self.update_install(r)) if inst else (lambda: (self.update_bubble_close(), webbrowser.open(r.get("asset") or r["url"])))
+        self.gael_bubble("Nouvelle version de Bev !", self.upd_title(r),
+                         [("Installer" if inst else "Télécharger", "primary", go), ("Plus tard", "", self.update_bubble_close)], mode="new",
+                         one_line=True)
+
+    def update_ready_bubble(self, r):
+        self.gael_bubble("Mise à jour prête.", "Elle s'installera quand tu fermeras Bev : le direct n'est pas coupé.",
+                         [("OK", "", self.update_bubble_close)], hide_after=12000, mode="ready")
 
     def place_upd_bubble(self):
         b = getattr(self, "upd_bubble", None)
@@ -20279,64 +20932,64 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         b.adjustSize()
         cw = self.centralWidget()
         if NAVTOP:
-            b.move(cw.width() - b.width() - 14, TopNav.H + 6)
+            bb = self.bot_btn
+            if bb is not None and bb.isVisible():
+                c = bb.mapTo(cw, QPointF(bb.width() / 2, bb.height() - 4))
+            else:
+                c = QPointF(cw.width() - 40, TopNav.H - 4)
+            x = int(max(8, min(c.x() - b.width() + 46, cw.width() - b.width() - 8)))
+            y = int(c.y() + 6)
+            b.move(x, y)
+            b.tip = QPointF(c.x() - x, 0)
         else:
             g = getattr(self.rail, "gael", None)
-            if g is not None and g.isVisible():                  # à hauteur de la tête de Gaël, sous le menu
-                y = g.geometry().top() + 30
-            else:
-                y = cw.height() - b.height() - 40
-            b.move(self.rail.width() - 4, max(10, min(y, cw.height() - b.height() - 10)))
+            if g is not None and g.isVisible():                  # la pointe touche la tête de Gaël
+                hp = g.mapTo(cw, g.head_point())
+            else:                                                # Gaël caché (fenêtre basse) : la bulle part du bas du menu
+                hp = QPointF(self.rail.width() - 8, cw.height() - 60)
+            x = int(hp.x() + 4)
+            y = int(max(8, min(hp.y() - b.height() * .45, cw.height() - b.height() - 8)))
+            b.move(x, y)
+            b.tip = QPointF(0, hp.y() - y)
         b.raise_()
+        b.update()
 
     def update_install(self, r):
-        """Télécharge l'installateur de la nouvelle version, vérifie le fichier, puis le lance et ferme Bev : l'installateur
-        remplace l'ancienne version et rouvre Bev tout seul (réglages, playlists et cartouches sont conservés)."""
+        """Mise à jour sans fenêtre d'installation : téléchargement (progression dans la bulle), vérification du fichier, puis
+        installation silencieuse et Bev se rouvre tout seul. À l'antenne, rien n'est coupé : l'installation attend la
+        fermeture de Bev. Windows peut demander l'autorisation (installation pour tous les utilisateurs)."""
         url = r.get("asset") or ""
         if not url:
             return webbrowser.open(r.get("url") or "")
-        if self.on_air and not yes(self, "Mise à jour", "La diffusion est en cours : l'installation coupe l'antenne une trentaine de secondes.\n\n"
-                                                         "Installer maintenant ?"):
-            return
         import tempfile
         dst = os.path.join(tempfile.gettempdir(), r.get("asset_name") or "Bev-Setup.exe")
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Mise à jour")
-        v = QVBoxLayout(dlg)
-        v.setContentsMargins(22, 18, 22, 16)
-        t = lab(f"Téléchargement de Bev {r.get('tag', '')}…", "")
-        t.setStyleSheet("font-weight:700;")
-        v.addWidget(t)
-        from PySide6.QtWidgets import QProgressBar
-        bar = QProgressBar()
-        bar.setRange(0, 1000)
-        bar.setMinimumWidth(360)
-        v.addWidget(bar)
-        note = lab("Bev se fermera puis se rouvrira tout seul après l'installation.", "mut", True)
-        v.addWidget(note)
-        stop = threading.Event()
-        cancel = btn("Annuler", "", lambda: (stop.set(), dlg.reject()))
-        v.addWidget(cancel, 0, Qt.AlignmentFlag.AlignRight)
-        res = {}
+        b = self.gael_bubble("Je télécharge la mise à jour…", self.upd_title(r), mode="dl", one_line=True)
+        self._upd_dl_bubble = b
+
+        def prog(pc):
+            bb = self.upd_bubble
+            if bb is not None and bb is getattr(self, "_upd_dl_bubble", None) and bb.l_line is not None:
+                bb.l_line.setText(f"{self.upd_title(r)}   ·   {pc} %")
 
         def work():
+            res = {}
             try:
                 rq = urllib.request.Request(url, headers={"User-Agent": "Bev-update"})
                 h = hashlib.sha256()
-                got = 0
+                got, last = 0, -1
                 with urllib.request.urlopen(rq, timeout=30) as resp, open(dst + ".part", "wb") as fh:
                     total = int(resp.headers.get("Content-Length") or r.get("size") or 0)
-                    while not stop.is_set():
-                        b = resp.read(256 * 1024)
-                        if not b:
+                    while True:
+                        blk = resp.read(256 * 1024)
+                        if not blk:
                             break
-                        fh.write(b)
-                        h.update(b)
-                        got += len(b)
-                        if total:
-                            self.ui(bar.setValue, int(1000 * got / total))
-                if stop.is_set():
-                    return
+                        fh.write(blk)
+                        h.update(blk)
+                        got += len(blk)
+                        pc = int(100 * got / total) if total else 0
+                        if pc != last:
+                            last = pc
+                            self.ui(prog, pc)
                 if r.get("size") and got != r["size"]:
                     raise RuntimeError(f"fichier incomplet ({got} octets sur {r['size']})")
                 dg = r.get("digest", "")
@@ -20346,30 +20999,49 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 res["ok"] = True
             except Exception as ex:
                 res["err"] = str(ex)
-            self.ui(dlg.accept)
+            self.ui(self.update_downloaded, r, dst, res)
         threading.Thread(target=work, daemon=True).start()
-        dlg.exec()
-        if stop.is_set():
-            return
+
+    def update_downloaded(self, r, dst, res):
         if not res.get("ok"):
-            return err(self, "Mise à jour", "Téléchargement impossible : " + (res.get("err") or "?") +
-                       "\n\nTu peux aussi télécharger l'installateur à la main depuis la page des versions.")
+            self.gael_bubble("Téléchargement impossible.", (res.get("err") or "?")[:140],
+                             [("Page des versions", "", lambda: (self.update_bubble_close(), webbrowser.open(r.get("url") or ""))),
+                              ("Fermer", "", self.update_bubble_close)], mode="err")
+            return
+        self.upd_pending, self._upd_pending_tag = dst, r.get("tag", "")
+        if self.on_air:                                   # jamais de coupure du direct : installation à la fermeture
+            self.log(f"Mise à jour {r.get('tag', '')} prête : elle s'installera à la fermeture de Bev.")
+            return self.update_ready_bubble(r)
+        self.log(f"Installation de Bev {r.get('tag', '')} : Bev se ferme et se rouvre tout seul.")
+        if self.update_launch(relaunch=True):
+            self._closing = True
+            self.close()
+
+    def update_launch(self, relaunch):
+        """Lance l'installateur téléchargé en mode invisible (aucune fenêtre ; seule la demande d'autorisation de Windows
+        peut apparaître). relaunch=False : Bev a été fermé par l'utilisateur, il ne se rouvre pas."""
+        dst = getattr(self, "upd_pending", None)
+        if not dst or not os.path.isfile(dst):
+            return False
         try:
             kw = {"creationflags": 0x00000008 | 0x00000200} if SYS == "Windows" else {}
-            subprocess.Popen([dst, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
-                              "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")],
-                             env=clean_env(True), close_fds=True, **kw)
+            args = [dst, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL",
+                    "/LOG=" + os.path.join(os.path.dirname(dst), "Bev-mise-a-jour.log")]
+            if not relaunch:
+                args.append("/NORELAUNCH=1")
+            subprocess.Popen(args, env=clean_env(True), close_fds=True, **kw)
+            self.upd_pending = None
+            return True
         except Exception as ex:
-            return err(self, "Mise à jour", f"Impossible de lancer l'installateur : {ex}")
-        self.log(f"Installation de Bev {r.get('tag', '')} : Bev se ferme et se rouvrira tout seul.")
-        self._closing = True
-        self.close()
+            self.log(f"Impossible de lancer la mise à jour : {ex}")
+            return False
 
     def update_bubble_close(self):
         if self.upd_bubble is not None:
             self.upd_bubble.hide()
             self.upd_bubble.deleteLater()
             self.upd_bubble = None
+        self._upd_mode = ""
 
     # ------------------------------------------------------------ fermeture
     def closeEvent(self, ev):
@@ -20408,6 +21080,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 self.slot.close()
         except Exception:
             pass
+        if getattr(self, "upd_pending", None):     # mise à jour téléchargée pendant le direct : elle s'installe maintenant
+            self.update_launch(relaunch=False)
         super().closeEvent(ev)
 
 def load_fonts():
@@ -20475,6 +21149,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setStyle("Fusion")
+    if "--render-splash" in sys.argv:              # construction : image de démarrage = 1re image de l'animation
+        load_fonts()
+        render_splash(sys.argv[sys.argv.index("--render-splash") + 1])
+        return
     srv = None
     if not selftest:                   # une seule fenêtre Bev : un second lancement ramène simplement la fenêtre ouverte
         try:
@@ -20501,25 +21179,29 @@ def main():
             app.setWindowIcon(QIcon(pm))
     except Exception:
         pass
+    sp = None
+    if not selftest:                   # l'animation prend le relais de l'image de démarrage, au même endroit, sans saut
+        try:
+            sp = Splash()
+            sp.show()
+            sp.repaint()
+            QApplication.processEvents()
+            close_boot_splash()
+            globals()["_SPLASH"] = sp
+            sp.spin(250)
+        except Exception:
+            sp = None
+    close_boot_splash()
     app.setStyleSheet(qss())
     errs = []
     if selftest:                       # vérification automatique (construction GitHub) : tout ouvrir, puis quitter
         import traceback
         sys.excepthook = lambda *a: errs.append("".join(traceback.format_exception(*a)))
-    sp = None
-    if not selftest:
-        try:
-            sp = Splash()
-            sp.show()
-            close_boot_splash()        # l'écran de chargement animé prend le relais de l'image de démarrage
-            sp.spin(450)
-        except Exception:
-            sp = None
-    close_boot_splash()
     w = MainWindow()
+    globals()["_SPLASH"] = None
     if sp is not None:
         try:
-            sp.spin(150)
+            sp.spin(120)
             sp.close()
         except Exception:
             pass

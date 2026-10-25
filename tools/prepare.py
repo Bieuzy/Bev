@@ -59,7 +59,16 @@ d.text((200, 146), "BROADCAST TOOL", font=font(15, False), fill=(255, 210, 122))
 d.text((200, 176), "Démarrage…", font=font(15, False), fill=(170, 186, 210))
 d.rectangle([0, 0, W - 1, H - 1], outline=(40, 66, 104), width=2)
 im.save("build/splash.png")
-print("Image de démarrage prête.")
+# mieux : la toute première image de l'animation de démarrage de Bev (même dessin, même taille) : l'image affichée dès le
+# double-clic et l'animation qui prend le relais ne font plus qu'une
+try:
+    import subprocess
+    import sys
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    subprocess.run([sys.executable, SRC, "--render-splash", os.path.abspath("build/splash.png")], env=env, timeout=120, check=True)
+    print("Image de démarrage prête (première image de l'animation).")
+except Exception as ex:
+    print("Image de démarrage prête (version simple : %s)." % ex)
 
 # 3) version et dépôt (seulement pour une version publiée : tag v1.2.3)
 tag = os.environ.get("TAG", "")
