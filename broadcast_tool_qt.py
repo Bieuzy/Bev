@@ -84,85 +84,416 @@ PROCESSING = {
         "alimiter=limit=0.89:level=0",
     "Normalisation EBU R128": "loudnorm=I=-16:TP=-1.5:LRA=11",
 }
-# --- Traitement du son (page « Traitement du son ») : 4 pages A-D, chacune une chaîne ffmpeg ; chaque flux choisit la sienne
-FX_NEW = dict(nr=0, deess=0, excite=0, width=100, mono=False, gain=0)
-FX_PRESETS = {
-    "Neutre": dict(hp=False, bass=0, mid=0, treble=0, agc=False, agc_lvl=50, comp=0, limit=-1.0, loud=False, **FX_NEW),
-    "Voix parlée": dict(hp=True, bass=-1, mid=2, treble=2, agc=True, agc_lvl=45, comp=45, limit=-1.0, loud=False,
-                        **dict(FX_NEW, nr=25, deess=35)),
-    "Musique": dict(hp=False, bass=1, mid=0, treble=1, agc=False, agc_lvl=50, comp=22, limit=-1.0, loud=False,
-                    **dict(FX_NEW, width=110)),
-    "Radio punchy": dict(hp=True, bass=2, mid=1, treble=3, agc=False, agc_lvl=50, comp=72, limit=-1.5, loud=True,
-                         **dict(FX_NEW, excite=25, width=112, deess=20)),
-    "Doux (nuit)": dict(hp=True, bass=0, mid=0, treble=-1, agc=True, agc_lvl=70, comp=70, limit=-3.0, loud=False,
-                        **dict(FX_NEW, nr=20, deess=25, gain=-1)),
+# ======================================================================================================================
+# PROCESSEUR D'ANTENNE : traitement du son temps réel, calculé dans le moteur bloc par bloc (20 ms), appliqué à tout ce
+# qui part à l'antenne (flux, FM, DAB+, enregistrement, écoute casque). Architecture des processeurs de diffusion
+# haut de gamme (Optimod, Omnia, Stereo Tool) :
+#   coupe-bas + égalisation à phase linéaire (sans coloration de phase)
+#   -> AGC large bande lente, à fenêtre et à porte (le niveau ne remonte pas dans les silences) + AGC des graves
+#   -> compresseur-limiteur 5 bandes : crossover à phase linéaire à reconstruction parfaite, couplage inter-bandes,
+#      porte par bande, limiteur de crête par bande, niveau de sortie de chaque bande (le « son » de la station)
+#   -> stéréo : élargissement par bande à ratio côté/milieu plafonné, graves en mono
+#   -> écrêteur doux suréchantillonné x2 (anti-repliement)
+#   -> limiteur final à anticipation avec détection des crêtes vraies (x4, esprit ITU-R BS.1770) : plafond garanti
+# Mesures : AGC, réduction de gain par bande, limiteur, écrêteur, sonie LUFS (court terme 3 s et momentanée 400 ms).
+# Contournement (bypass) par fondu de 60 ms entre son traité et son brut retardé d'autant : aucune coupure, aucun saut.
+# ======================================================================================================================
+P_N = 4096                       # taille FFT du crossover (overlap-save)
+P_L = 3071                       # longueur des noyaux à phase linéaire
+P_D = (P_L - 1) // 2             # retard du crossover (échantillons)
+P_B = CH // 4                    # 882 échantillons par bloc de 20 ms
+P_SUB = 63                       # sous-bloc de calcul des gains (1,43 ms) : 14 par bloc
+P_NS = P_B // P_SUB
+P_XO = (120.0, 420.0, 1700.0, 6200.0)      # fréquences de coupure des 5 bandes
+P_HB = 127                       # passe-bas 20 kHz de l'écrêteur suréchantillonné (x2)
+P_TP = 129                       # filtre d'interpolation des crêtes vraies (x4)
+P_TPD = (P_TP - 1) // 2 // 4     # retard correspondant (16 échantillons)
+BAND_NAMES = ("Graves", "Bas-médium", "Médium", "Présence", "Aigus")
+
+
+def _fir_lp(n, cutoff, beta):
+    k = np.arange(n) - (n - 1) / 2
+    h = np.sinc(2 * cutoff * k) * np.kaiser(n, beta)
+    return h / h.sum()
+
+
+def _kweight_mag(nfft=1024):
+    """Pondération K (ITU-R BS.1770) : module au carré de la réponse, pour la mesure de sonie (LUFS)."""
+    f = np.fft.rfftfreq(nfft, 1.0 / SR)
+    z = np.exp(-1j * 2 * np.pi * f / SR)
+
+    def biquad(b, a):
+        return (b[0] + b[1] * z + b[2] * z * z) / (a[0] + a[1] * z + a[2] * z * z)
+    G, Q, fc = 3.999843853973347, 0.7071752369554196, 1681.974450955533
+    A = 10 ** (G / 40)
+    w0 = 2 * np.pi * fc / SR
+    al, cw, sA = np.sin(w0) / (2 * Q), np.cos(w0), np.sqrt(A)
+    h1 = biquad([A * ((A + 1) + (A - 1) * cw + 2 * sA * al), -2 * A * ((A - 1) + (A + 1) * cw), A * ((A + 1) + (A - 1) * cw - 2 * sA * al)],
+                [(A + 1) - (A - 1) * cw + 2 * sA * al, 2 * ((A - 1) - (A + 1) * cw), (A + 1) - (A - 1) * cw - 2 * sA * al])
+    Q, fc = 0.5003270373238773, 38.13547087602444
+    w0 = 2 * np.pi * fc / SR
+    al, cw = np.sin(w0) / (2 * Q), np.cos(w0)
+    h2 = biquad([1.0, -2.0, 1.0], [1 + al, -2 * cw, 1 - al])
+    return np.abs(h1 * h2) ** 2
+
+
+class _Fir:
+    """Filtre RIF en flux continu (historique conservé d'un bloc à l'autre), sur 2 canaux."""
+
+    def __init__(self, h):
+        self.h = np.asarray(h, dtype=float)
+        self.z = np.zeros((2, len(h) - 1))
+
+    def __call__(self, x):
+        xs = np.concatenate((self.z, x), axis=1)
+        self.z = xs[:, x.shape[1]:]
+        return np.stack((np.convolve(xs[0], self.h, "valid"), np.convolve(xs[1], self.h, "valid")))
+
+
+# --- réglages ----------------------------------------------------------------------------------------------------------
+#  lm         MOINS <-> PLUS (1-10, comme sur un Optimod) : densité et volume perçu, à partir du préréglage
+#  hpf        coupe-bas (Hz, 0 = sans) ; bass / presence / air : égalisation (dB)
+#  agc        AGC marche / arrêt ; agc_speed : vitesse de remontée (dB/s) ; agc_gate : seuil de porte (dBFS)
+#  bass_agc   AGC des graves (correction maximale, dB)
+#  mb_drive   attaque du multibande (dB) ; ratio ; mb_release (ms) ; coupling (%) ; mix : niveau de sortie des 5 bandes (dB)
+#  width      élargissement stéréo (%) ; bass_mono : graves en mono ; mono : sortie mono
+#  clip       écrêteur (0-100 %) ; ceiling : plafond (dB crête vraie) ; fm15 : bande limitée à 15 kHz (émetteur FM)
+PROC_BASE = dict(lm=5.0, hpf=35, bass=0.0, presence=0.0, air=0.0,
+                 agc=True, agc_speed=2.0, agc_gate=-44.0, agc_target=-18.0, agc_max=15.0, agc_window=1.5, bass_agc=3.0,
+                 mb_on=True, mb_drive=6.0, mb_thr=(-26.0, -26.0, -26.0, -28.0, -30.0), ratio=4.0,
+                 mb_attack=(40.0, 22.0, 12.0, 7.0, 4.0), mb_release=250.0, coupling=40,
+                 mix=(0.0, 0.0, 0.0, 0.0, 0.0), makeup=0.0, blim=-4.0,
+                 width=0, bass_mono=True, mono=False,
+                 clip=20, ceiling=-1.0, lim_release=120.0, fm15=False)
+
+PROC_PRESETS = {
+    "Généraliste": dict(bass=1.0, presence=0.5, air=1.0, mb_drive=6.0, ratio=4.0, mb_release=250.0, coupling=40, makeup=2.0,
+                        mix=(0.5, 0.0, 0.0, 0.5, 1.0), width=25, clip=25, lim_release=120.0),
+    "Talk-show": dict(hpf=70, bass=-0.5, presence=2.0, air=1.0, agc_speed=3.0, agc_gate=-40.0, mb_drive=7.0, ratio=5.0,
+                      mb_release=180.0, coupling=60, mix=(-1.5, 0.0, 0.5, 1.0, 0.5), width=0, clip=15, lim_release=100.0),
+    "Info (news)": dict(hpf=90, bass=-2.0, presence=3.0, air=0.5, agc_speed=4.0, agc_gate=-38.0, agc_window=0.8,
+                        mb_drive=9.0, ratio=8.0, mb_release=120.0, coupling=70, mix=(-3.0, -0.5, 1.0, 1.5, 0.0),
+                        width=0, clip=20, lim_release=80.0, bass_agc=0.0, blim=-5.0),
+    "Classique": dict(hpf=20, agc_speed=0.6, agc_gate=-52.0, agc_target=-21.0, agc_max=10.0, agc_window=4.0, bass_agc=0.0,
+                      mb_drive=1.0, ratio=1.8, mb_release=900.0, coupling=85, makeup=-1.2, blim=-1.5,
+                      width=10, bass_mono=False, clip=0, ceiling=-1.5, lim_release=250.0),
+    "Jazz & acoustique": dict(hpf=25, bass=0.5, air=0.5, agc_speed=1.0, agc_gate=-50.0, agc_target=-20.0, agc_window=3.0,
+                              mb_drive=3.0, ratio=2.5, mb_release=600.0, coupling=70, mix=(0.0, 0.0, 0.0, 0.0, 0.5),
+                              makeup=0.7, blim=-2.5, width=15, bass_mono=False, clip=5, lim_release=180.0),
+    "Pop / Hits": dict(bass=1.5, presence=1.0, air=2.0, agc_speed=2.5, mb_drive=8.0, ratio=5.0, mb_release=160.0,
+                       coupling=35, mix=(1.0, -0.5, 0.0, 1.0, 1.5), makeup=3.0, width=35, clip=40, lim_release=90.0),
+    "Rock": dict(bass=1.0, presence=1.5, air=1.0, agc_speed=2.5, mb_drive=8.0, ratio=5.0, mb_release=200.0,
+                 coupling=40, mix=(0.5, 0.0, 0.5, 1.5, 0.5), makeup=3.0, width=30, clip=40, lim_release=100.0),
+    "Urbain": dict(hpf=28, bass=2.5, presence=0.5, air=1.5, agc_speed=2.5, mb_drive=8.0, ratio=5.0, mb_release=180.0,
+                   coupling=35, mix=(2.0, 0.0, -0.5, 0.5, 1.0), makeup=3.0, width=30, clip=35, lim_release=100.0, bass_agc=4.0),
+    "Loud": dict(bass=1.5, presence=1.5, air=2.0, agc_speed=3.0, mb_drive=11.0, ratio=10.0, mb_release=90.0,
+                 coupling=25, mix=(1.0, 0.0, 0.0, 1.0, 1.5), makeup=3.5, blim=-5.5, width=40, clip=70, lim_release=60.0),
+    "Protection seule": dict(hpf=0, agc=False, mb_on=False, width=0, bass_mono=False, clip=0, lim_release=150.0),
 }
-FX_DEFAULT = dict(FX_PRESETS["Voix parlée"], on=False, preset="Voix parlée", lufs=-16)
-FX_LETTERS = ("A", "B", "C", "D")
-FX_PAGES_DEFAULT = {"A": ("Voix parlée", True), "B": ("Musique", False), "C": ("Radio punchy", False), "D": ("Doux (nuit)", False)}
-FX = {"chain": "", "chains": {}}
-FX_PAGE = "Page A"
-FX_NONE = "Aucun traitement"
-FX_CHOICES = ["Page " + k for k in FX_LETTERS]
+PROC_ORDER = list(PROC_PRESETS)
+PROC_DEFAULT = "Généraliste"
 
 
-def build_fx_chain(c, force=False):
-    """Chaîne de filtres ffmpeg : coupe-bas, bruit, de-esser, égaliseur, exciter, AGC, compresseur, largeur, gain, normalisation, limiteur."""
-    if not c or not (c.get("on") or force):
-        return ""
-    f = []
-    num = lambda k, d=0.0: float(c.get(k, d) or 0)
-    if c.get("hp"):
-        f.append("highpass=f=70")
-    if num("nr") > 0:  # réduction de bruit (souffle, ventilateur) : 0-100 % -> 3 à 24 dB
-        f.append(f"afftdn=nr={3 + num('nr') * .21:.0f}:nf=-45:tn=1")
-    if num("deess") > 0:  # atténue les « sss » trop aigus
-        f.append(f"deesser=i={min(1.0, num('deess') / 100):.2f}:m=0.5:f=0.5")
-    if abs(num("bass")) >= .1:
-        f.append(f"bass=g={num('bass'):.1f}:f=110:w=0.7")
-    if abs(num("mid")) >= .1:
-        f.append(f"equalizer=f=1600:t=q:w=0.9:g={num('mid'):.1f}")
-    if abs(num("treble")) >= .1:
-        f.append(f"treble=g={num('treble'):.1f}:f=7500:w=0.7")
-    if num("excite") > 0:  # présence / brillance harmonique
-        f.append(f"aexciter=amount={1 + num('excite') / 100 * 3:.1f}:freq=6500:drive=6:blend=0")
-    if c.get("agc"):  # contrôle automatique de gain : ramène voix fortes et faibles au même niveau
-        f.append(f"dynaudnorm=f=150:g=7:p=0.9:m={3 + num('agc_lvl', 50) * .17:.1f}:s=5")   # ~1 s d'anticipation (et non 7 s)
-    cp = num("comp")
-    if cp > 0:
-        f.append(f"acompressor=threshold={10 ** (-(10 + cp * .18) / 20):.4f}:ratio={1.5 + cp / 100 * 5.5:.2f}"
-                 f":attack=12:release=220:makeup={1 + cp / 100 * 2.5:.2f}")
-    if c.get("mono"):
-        f.append("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
-    elif abs(num("width", 100) - 100) >= 2:  # largeur stéréo : 0 % mono, 100 % normal, 150 % large
-        f.append(f"extrastereo=m={max(0.0, num('width', 100)) / 100:.2f}:c=1")
-    if abs(num("gain")) >= .1:
-        f.append(f"volume={num('gain'):.1f}dB")
-    ceil = max(-9.0, min(0.0, num("limit", -1)))
-    if c.get("loud"):
-        f.append(f"loudnorm=I={num('lufs', -16):.0f}:TP={ceil:.1f}:LRA=9,aresample={SR}")
-    f.append(f"alimiter=limit={10 ** (ceil / 20):.3f}:level=0")
-    return ",".join(f)
+def proc_params(name=PROC_DEFAULT, **over):
+    d = dict(PROC_BASE)
+    d.update(PROC_PRESETS.get(name, {}))
+    d.update(over)
+    d["preset"] = name if name in PROC_PRESETS else PROC_DEFAULT
+    return d
 
 
-def fx_chain_for(cfg):
-    """Chaîne de traitement d'un flux : une page A-D, aucun traitement, ou un style choisi pour ce flux."""
-    mode = cfg.get("fxmode", FX_PAGE)
-    if mode == FX_NONE:
-        return ""
-    if mode in FX_PRESETS:
-        return build_fx_chain(dict(FX_PRESETS[mode], lufs=-16), True)
-    if mode.startswith("Page "):
-        return FX["chains"].get(mode[5:6], "")
-    return FX["chains"].get("A", "")  # ancien « réglage de la page »
+class AirProcessor:
+    """Processeur d'antenne temps réel : process(bloc de 20 ms, int16 stéréo) -> bloc traité de même taille, latence fixe
+    (LAT échantillons, ~38 ms). update(réglages) et set_bypass(on) peuvent venir d'un autre fil : pris en compte au bloc
+    suivant, sans clic (filtres changés par fondu, contournement par fondu)."""
+    LAT = P_D + (P_HB - 1) // 2 + P_TPD + P_SUB
+
+    def __init__(self, params=None, bypass=False):
+        self.lk = threading.Lock()
+        self.hist = np.zeros((2, P_N))                # historique M/S du crossover
+        self.K = self.K_old = None
+        self.shape_sig = None
+        self.agc_db = self.bagc_db = 0.0
+        self.agc_pow = 1e-4
+        self.gr = np.zeros(5)                         # réduction de gain des compresseurs de bande (dB)
+        self.gl = np.zeros(5)                         # réduction de gain des limiteurs de bande (dB)
+        self.g_prev = None                            # gains de bande au dernier nœud
+        self.w_prev = np.ones(5)                      # largeur stéréo appliquée par bande
+        hb = _fir_lp(P_HB, 20500.0 / (2 * SR), 9.0)  # passe-bas 20,5 kHz à 88,2 kHz : rien au-dessus de 20 kHz
+        self.up2, self.dn2 = _Fir(2 * hb), _Fir(hb)
+        self.tp = _Fir(4 * _fir_lp(P_TP, 0.122, 8.0))
+        self.tpd = np.zeros((2, P_TPD))
+        self.lim_buf = np.zeros((2, P_SUB))
+        self.lim_req_prev = 1.0
+        self.lim_g = 1.0
+        self.dry = np.zeros((2, self.LAT + P_B))
+        self.bypass = bool(bypass)
+        self.mix_g = 0.0 if bypass else 1.0
+        self.kw = _kweight_mag()
+        self.ms_hist = np.zeros(150)
+        self.ms_i = 0
+        self.clip_acc = 0.0
+        self.meter = {"agc": 0.0, "bagc": 0.0, "gr": [0.0] * 5, "lim": 0.0, "clip": 0.0, "lufs": -70.0, "lufs_m": -70.0,
+                      "in": -90.0, "out": -90.0, "bypass": self.bypass, "ms": 0.0, "gate": False}
+        self.p = self.q = None
+        self.update(params or proc_params())
+
+    # --- réglages (depuis n'importe quel fil)
+    def set_bypass(self, on):
+        self.bypass = bool(on)
+
+    def update(self, params):
+        p = proc_params(params.get("preset", PROC_DEFAULT)) if params else proc_params()
+        p.update({k: v for k, v in (params or {}).items() if k in PROC_BASE})
+        num = lambda k: float(p.get(k, PROC_BASE[k]))
+        lm = max(1.0, min(10.0, num("lm")))
+        T = P_SUB / SR
+        q = {"drive": num("mb_drive") + (lm - 5.0) * 1.3,                      # MOINS <-> PLUS
+             "clip_drive": max(0.0, min(100.0, num("clip"))) / 100.0 * 3.5 + max(0.0, lm - 5.0) * 0.3,
+             "clip_amt": max(0.0, min(100.0, num("clip"))) / 100.0,
+             "ceil": 10 ** (max(-6.0, min(-0.1, num("ceiling"))) / 20),
+             "thr": np.array(p["mb_thr"], dtype=float), "ratio": max(1.0, num("ratio")),
+             "mix": np.array(p["mix"], dtype=float), "makeup": num("makeup") + (lm - 5.0) * 0.5,
+             "a_att": 1 - np.exp(-T / (np.array(p["mb_attack"], dtype=float) / 1000.0)),
+             "a_rel": 1 - np.exp(-T / (num("mb_release") / 1000.0 * np.array((1.6, 1.25, 1.0, 0.8, 0.65)))),
+             "a_lrel": 1 - np.exp(-T / np.array((0.12, 0.08, 0.06, 0.05, 0.04))),
+             "blim": num("blim") - (lm - 5.0) * 0.2,
+             "coup": max(0.0, min(1.0, num("coupling") / 100.0)),
+             "gate": num("agc_gate"), "mb_on": bool(p.get("mb_on", True)), "agc": bool(p.get("agc", True)),
+             "agc_target": num("agc_target") + (lm - 5.0) * 0.4, "agc_speed": max(0.1, num("agc_speed")),
+             "agc_max": num("agc_max"), "agc_win": max(0.0, num("agc_window")), "bagc_max": max(0.0, num("bass_agc")),
+             "mono": bool(p.get("mono")),
+             "lim_rel": 1 - math.exp(-T / max(0.01, num("lim_release") / 1000.0))}
+        wd = max(0.0, min(200.0, num("width"))) / 100.0
+        q["width"] = np.array((0.0 if p.get("bass_mono") else 1.0, 1 + wd * .5, 1 + wd, 1 + wd, 1 + wd * .7))
+        sig = (num("hpf"), num("bass"), num("presence"), num("air"), bool(p.get("fm15")))
+        K = self.design(*sig) if sig != self.shape_sig else None
+        with self.lk:
+            self.p, self.q = p, q
+            if K is not None:
+                self.K_old, self.K, self.shape_sig = self.K, K, sig
+
+    @staticmethod
+    def design(hpf, bass, presence, air, fm15):
+        """Noyaux à phase linéaire des 5 bandes, égalisation et coupe-bas compris. Leur somme est exactement le filtre de
+        mise en forme : le découpage en bandes n'ajoute aucune coloration."""
+        nd = 1 << 16
+        f = np.fft.rfftfreq(nd, 1.0 / SR)
+        fz = np.maximum(f, 0.5)
+        S = 1 / np.sqrt(1 + (12.0 / fz) ** 4)                       # toujours : protection infra-basse / continu
+        if hpf > 0:                                                 # coupe-bas Butterworth d'ordre 4 (module)
+            S = S / np.sqrt(1 + (hpf / fz) ** 8)
+        if abs(bass) > .05:                                         # plateau grave (90 Hz)
+            A2, x = 10 ** (bass / 10), (90.0 / fz) ** 2
+            S = S * np.sqrt((1 + A2 * x) / (1 + x))
+        if abs(presence) > .05:                                     # présence (cloche large à 3,2 kHz)
+            S = S * 10 ** (presence / 20 * np.exp(-(np.log2(fz / 3200.0) / 0.8) ** 2))
+        if abs(air) > .05:                                          # air (plateau aigu à 11 kHz)
+            A2, x = 10 ** (air / 10), (fz / 11000.0) ** 2
+            S = S * np.sqrt((1 + A2 * x) / (1 + x))
+        if fm15:                                                    # FM : rien au-dessus de 15 kHz (pilote 19 kHz protégé)
+            u = np.clip((f - 14700.0) / 1000.0, 0, 1)
+            S = S * np.cos(u * np.pi / 2) ** 2
+        lx = np.log2(fz)
+        lps = [np.cos(np.clip(lx - math.log2(fc) + .5, 0, 1) * np.pi / 2) ** 2 for fc in P_XO]   # transitions d'une octave
+        bands = [lps[0]] + [lps[i] - lps[i - 1] for i in range(1, 4)] + [1 - lps[3]]
+        win = np.kaiser(P_L, 8.0)
+        K = np.zeros((5, P_N // 2 + 1), dtype=complex)
+        for i, b in enumerate(bands):
+            h = np.roll(np.fft.irfft(b * S, nd), P_D)[:P_L] * win
+            K[i] = np.fft.rfft(h, P_N)
+        return K
+
+    # --- un bloc
+    def process(self, blk):
+        t0 = time.perf_counter()
+        x = np.frombuffer(blk, dtype="<i2").astype(np.float64).reshape(-1, 2).T * (1 / 32768.0)
+        with self.lk:
+            q, K, Ko = self.q, self.K, self.K_old
+            self.K_old = None
+        d = self.dry                                                 # son brut, retardé comme le son traité
+        d[:, :-P_B] = d[:, P_B:]
+        d[:, -P_B:] = x
+        dry = d[:, :P_B].copy()
+        # --- milieu / côté, crossover à phase linéaire (overlap-save : une FFT, cinq bandes)
+        h = self.hist
+        h[:, :-P_B] = h[:, P_B:]
+        h[0, -P_B:] = (x[0] + x[1]) * .5
+        h[1, -P_B:] = (x[0] - x[1]) * .5
+        X = np.fft.rfft(h, axis=-1)
+        bands = np.fft.irfft(X[None] * K[:, None], P_N, axis=-1)[..., -P_B:]           # (5, 2, B)
+        if Ko is not None:                                                             # nouveaux filtres : fondu d'un bloc
+            old = np.fft.irfft(X[None] * Ko[:, None], P_N, axis=-1)[..., -P_B:]
+            bands = old + (bands - old) * np.linspace(0, 1, P_B)
+        M, S = bands[:, 0], bands[:, 1]
+        a = np.abs(M) + np.abs(S)                                     # = max(|gauche|, |droite|) de chaque bande
+        sub = a.reshape(5, P_NS, P_SUB)
+        lev = 10 * np.log10(np.mean(sub * sub, axis=-1) + 1e-12) + 3.0              # dB (sinus pleine échelle = 0 dB)
+        pk = 20 * np.log10(np.max(sub, axis=-1) + 1e-9)
+        tot = a.sum(axis=0)
+        p_all = float(np.mean(tot * tot))
+        lin = 10 * math.log10(p_all + 1e-12) + 3.0
+        # --- AGC large bande : lente, à fenêtre (immobile près de la cible), figée sous le seuil de porte
+        gated = True
+        if q["agc"]:
+            self.agc_pow += (p_all - self.agc_pow) * 0.055                            # ≈ 0,35 s
+            lvl = 10 * math.log10(self.agc_pow + 1e-12) + 3.0
+            if lvl > q["gate"]:
+                gated = False
+                err = q["agc_target"] - (lvl + self.agc_db)
+                win = q["agc_win"]
+                if err < -win:                                                         # trop fort : descente (~1 s)
+                    self.agc_db += max((err + win) * 0.02 / 0.9, -0.02 * 12.0)
+                elif err > win:                                                        # trop faible : remontée lente
+                    self.agc_db += min((err - win) * 0.02 / 1.5, 0.02 * q["agc_speed"])
+                self.agc_db = max(-14.0, min(q["agc_max"], self.agc_db))
+                if q["bagc_max"] > 0:                                                  # AGC des graves
+                    e2 = (float(np.mean(lev[1:3])) - 3.0) - (float(np.mean(lev[0])) + self.bagc_db)
+                    if abs(e2) > 2.0:
+                        self.bagc_db += max(-0.02 * 3.0, min(0.02 * 1.0, (e2 - math.copysign(2.0, e2)) * 0.02 / 2.0))
+                    self.bagc_db = max(-q["bagc_max"], min(q["bagc_max"], self.bagc_db))
+        else:
+            self.agc_db *= 0.95
+            self.bagc_db *= 0.95
+        base = np.full(5, self.agc_db + q["drive"])
+        base[0] += self.bagc_db
+        # --- compresseur-limiteur 5 bandes : gains calculés toutes les 1,43 ms, interpolés à l'échantillon
+        nodes = np.empty((5, P_NS + 1))
+        gr, gl = self.gr, self.gl
+        thr, att, rel, lrel = q["thr"], q["a_att"], q["a_rel"], q["a_lrel"]
+        slope = 1 - 1 / q["ratio"]
+        out_off = q["mix"] + q["makeup"] - thr - 20.0                 # niveau de sortie : seuil ramené vers -20 dB
+        coup, blim = q["coup"], q["blim"]
+        bgate = q["gate"] - q["drive"] - 8.0 - (thr - thr.max())     # porte par bande
+        grmax = np.zeros(5)
+        if q["mb_on"]:
+            for j in range(P_NS):
+                li = lev[:, j] + base
+                over = li - thr
+                tgt = np.where(over > 4, over * slope, np.where(over > -4, (over + 4) ** 2 / 16 * slope, 0.0))   # genou de 8 dB
+                k = np.where(tgt > gr, att, np.where(lev[:, j] + self.agc_db < bgate, rel * 0.02, rel))
+                gr += (tgt - gr) * k
+                gc = gr + coup * (gr.mean() - gr)                      # couplage : les bandes ne s'écartent pas trop
+                g = base - gc + out_off
+                lt = np.maximum(0.0, pk[:, j] + g - gl * 0 - blim)    # limiteur de crête par bande (en sortie)
+                gl = np.where(lt > gl, lt, gl + (lt - gl) * lrel)
+                g = g - gl
+                grmax = np.maximum(grmax, gc + gl)
+                nodes[:, j + 1] = g
+        else:
+            nodes[:, 1:] = self.agc_db
+        self.gr, self.gl = gr, gl
+        nodes = 10 ** (nodes / 20)
+        nodes[:, 0] = nodes[:, 1] if self.g_prev is None else self.g_prev
+        self.g_prev = nodes[:, -1].copy()
+        ramp = np.arange(P_SUB) * (1.0 / P_SUB)
+        G = (nodes[:, :-1, None] + (nodes[:, 1:] - nodes[:, :-1])[:, :, None] * ramp).reshape(5, P_B)
+        # --- stéréo : élargissement par bande, côté plafonné à 85 % du milieu (image pleine, jamais trouée), graves mono
+        Mg, Sg = M * G, S * G
+        em = np.einsum("ij,ij->i", Mg, Mg) + 1e-12
+        es = np.einsum("ij,ij->i", Sg, Sg) + 1e-12
+        wt = q["width"].copy()
+        cap = 0.85 * np.sqrt(em / es)
+        wt[1:] = np.where(wt[1:] > 1, np.maximum(1.0, np.minimum(wt[1:], cap[1:])), wt[1:])
+        w0 = self.w_prev
+        w1 = w0 + (wt - w0) * 0.12
+        self.w_prev = w1
+        W = w0[:, None] + (w1 - w0)[:, None] * np.linspace(0, 1, P_B)
+        m = Mg.sum(axis=0)
+        s = np.einsum("ij,ij->j", Sg, W) if not q["mono"] else np.zeros(P_B)
+        y = np.vstack((m + s, m - s))
+        # --- écrêteur doux x2, puis limiteur à anticipation sur les crêtes vraies
+        y = self.clipper(y, q)
+        y = self.limiter(y, q)
+        # --- contournement : fondu de 60 ms entre traité et brut
+        want = 0.0 if self.bypass else 1.0
+        g0 = self.mix_g
+        g1 = g0 if want == g0 else (min(1.0, g0 + 1 / 3) if want > g0 else max(0.0, g0 - 1 / 3))
+        self.mix_g = g1
+        if g0 < 1.0 or g1 < 1.0:
+            y = dry + (y - dry) * (g0 + (g1 - g0) * np.linspace(0, 1, P_B))
+        out = np.clip(np.rint(y.T.reshape(-1) * 32767.0), -32768, 32767).astype("<i2").tobytes()
+        # --- mesures
+        self.loud(y)
+        mt = self.meter
+        mt["agc"], mt["bagc"], mt["gate"] = self.agc_db, self.bagc_db, gated
+        mt["gr"] = [round(float(v), 2) for v in grmax]
+        mt["in"] = lin
+        mt["bypass"] = self.bypass
+        mt["out"] = float(20 * np.log10(np.max(np.abs(y)) + 1e-9))
+        mt["ms"] = mt["ms"] * .9 + (time.perf_counter() - t0) * 100
+        return out
+
+    def clipper(self, y, q):
+        """Écrêteur doux suréchantillonné x2 : arrondit les crêtes isolées (volume perçu) sans repliement audible."""
+        y = y * 10 ** (q["clip_drive"] / 20)
+        u = np.empty((2, 2 * P_B))
+        u[:, 0::2], u[:, 1::2] = y, 0.0
+        u = self.up2(u)
+        thr = q["ceil"] * 1.06                                        # (le limiteur final rattrape le reste)
+        k = (0.9 - 0.3 * q["clip_amt"]) * thr                        # genou : bas si l'on écrête, presque invisible sinon
+        au = np.abs(u)
+        over = au > k
+        n = int(np.count_nonzero(over))
+        if n:
+            r = thr - k
+            u = np.where(over, np.sign(u) * (k + r * np.tanh((au - k) / r)), u)
+        self.clip_acc = max(self.clip_acc * 0.85, n / u.size * 100)
+        self.meter["clip"] = self.clip_acc
+        return self.dn2(u)[:, 0::2]
+
+    def limiter(self, y, q):
+        """Limiteur final : crêtes vraies (x4), anticipation d'un sous-bloc, attaque sans dépassement, retour réglable."""
+        c = q["ceil"] * 0.977                                         # 0,2 dB de marge : plafond tenu en crête vraie
+        u = np.zeros((2, 4 * P_B))
+        u[:, 0::4] = y
+        pk = np.abs(self.tp(u)).reshape(2, P_B, 4).max(axis=(0, 2))   # (retard de P_TPD échantillons)
+        pk = np.maximum(pk, np.concatenate((pk[1:], pk[-1:])))         # marge d'un échantillon (alignement)
+        yd = np.concatenate((self.tpd, y), axis=1)
+        self.tpd = yd[:, -P_TPD:]
+        y = yd[:, :P_B]
+        req = (c / np.maximum(pk, c)).reshape(P_NS, P_SUB).min(axis=1)
+        nodes = np.empty(P_NS + 1)
+        nodes[0] = g = self.lim_g
+        prev, rel = self.lim_req_prev, q["lim_rel"]
+        for j in range(P_NS):
+            t = req[j] if req[j] < prev else prev
+            g = t if t < g else g + (t - g) * rel
+            nodes[j + 1] = g
+            prev = req[j]
+        self.lim_req_prev, self.lim_g = prev, g
+        ramp = np.arange(P_SUB) * (1.0 / P_SUB)
+        Gl = (nodes[:-1, None] + (nodes[1:] - nodes[:-1])[:, None] * ramp).reshape(P_B)
+        buf = np.concatenate((self.lim_buf, y), axis=1)
+        self.lim_buf = buf[:, -P_SUB:]
+        self.meter["lim"] = float(-20 * math.log10(max(1e-6, float(nodes.min()))))
+        return np.clip(buf[:, :P_B] * Gl, -c, c)
+
+    def loud(self, y):
+        """Sonie (LUFS, pondération K) : court terme (3 s) et momentanée (400 ms)."""
+        X = np.fft.rfft(y, 1024, axis=-1)
+        ms = float(np.sum((X.real ** 2 + X.imag ** 2) * self.kw)) * 2 / (1024 * P_B)
+        self.ms_hist[self.ms_i % 150] = ms
+        self.ms_i += 1
+        n = min(self.ms_i, 150)
+        st = float(np.mean(self.ms_hist[:n]))
+        idx = (self.ms_i - 1 - np.arange(min(20, self.ms_i))) % 150
+        mm = float(np.mean(self.ms_hist[idx]))
+        self.meter["lufs"] = -0.691 + 10 * math.log10(st + 1e-12)
+        self.meter["lufs_m"] = -0.691 + 10 * math.log10(mm + 1e-12)
 
 
-def fx_key(cfg):
-    """Quel traitement suit ce flux : « Page A »…« Page D », un style, ou « Aucun traitement »."""
-    mode = cfg.get("fxmode", FX_PAGE) or FX_PAGE
-    if mode == FX_NONE or mode in FX_PRESETS or (mode.startswith("Page ") and mode[5:6] in FX_LETTERS):
-        return mode
-    return "Page A"
+# --- état partagé interface <-> moteur : réglages du processeur et contournement (bypass)
+FX = {"proc": proc_params(), "bypass": False}
+FX_ON = "Son traité (processeur)"
+FX_NONE = "Son brut (sans traitement)"
+FX_CHOICES = [FX_ON, FX_NONE]
+
+
+def out_processed(cfg):
+    """Ce flux reçoit-il le son du processeur d'antenne ? (ancien réglage « Aucun traitement » = son brut)"""
+    m = cfg.get("fxmode") or ""
+    return not (m == FX_NONE or m == "Aucun traitement")
 
 
 FM_PROC = "Radio FM (filtre 15 kHz + compresseur + limiteur)"
@@ -1024,7 +1355,13 @@ class Engine:
         self.gain = 1.0
         self.set_gain(prof.get("gain", "0"))
         self.cmon = CartMonitor(self.log)
-        self.buses, self.bus_bad, self.n_dist = {}, set(), 0
+        self.proc = None                       # processeur d'antenne (traitement du son temps réel)
+        self.pm = {}                           # ses mesures (AGC, réduction de gain par bande, limiteur, LUFS…)
+        if np is not None:
+            try:
+                self.proc = AirProcessor(FX.get("proc"), bool(FX.get("bypass")))
+            except Exception as ex:
+                self.log(f"Processeur d'antenne indisponible ({ex}) : le son part sans traitement.")
         self.cap_proc = self.pl_proc = None
         self.cap_stream = None
         self.outputs = []                      # flux : créés seulement à la mise à l'antenne
@@ -1046,9 +1383,6 @@ class Engine:
         self.cmon.close()
         for o in self.outputs:
             o.stop()
-        for b in list(self.buses.values()):
-            b.stop()
-        self.buses = {}
         self._cap_kill()
         if self.pl_proc:
             stop_proc(self.pl_proc)
@@ -1061,9 +1395,6 @@ class Engine:
                     self.set_prof(prof)
                 for o in self.outputs:              # (sécurité) anciens flux encore présents
                     threading.Thread(target=o.stop, daemon=True).start()
-                for b in list(self.buses.values()):
-                    b.stop()
-                self.buses, self.bus_bad = {}, set()
                 with self.lock:
                     self.pl_buf.clear()
                     self.pl_marks.clear()
@@ -1096,9 +1427,6 @@ class Engine:
                 outs, self.outputs = self.outputs, []
                 for o in outs:
                     o.stop()
-                for b in list(self.buses.values()):
-                    b.stop()
-                self.buses = {}
                 self.backup = self.manual = self.mute = self.tone = self.pl_active = self.pl_pause = self.pl_stop = False
                 self.silent_ms = self.loud_ms = 0
                 self.track, self.pl_cur = "", None
@@ -1183,43 +1511,29 @@ class Engine:
     def output(self, oid):
         return next((o for o in self.outputs if o.cfg["id"] == oid), None)
 
-    # --- traitement du son : un « bus » par réglage (page A-D, style, ou aucun), partagé par les flux qui l'utilisent.
-    # Les encodeurs (connectés au serveur) ne voient que le son déjà traité : changer le traitement ne les coupe jamais.
-    def bus_wanted(self, key):
-        return key not in self.bus_bad
+    # --- traitement du son : le processeur d'antenne traite chaque bloc UNE fois ; chaque flux reçoit le son traité ou,
+    # s'il est réglé ainsi, le son brut. Changer un réglage ou passer en bypass ne touche jamais aux encodeurs.
+    def set_processor(self, params=None, bypass=None):
+        if params is not None:
+            FX["proc"] = params
+            if self.proc is not None:
+                self.proc.update(params)
+        if bypass is not None:
+            FX["bypass"] = bool(bypass)
+            if self.proc is not None:
+                self.proc.set_bypass(bypass)
 
-    def distribute(self, out):
-        """Bloc de 20 ms vers les sorties : via le bus de traitement de chacune (ou directement si son bus a échoué)."""
-        used = set()
+    def distribute(self, out, raw):
+        """Bloc de 20 ms vers les sorties : son traité, ou son brut pour les flux réglés « sans traitement »."""
         for o in self.outputs:
-            bk = o.bus_key
-            if bk is None:
-                o.push(out)
-            elif o.thread is not None and o.thread.is_alive():
-                used.add(bk)
-        for k in used:
-            if k in self.bus_bad:
-                continue
-            b = self.buses.get(k)
-            if b is None:
-                b = self.buses[k] = FxBus(self, k)
-            b.push(out)
-        self.n_dist += 1
-        if self.n_dist % 50 == 0:                  # une fois par seconde : bus devenus inutiles arrêtés
-            for k in [k for k in self.buses if k not in used]:
-                self.buses.pop(k).stop()
+            o.push(out if out_processed(o.cfg) else raw)
 
     def set_out_fx(self, modes):
-        """« Appliquer aux flux » : chaque flux suit son nouveau réglage SANS redémarrer (son encodeur reste connecté)."""
+        """Traité / brut choisi flux par flux : pris en compte au bloc suivant, sans redémarrer l'encodeur."""
         for o in list(self.outputs):
             m = modes.get(o.cfg.get("id"))
-            if m is None:
-                continue
-            o.cfg["fxmode"] = m
-            if o.bus_key is not None:
-                o.bus_key = fx_key(o.cfg)
-            elif o.state == "live":                 # traitement propre au flux (bus en échec) : seul cas où il faut relancer
-                threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.0), o.start() if self.air else None), daemon=True).start()
+            if m is not None:
+                o.cfg["fxmode"] = m
 
     def remove_output(self, oid):
         """Retire une sortie de l'antenne en cours (elle s'arrête en arrière-plan)."""
@@ -1987,13 +2301,26 @@ class Engine:
                 out = dq.popleft() if len(dq) > n else zero
             else:
                 out = prog
+            raw = out
+            pr = self.proc
+            if pr is not None and (air or cap):         # processeur d'antenne (hors antenne : mesures sur l'entrée seulement)
+                try:
+                    po = pr.process(out if air else live)
+                    if air:
+                        out = po
+                    self.pm = pr.meter
+                except Exception as ex:
+                    self.proc = None
+                    self.log(f"Processeur d'antenne arrêté ({ex}) : le son part sans traitement.")
+            elif self.pm:
+                self.pm = {}
             lv = peak_db(out)
             if max(lv) > -0.3:
                 self.clip_t = time.time()
             for ch in (0, 1):
                 self.peak[ch] = max(self.peak[ch], lv[ch])
             if air:
-                self.distribute(out)
+                self.distribute(out, raw)
             if self.cmon.stream:                   # casque : antenne écoutée (si demandé) + pré-écoute des cartouches
                 parts = []
                 if self.listen and air:
@@ -2094,226 +2421,6 @@ class Engine:
             return 0.7
 
 # ------------------------------------------------------------------ sorties
-class FxBus:
-    """Traitement du son d'un réglage (page A-D, style ou aucun) calculé UNE fois, puis distribué aux encodeurs des flux qui
-    le suivent. Quand le réglage change (« Appliquer aux flux »), un second ffmpeg démarre en parallèle avec le nouveau
-    réglage ; dès qu'il est prêt, il prend le relais AU MÊME INSTANT du son, avec un fondu de 0,3 s. Les encodeurs ne sont
-    jamais arrêtés : les auditeurs restent connectés. En cas d'échecs répétés, les flux reprennent leur propre traitement."""
-    FADE = int(0.3 * SR) * 4
-
-    def __init__(self, eng, key):
-        self.eng, self.key = eng, key
-        self.q = queue.Queue(maxsize=300)
-        self.stop_ev = threading.Event()
-        self.lk = threading.Lock()
-        self.G = 0                                   # octets de son entrés dans le bus depuis sa création
-        self.cur = self.nxt = None
-        self.fails, self.t_fail0, self.refused = 0, 0.0, set()
-        threading.Thread(target=self.feed_loop, daemon=True).start()
-        threading.Thread(target=self.out_loop, daemon=True).start()
-
-    @property
-    def chain(self):
-        return self.cur["chain"] if self.cur else ""
-
-    def chain_now(self):
-        return fx_chain_for({"fxmode": self.key}) or "anull"
-
-    def push(self, blk):
-        try:
-            self.q.put_nowait(blk)
-        except queue.Full:
-            try:
-                self.q.get_nowait()
-                self.q.put_nowait(blk)
-            except (queue.Empty, queue.Full):
-                pass
-
-    def subscribers(self):
-        return [o for o in list(self.eng.outputs) if o.bus_key == self.key]
-
-    # --- un processus de traitement
-    def spawn(self, chain):
-        st = {"chain": chain, "G0": None, "buf": bytearray(), "out": 0, "pushed": 0, "dead": False, "err": deque(maxlen=6),
-              "inq": queue.Queue(maxsize=400), "t0": time.time(), "p": None}
-        try:
-            st["p"] = popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "s16le", "-ar", str(SR),
-                             "-ac", "2", "-i", "pipe:0", "-af", chain, "-ar", str(SR), "-ac", "2", "-f", "s16le", "pipe:1"],
-                            bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError as ex:
-            st["err"].append(str(ex))
-            st["dead"] = True
-            return st
-        p = st["p"]
-        threading.Thread(target=Engine.drain, args=(p, st["err"]), daemon=True).start()
-
-        def writer():
-            while not st["dead"]:
-                try:
-                    blk = st["inq"].get(timeout=0.2)
-                except queue.Empty:
-                    if p.poll() is not None:
-                        break
-                    continue
-                try:
-                    p.stdin.write(blk)
-                except (OSError, ValueError):
-                    break
-            try:
-                p.stdin.close()
-            except Exception:
-                pass
-
-        def reader():
-            carry = b""
-            while True:
-                try:
-                    data = p.stdout.read(8192)
-                except Exception:
-                    data = b""
-                if not data:
-                    break
-                data = carry + data
-                n = len(data) // 4 * 4
-                data, carry = data[:n], data[n:]
-                if data:
-                    with self.lk:
-                        st["buf"] += data
-                        st["out"] += len(data)
-                        if len(st["buf"]) > 40 * SR * 4:          # (sécurité) jamais plus de 40 s en attente
-                            cut = len(st["buf"]) - 30 * SR * 4
-                            del st["buf"][:cut]
-                            st["pushed"] += cut
-            st["dead"] = True
-        threading.Thread(target=writer, daemon=True).start()
-        threading.Thread(target=reader, daemon=True).start()
-        return st
-
-    def kill(self, st):
-        if st is None:
-            return
-        st["dead"] = True
-        if st.get("p") is not None:
-            stop_proc(st["p"])
-
-    def feed_loop(self):
-        while not self.stop_ev.is_set():
-            try:
-                blk = self.q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            with self.lk:
-                for st in (self.cur, self.nxt):
-                    if st is None or st["dead"]:
-                        continue
-                    if st["G0"] is None:
-                        st["G0"] = self.G
-                    try:
-                        st["inq"].put_nowait(blk)
-                    except queue.Full:
-                        pass
-                self.G += len(blk)
-
-    def send(self, data):
-        if data:
-            for o in self.subscribers():
-                o.push(data)
-
-    def out_loop(self):
-        last_chk = 0.0
-        while not self.stop_ev.is_set():
-            time.sleep(0.01)
-            now = time.time()
-            if now - last_chk > 0.4:                         # le réglage a-t-il changé ?
-                last_chk = now
-                want = self.chain_now()
-                with self.lk:
-                    pending = self.nxt["chain"] if self.nxt else (self.cur["chain"] if self.cur else None)
-                if want != pending and want not in self.refused:
-                    st = self.spawn(want)
-                    with self.lk:
-                        if self.cur is None:
-                            self.cur = st
-                        else:
-                            old, self.nxt = self.nxt, st
-                            self.kill(old)
-            with self.lk:
-                cur, nxt = self.cur, self.nxt
-                out = b""
-                switched = False
-                if nxt is not None and nxt["dead"] and nxt["out"] == 0:       # nouveau réglage refusé par ffmpeg
-                    self.refused.add(nxt["chain"])
-                    self.nxt = None
-                    why = next((l for l in reversed(list(nxt["err"])) if l), "réglage refusé")
-                    self.eng.log(f"Traitement son : nouveau réglage impossible ({why[:120]}) : l'ancien continue.")
-                elif cur is not None and nxt is not None and nxt["G0"] is not None and cur["G0"] is not None:
-                    X = cur["G0"] + cur["pushed"]             # instant (dans le son d'entrée) du prochain octet à diffuser
-                    j = max(nxt["pushed"], X - nxt["G0"])    # le même instant dans la sortie du nouveau réglage
-                    j -= j % 4
-                    have_cur = len(cur["buf"])
-                    aligned = X >= nxt["G0"] and nxt["out"] >= j + self.FADE and (have_cur >= self.FADE or cur["dead"])
-                    forced = nxt["out"] >= self.FADE and (now - nxt["t0"] > 6 or cur["dead"])
-                    if aligned or forced:
-                        if not aligned:                       # (très rare) le nouveau ne rattrape pas : on prend le plus récent
-                            j = max(nxt["pushed"], nxt["out"] - self.FADE)
-                            j -= j % 4
-                        del nxt["buf"][:j - nxt["pushed"]]
-                        nxt["pushed"] = j
-                        f = min(self.FADE, len(nxt["buf"]), have_cur)
-                        f -= f % 4
-                        a_, b_ = bytes(cur["buf"][:f]), bytes(nxt["buf"][:f])
-                        del nxt["buf"][:f]
-                        nxt["pushed"] += f
-                        out = mix_blocks(a_, b_, 0.0, 1.0) if f else b""
-                        out += bytes(nxt["buf"])
-                        nxt["pushed"] += len(nxt["buf"])
-                        nxt["buf"].clear()
-                        self.cur, self.nxt = nxt, None
-                        self.kill(cur)
-                        switched = True
-                    else:
-                        # en attendant que le nouveau réglage soit prêt : l'ancien continue, en gardant 0,35 s en réserve pour
-                        # le fondu ; si le nouveau a plus de retard (AGC ajouté), l'ancien patiente (≈ 1 s) au lieu de répéter
-                        lag = nxt["out"] > 0 and X >= nxt["G0"] and nxt["out"] < j + self.FADE
-                        keep = have_cur if lag else min(have_cur, self.FADE + SR * 4 // 20)
-                        n = have_cur - keep
-                        n -= n % 4
-                        if n > 0:
-                            out = bytes(cur["buf"][:n])
-                            del cur["buf"][:n]
-                            cur["pushed"] += n
-                        switched = None
-                if switched is False and self.cur is not None and self.cur["buf"]:
-                    c = self.cur
-                    out = bytes(c["buf"])
-                    c["pushed"] += len(out)
-                    c["buf"].clear()
-                dead_cur = self.cur is not None and self.cur["dead"] and not self.cur["buf"] and self.nxt is None
-            self.send(out)
-            if switched:
-                self.eng.log("Traitement son appliqué en direct, sans couper les flux (fondu de 0,3 s).")
-            if dead_cur and not self.stop_ev.is_set():
-                err = list(self.cur["err"])
-                self.fails = self.fails + 1 if now - self.t_fail0 < 60 else 1
-                if self.fails == 1:
-                    self.t_fail0 = now
-                self.eng.log("Traitement son interrompu" + (f" ({err[-1][:100]})" if err else "") + " : relance.")
-                if self.fails >= 3:                    # on n'insiste pas : chaque flux reprend son propre traitement
-                    self.eng.bus_bad.add(self.key)
-                    self.eng.log("Traitement son partagé abandonné : chaque flux applique son propre traitement.")
-                    for o in self.subscribers():
-                        threading.Thread(target=lambda o=o: (o.stop(), time.sleep(1.5), o.start()), daemon=True).start()
-                    break
-                with self.lk:
-                    self.cur = self.spawn(self.chain_now())
-
-    def stop(self):
-        self.stop_ev.set()
-        with self.lk:
-            for st in (self.cur, self.nxt):
-                self.kill(st)
-
-
 class Output:
     """Une destination : chaque sortie a son propre encodeur et sa reconnexion."""
 
@@ -2328,7 +2435,6 @@ class Output:
         self.t_live = 0.0
         self.had_error = False
         self.meta_note = ""
-        self.bus_key = None                # traitement du son partagé : ce flux reçoit le son déjà traité par le bus
 
     @property
     def name(self):
@@ -2444,11 +2550,10 @@ class Output:
                 break
 
     def filters(self):
-        key = fx_key(self.cfg)
-        wanted = getattr(self.eng, "bus_wanted", None)
-        self.bus_key = key if (wanted and wanted(key)) else None
-        chain = None if self.bus_key else fx_chain_for(self.cfg)
-        f = ",".join(x for x in (chain, PROCESSING.get(self.cfg.get("processing", "Aucun"), "")) if x)
+        # son traité par le processeur d'antenne : pas de second traitement dans l'encodeur (il recompresserait)
+        if getattr(self.eng, "proc", None) is not None and out_processed(self.cfg):
+            return []
+        f = PROCESSING.get(self.cfg.get("processing", "Aucun"), "")
         return ["-af", f] if f else []
 
     @staticmethod
@@ -3107,7 +3212,8 @@ class EngineWorker:
                 "pl_out": e.pl_out, "in_peak": pin, "peak": pout, "clip_t": e.clip_t, "proc_ms": e.proc_ms, "late": e.late,
                 "slow": e.slow_now(), "mix_g": e.mix_g, "carts": st, "loading": set(loading),
                 "voices": [(v["id"], bool(v["stopping"])) for v in list(e.voices)],
-                "outs": [(o.cfg.get("id"), o.state, o.detail, o.t_live) for o in outs], "cmon": e.cmon.label}
+                "outs": [(o.cfg.get("id"), o.state, o.detail, o.t_live) for o in outs], "cmon": e.cmon.label,
+                "pm": dict(e.pm) if e.pm else {}}
 
     def sender(self):
         """Seul fil qui écrit vers l'interface (une connexion ne supporte pas deux écritures simultanées)."""
@@ -3152,6 +3258,7 @@ class EngineWorker:
             return
         elif k == "fx":
             FX.update(m[1])
+            e.set_processor(FX.get("proc"), FX.get("bypass"))
         elif k == "call":
             getattr(e, m[1])(*m[2], **m[3])
         elif k == "set":
@@ -3441,7 +3548,7 @@ class EngineProxy:
                    "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
                    "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": [],
                    "air": False, "monitor": False, "listen": False, "cap_state": "off", "cap_err": "",
-                   "src_dev": (prof.get("source") or {}).get("device", "")}
+                   "src_dev": (prof.get("source") or {}).get("device", ""), "pm": {}}
         d["in_peak"], d["peak"] = [-90.0, -90.0], [-90.0, -90.0]
         d["pid"] = slot.pid
 
@@ -3717,6 +3824,14 @@ class EngineProxy:
     def set_cart_live(self, cid, **kw):
         self._call("set_cart_live", cid, **kw)
 
+    def set_processor(self, params=None, bypass=None):
+        """Réglages du processeur d'antenne / bypass : envoyés tout de suite au moteur (appliqués au bloc suivant)."""
+        if params is not None:
+            FX["proc"] = params
+        if bypass is not None:
+            FX["bypass"] = bool(bypass)
+        self._send(("noop",))
+
     def set_out_fx(self, modes):
         for o in self.outputs:
             m = modes.get(o.cfg.get("id"))
@@ -3743,7 +3858,7 @@ class EngineProxy:
 
 
 from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal, QElapsedTimer)
-from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence,
+from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QFontMetricsF, QIcon, QImage, QKeySequence,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QWidgetAction
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -5607,6 +5722,7 @@ class SeaScene(QWidget):
         self.bgc = bg or RAIL
         self.setFixedSize(w, h)
         self.air, self.t, self.n, self.lx = False, 0.0, 0, light_x
+        self.mode = False                       # False (tout roule) / "secours" / "flux" / "son"
         rnd = random.Random(11)
         self.stars = [[rnd.uniform(8, w - 8), rnd.uniform(3, h * .38), 0] for _ in range(11)]
         self.sc = ["#3D6A92", "#6E9CC8", "#BFD7F2", "#2A4C6E"]
@@ -5648,12 +5764,23 @@ class SeaScene(QWidget):
         p.setBrush(QColor(self.bgc))
         p.drawEllipse(QRectF(mx - 3 * s, my - 10 * s, 14 * s, 16 * s))
         ly = sea - 54 * s - 5.5 * s
-        ph = t * (2.1 if self.air else 1.0)
-        beam = mixc(self.bgc, "#FFE9A8", .20)
-        for sg in (1, -1):
-            tip = lx + sg * w * .95 * math.cos(ph)
-            hh = (2.5 + 9 * abs(math.sin(ph))) * s
-            self.poly(p, beam, lx, ly, tip, ly - hh, tip, ly + hh)
+        mode = self.mode if self.air or self.mode else False
+        ph = t * {"secours": 3.0, "flux": 0.0, "son": 0.6}.get(mode, 2.1 if self.air else 1.0)
+        lit = True
+        if mode == "flux":                       # rupture : le phare ne tourne plus, il lance des éclats rouges d'alarme
+            k = (t / .9) % 1.0
+            lit = k < .12 or .24 < k < .36
+            beam = mixc(self.bgc, "#FF3150", .38 if lit else .06)
+            for sg in (1, -1):
+                hh = 7 * s
+                self.poly(p, beam, lx, ly, lx + sg * w * .95, ly - hh, lx + sg * w * .95, ly + hh)
+        else:
+            beam = mixc(self.bgc, {"secours": "#FFD23F", "son": "#FF7A1A"}.get(mode, "#FFE9A8"),
+                        {"secours": .34, "son": .12}.get(mode, .20))
+            for sg in (1, -1):
+                tip = lx + sg * w * .95 * math.cos(ph)
+                hh = (2.5 + 9 * abs(math.sin(ph))) * s
+                self.poly(p, beam, lx, ly, tip, ly - hh, tip, ly + hh)
         self.poly(p, "#1B2B3A", lx - 19 * s, h, lx - 14 * s, sea + 2 * s, lx - 7 * s, sea - 7 * s, lx + 6 * s, sea - 8 * s, lx + 14 * s, sea + 2 * s, lx + 20 * s, h)
         y0, y1 = sea - 6 * s, sea - 54 * s
         self.poly(p, "#EAF0F6", lx - 6 * s, y0, lx + 6 * s, y0, lx + 3.6 * s, y1, lx - 3.6 * s, y1)
@@ -5662,7 +5789,13 @@ class SeaScene(QWidget):
         self.poly(p, "#C8452D", lx - wa * s, ya, lx + wa * s, ya, lx + wb * s, yb, lx - wb * s, yb)
         p.setBrush(QColor("#2A3A4A"))
         p.drawRect(QRectF(lx - 6 * s, y1 - 2 * s, 12 * s, 3 * s))
-        p.setBrush(QColor("#FFE08A" if abs(math.sin(ph)) > .7 else "#E0A93C"))
+        if mode == "flux":
+            lamp = "#FF5A6E" if lit else "#5A1A24"
+        elif mode == "secours":
+            lamp = "#FFF2B0" if abs(math.sin(ph)) > .7 else "#FFD23F"
+        else:
+            lamp = "#FFE08A" if abs(math.sin(ph)) > .7 else "#E0A93C"
+        p.setBrush(QColor(lamp))
         p.drawRect(QRectF(lx - 3.6 * s, y1 - 9 * s, 7.2 * s, 7 * s))
         self.poly(p, "#2A3A4A", lx - 5 * s, y1 - 9 * s, lx + 5 * s, y1 - 9 * s, lx, y1 - 15 * s)
         W = int(w)
@@ -5771,23 +5904,29 @@ class AuroraBar(QWidget):
 
 
 ONAIR_RED, ONAIR_RED2 = "#ff3150", "#e0123a"        # rouge « ON AIR » des studios : la couleur universelle de l'antenne
+SECOURS_Y = "#ffd23f"                                # jaune « playlist de secours à l'antenne »
 
 
 class AirWaves(QWidget):
-    """Phare d'antenne, version moderne : silhouette épurée qui émet des ondes ambre, comme le logo de Bev, avec un halo
-    qui respire. Éteint hors antenne ; orange si plus de son ; rouge en cas de rupture."""
+    """Phare d'antenne : une animation par état, reconnaissable d'un coup d'œil, même de loin.
+      - tout roule : ondes ambre émises calmement depuis la lanterne, halo qui respire ;
+      - playlist de secours (jaune) : la lanterne tourne, son faisceau balaie l'horizon comme un vrai phare ;
+      - flux coupés (rouge) : alarme, la lanterne flashe par paires, les ondes se brisent et grésillent ;
+      - plus de son (orange) : les ondes reviennent vers la lanterne, comme si le phare tendait l'oreille.
+    Éteint et immobile hors antenne."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(58, 54)
         self.on, self.bad, self.t = False, False, 0.0
         self.setToolTip("Phare d'antenne")
-        Ticker.add(self, self.step, 30)
+        Ticker.add(self, self.step, 60)
 
     def set(self, on, bad=False):
         if (on, bad) != (self.on, self.bad):
             self.on, self.bad = on, bad
-            self.setToolTip("Phare d'antenne : " + ({"son": "pas de son en entrée", "flux": "rupture de flux"}.get(bad, "panne") if bad
+            self.setToolTip("Phare d'antenne : " + ({"son": "pas de son en entrée", "flux": "rupture de flux",
+                                                     "secours": "playlist de secours à l'antenne"}.get(bad, "panne") if bad
                                                     else ("à l'antenne, tout va bien" if on else "hors antenne")))
             self.update()
 
@@ -5795,44 +5934,105 @@ class AirWaves(QWidget):
         self.t = t
         return self.on or bool(self.bad)
 
+    @staticmethod
+    def arc(p, cx, top, sd, dx, hh, bul):
+        x0 = cx + sd * dx
+        pa = QPainterPath(QPointF(x0, top - hh))
+        pa.cubicTo(QPointF(x0 + sd * bul / .75, top - hh * .25), QPointF(x0 + sd * bul / .75, top + hh * .25), QPointF(x0, top + hh))
+        p.drawPath(pa)
+
     def paintEvent(self, e):
         p = new_painter(self)
-        t = self.t
-        act = self.on or bool(self.bad)
-        col = QColor(ONAIR_RED if self.bad == "flux" else ("#ff9a1f" if self.bad == "son" else "#ffb03b"))
+        t = self.t if ANIM else 0.0
+        mode = self.bad or ("ok" if self.on else "off")
+        act = mode != "off"
+        col = QColor({"flux": ONAIR_RED, "son": "#ff7a1a", "secours": SECOURS_Y}.get(mode, "#ffb03b"))
         cx, top, base = 29.0, 13.0, 51.0
         dim = QColor("#4a5266" if not LIGHT else "#b4bac6")
-        # ondes comme sur le logo : deux arcs de chaque côté de la lanterne, émis l'un après l'autre (de l'intérieur vers
-        # l'extérieur) à l'antenne ; immobiles et discrets hors antenne
-        per = .9 if self.bad else 1.5
-        ph = (t / per) % 1.0 if (act and ANIM) else None
+        shake = 0.0
+        lamp = 1.0
+        if mode == "flux":                                   # alarme : double flash rouge toutes les 0,9 s, léger tremblement
+            ph = (t / .9) % 1.0
+            lamp = 1.0 if (ph < .12 or .24 < ph < .36) else .18
+            shake = (math.sin(t * 61) * .55) if (ANIM and lamp > .5) else 0.0
+        elif mode == "son":
+            lamp = .45 + .35 * (math.sin(t * 2.2) + 1) / 2
+        elif mode == "secours":
+            lamp = .75 + .25 * abs(math.cos(t * 2.4))
+        p.translate(shake, 0)
+        # halo de la lanterne
         if act:
-            halo = QRadialGradient(cx, top, 12)
-            br = .55 + .45 * math.sin(math.pi * ph) if ph is not None else .8
-            halo.setColorAt(0, qc(col.name(), int(120 * br)))
+            rad = 13 if mode != "flux" else 17
+            halo = QRadialGradient(cx, top, rad)
+            br = (.55 + .45 * math.sin(t * 2.6) ** 2) if mode == "ok" else lamp
+            halo.setColorAt(0, qc(col.name(), int(140 * br)))
             halo.setColorAt(1, qc(col.name(), 0))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(halo))
-            p.drawEllipse(QPointF(cx, top), 12, 12)
+            p.drawEllipse(QPointF(cx, top), rad, rad)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        for i, (dx, hh, bul) in enumerate(((9.5, 7.5, 2.4), (15.0, 11.0, 4.2))):
-            if not act:
-                a = .35
-                c = dim
-            elif ph is None:
-                a, c = 1.0, col
-            else:                                         # chaque onde s'allume puis s'éteint, la suivante prend le relais
-                d = (ph - i * .28) % 1.0
-                a = .28 + .72 * max(0.0, 1 - abs(d - .25) / .3) if d < .6 else .28
-                c = col
-            pc = QColor(c)
-            pc.setAlphaF(_cl(a))
-            p.setPen(ppen(pc, 2.1 if i == 0 else 2.0, Qt.PenCapStyle.RoundCap))
-            for sd in (-1, 1):
-                x0 = cx + sd * dx
-                pa = QPainterPath(QPointF(x0, top - hh))
-                pa.cubicTo(QPointF(x0 + sd * bul / .75, top - hh * .25), QPointF(x0 + sd * bul / .75, top + hh * .25), QPointF(x0, top + hh))
-                p.drawPath(pa)
+        waves = ((9.5, 7.5, 2.4), (15.0, 11.0, 4.2), (20.5, 14.0, 5.6))
+        if mode == "secours":
+            # faisceau tournant : deux pinceaux de lumière qui balaient l'horizon (de face, il s'étale ; de profil, il s'affine)
+            th = t * 2.4
+            for sd in (1, -1):                                       # deux pinceaux opposés, comme une vraie lanterne
+                k = abs(math.cos(th))
+                L = 6 + 24 * k
+                hw = 1.6 + 5.5 * (1 - k)
+                near = (math.sin(th) * sd) > 0                        # celui qui nous fait face est plus lumineux
+                al = int((235 if near else 120) * (.45 + .55 * k))
+                g = QLinearGradient(cx, top, cx + sd * L, top)
+                g.setColorAt(0, qc(col.name(), al))
+                g.setColorAt(.7, qc(col.name(), int(al * .35)))
+                g.setColorAt(1, qc(col.name(), 0))
+                beam = QPainterPath(QPointF(cx, top - 1.8))
+                beam.lineTo(QPointF(cx + sd * L, top - hw))
+                beam.lineTo(QPointF(cx + sd * L, top + hw))
+                beam.lineTo(QPointF(cx, top + 1.8))
+                beam.closeSubpath()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(g))
+                p.drawPath(beam)
+            # éclat quand le faisceau passe face à nous
+            face = max(0.0, abs(math.sin(th)) - .92) / .08
+            if face > 0:
+                p.setBrush(qc("#ffffff", int(160 * face)))
+                p.drawEllipse(QPointF(cx, top), 6 + 3 * face, 6 + 3 * face)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for i, (dx, hh, bul) in enumerate(waves[:2]):            # ondes discrètes, immobiles
+                pc = QColor(col)
+                pc.setAlphaF(.22)
+                p.setPen(ppen(pc, 1.8, Qt.PenCapStyle.RoundCap))
+                for sd in (-1, 1):
+                    self.arc(p, cx, top, sd, dx, hh, bul)
+        else:
+            for i, (dx, hh, bul) in enumerate(waves):
+                if not act:
+                    if i == 2:
+                        continue
+                    a, c = .35, dim
+                elif mode == "ok":                                   # émission : de l'intérieur vers l'extérieur
+                    d_ = ((t / 1.6) - i * .26) % 1.0
+                    a = .2 + .8 * max(0.0, 1 - abs(d_ - .22) / .28) if d_ < .62 else .2
+                    a *= (1.0, 1.0, .75)[i]
+                    c = col
+                elif mode == "son":                                  # retour : de l'extérieur vers la lanterne
+                    d_ = ((t / 2.0) - (2 - i) * .26) % 1.0
+                    a = .12 + .6 * max(0.0, 1 - abs(d_ - .22) / .28) if d_ < .62 else .12
+                    c = col
+                else:                                                # flux coupés : ondes brisées qui grésillent
+                    fl = .5 + .5 * math.sin(t * 23 + i * 2.1) * math.sin(t * 7.3 + i)
+                    a = (.25 + .65 * fl) * (1.0 if lamp > .5 else .55)
+                    c = col
+                pc = QColor(c)
+                pc.setAlphaF(_cl(a))
+                pen = ppen(pc, 2.1 if i == 0 else 2.0, Qt.PenCapStyle.RoundCap)
+                if mode == "flux":
+                    pen.setDashPattern([1.6, 1.4 + i * .6])
+                    pen.setDashOffset(t * 9 * (1 if i % 2 else -1))
+                p.setPen(pen)
+                for sd in (-1, 1):
+                    self.arc(p, cx, top, sd, dx, hh, bul)
         # tour : silhouette fine, deux bandes, lanterne
         body = QPainterPath(QPointF(cx - 3.6, 19))
         body.lineTo(QPointF(cx + 3.6, 19))
@@ -5849,7 +6049,10 @@ class AirWaves(QWidget):
             for y0 in (26, 37):
                 p.drawRect(QRectF(cx - 8, y0, 16, 4.5))
             p.restore()
-        p.setBrush(col if act else mixc(dim, PAGE, .2))
+        lc = QColor(col) if act else mixc(dim, PAGE, .2)
+        if act:
+            lc = mixc(QColor("#3a2a10"), col, lamp)
+        p.setBrush(lc)
         p.drawRoundedRect(QRectF(cx - 3.2, top - 3.2, 6.4, 6.4), 1.6, 1.6)
         p.setBrush(QColor("#2a3040") if act else dim)
         p.drawRoundedRect(QRectF(cx - 5.5, top + 3.4, 11, 2.4), 1.2, 1.2)
@@ -6043,6 +6246,12 @@ class Rail(NavBase):
         if self.sea:
             self.sea.air = self.air
 
+    def set_alert(self, mode):
+        """État du phare du menu : tout roule, playlist de secours, flux coupés ou plus de son."""
+        if self.sea and self.sea.mode != mode:
+            self.sea.mode = mode
+            self.sea.update()
+
     def key_at(self, y):
         for k, _ in self.LAYOUT:
             if k != "sec" and self.pos[k] <= y < self.pos[k] + self.RH:
@@ -6160,7 +6369,7 @@ class Rail(NavBase):
             p.setPen(QColor(TXT if (on or hv) else LABEL_C))
             tx = 62 + (3 if hv else 0)
             p.drawText(QRectF(tx, y, w - 70, self.RH), Qt.AlignmentFlag.AlignVCenter, lab)
-            if k == "son":                                  # étiquette BÊTA
+            if k == "son" and False:                        # (ancienne étiquette BÊTA : le traitement son est sorti de bêta)
                 bx = tx + QFontMetrics(lf).horizontalAdvance(lab) + 6
                 bf = QFont(self.font())
                 bf.setPointSizeF(6.4)
@@ -8246,7 +8455,7 @@ Problèmes fréquents
 """
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
 
 
@@ -8431,9 +8640,9 @@ class AssistantKB:
                     "puis choisis « Son de l'ordinateur » dans la liste des entrées.")
         add("Son saturé", ["sature", "clip", "distorsion", "trop fort", "grésille", "gresille", "craque", "ecrete", "rouge"],
             lambda: "Son saturé (CLIP) : baisse le gain d'entrée de quelques dB et vérifie que la table de mixage ne sature pas déjà. Vise des crêtes autour de -6 dB. "
-                    "Un limiteur doux est disponible dans le traitement du son (page « Traitement son »).")
+                    "Le processeur d'antenne (page « Traitement son ») tient le niveau et garantit le plafond : vérifie qu'il n'est pas en bypass.")
         add("Son trop faible", ["trop faible", "trop bas", "volume bas", "pas assez fort", "niveau bas", "gain"],
-            lambda: "Son trop faible : monte le gain d'entrée (+6 dB max), ou active le traitement du son (page « Traitement son » : normalisation / limiteur) pour une écoute plus homogène.")
+            lambda: "Son trop faible : monte le gain d'entrée (+6 dB max), ou choisis un préréglage plus dense dans « Traitement son » (son AGC ramène les sources faibles au bon niveau).")
         add("Écho / larsen", ["echo", "larsen", "retour", "eco", "double son", "on s'entend"],
             lambda: "Écho ou larsen : coupe le haut-parleur d'écoute pendant les prises de parole, ou écoute au casque. Si l'écho vient des auditeurs, ils entendent leur radio avec le retard "
                     "du flux (10 à 30 s) : demande-leur de couper leur poste.")
@@ -14103,8 +14312,25 @@ class PagesMixin1:
         return pg
 
 # ------------------------------------------------------------------ Traitement du son
+PROC_INFO = {
+    "Généraliste": "Variété, programmation mixte : dense mais naturel, voix et musique au même niveau.",
+    "Talk-show": "Émissions parlées, plateaux, interviews : voix présentes et régulières, souffle et graves tenus.",
+    "Info (news)": "Journaux, flashs, chroniques : intelligibilité maximale, niveau parfaitement constant.",
+    "Classique": "Musique classique : dynamique respectée, AGC très lente, aucun écrêtage.",
+    "Jazz & acoustique": "Jazz, folk, musique trad' : traitement léger, timbres et respiration préservés.",
+    "Pop / Hits": "Hits, pop, électro : brillant, punchy, volume perçu élevé.",
+    "Rock": "Rock, guitares : médiums denses, attaque des batteries conservée.",
+    "Urbain": "Rap, R'n'B, afro : graves profonds et tenus, voix devant.",
+    "Loud": "Volume perçu maximal (style FM commerciale) : très dense, écrêtage poussé.",
+    "Protection seule": "Aucune couleur : juste le limiteur final qui garantit le plafond.",
+}
+PROC_OLD = {"Voix parlée": "Talk-show", "Musique": "Généraliste", "Radio punchy": "Pop / Hits", "Doux (nuit)": "Classique",
+            "Neutre": "Protection seule"}
+PROC_SHORT = ("Graves", "Bas-méd.", "Médium", "Présence", "Aigus")
+
+
 class EQCurve(QWidget):
-    """Courbe de réponse de l'égaliseur."""
+    """Courbe de l'égalisation du processeur (coupe-bas, graves, présence, air, filtre FM) et repères des 5 bandes."""
 
     def __init__(self):
         super().__init__()
@@ -14115,12 +14341,22 @@ class EQCurve(QWidget):
 
     @staticmethod
     def db_at(f, v):
+        num = lambda k: float(v.get(k, 0) or 0)
         r = 0.0
-        r += float(v.get("bass", 0)) / (1 + (f / 150.0) ** 2)
-        r += float(v.get("treble", 0)) * (f / 6000.0) ** 2 / (1 + (f / 6000.0) ** 2)
-        r += float(v.get("mid", 0)) * math.exp(-(math.log2(f / 1600.0) / 0.9) ** 2)
-        if v.get("hp"):
-            r -= 12 * math.log10(1 + (70.0 / f) ** 4) / 1.2
+        if num("hpf") > 0:
+            r -= 10 * math.log10(1 + (num("hpf") / f) ** 8)
+        b = num("bass")
+        if abs(b) > .05:
+            x = (90.0 / f) ** 2
+            r += 10 * math.log10((1 + 10 ** (b / 10) * x) / (1 + x))
+        r += num("presence") * math.exp(-(math.log2(f / 3200.0) / 0.8) ** 2)
+        a = num("air")
+        if abs(a) > .05:
+            x = (f / 11000.0) ** 2
+            r += 10 * math.log10((1 + 10 ** (a / 10) * x) / (1 + x))
+        if v.get("fm15") and f > 14700:
+            u = min(1.0, (f - 14700.0) / 1000.0)
+            r += 20 * math.log10(max(1e-3, math.cos(u * math.pi / 2) ** 2))
         return r
 
     def set(self, vals):
@@ -14133,7 +14369,7 @@ class EQCurve(QWidget):
         x0, x1, y0, y1 = 34, W - 12, 8, H - 22
         grid = QColor("#d5d9e3" if LIGHT else "#2b3242")
         txt = QColor("#8a93a8" if LIGHT else "#6c7589")
-        fx = lambda f: x0 + (math.log10(f) - math.log10(30)) / (math.log10(16000) - math.log10(30)) * (x1 - x0)
+        fx = lambda f: x0 + (math.log10(f) - math.log10(20)) / (math.log10(20000) - math.log10(20)) * (x1 - x0)
         dy = lambda d: (y0 + y1) / 2 - d / 12.0 * (y1 - y0) / 2
         f8 = QFont(self.font())
         f8.setPointSizeF(7.5)
@@ -14148,9 +14384,12 @@ class EQCurve(QWidget):
             p.drawLine(QPointF(fx(f), y0), QPointF(fx(f), y1))
             p.setPen(txt)
             p.drawText(QRectF(fx(f) - 20, y1 + 3, 40, 14), Qt.AlignmentFlag.AlignCenter, l)
+        p.setPen(QPen(qc(ACC, 90), 1, Qt.PenStyle.DotLine))       # frontières des 5 bandes du multibande
+        for fc in P_XO:
+            p.drawLine(QPointF(fx(fc), y0), QPointF(fx(fc), y1))
         pts = []
-        for i in range(141):
-            f = 30 * (16000 / 30.0) ** (i / 140.0)
+        for i in range(161):
+            f = 20 * 1000 ** (i / 160.0)
             pts.append(QPointF(fx(f), dy(max(-12, min(12, self.db_at(f, self.vals))))))
         mid = dy(0)
         fill = QPainterPath()
@@ -14163,258 +14402,445 @@ class EQCurve(QWidget):
         stops = ("#4cc9f0", "#a76bff", "#ff5fa2") if PSYCHE else (ACC, ACC2, ACC)
         for i, c in enumerate(stops):
             g.setColorAt(i / 2, QColor(c))
-        fc = QBrush(g)
+        fc_ = QBrush(g)
         p.setPen(Qt.PenStyle.NoPen)
         p.setOpacity(.18)
-        p.setBrush(fc)
+        p.setBrush(fc_)
         p.drawPath(fill)
         p.setOpacity(1)
         line = QPainterPath()
         line.moveTo(pts[0])
         for q in pts[1:]:
             line.lineTo(q)
-        p.setPen(QPen(fc, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setPen(QPen(fc_, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(line)
 
 
-class PagesMixin2:
-    FXBOOL = ("on", "hp", "loud", "agc", "mono")
-    FXNUM = ("bass", "mid", "treble", "comp", "agc_lvl", "limit", "lufs", "nr", "deess", "excite", "width", "gain")
+class ProcMeters(QWidget):
+    """Vumètres du processeur, façon rack de diffusion : AGC (± dB), réduction de gain des 5 bandes, limiteur final,
+    écrêteur, et sonie de sortie (LUFS court terme / momentanée). Mis à jour 30 fois par seconde."""
 
-    def fx_slider(self, card, label, key, lo, hi, fmt):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(190)
+        self.setMinimumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.m, self.state = {}, "idle"
+        self.disp = {"agc": 0.0, "bagc": 0.0, "gr": [0.0] * 5, "lim": 0.0, "clip": 0.0}
+        self.hold = [0.0] * 7
+
+    def set(self, m, state):
+        self.state = state
+        if m:
+            self.m = m
+            d = self.disp
+            k = .45
+            d["agc"] += (m.get("agc", 0.0) - d["agc"]) * k
+            d["bagc"] += (m.get("bagc", 0.0) - d["bagc"]) * k
+            for i, v in enumerate(m.get("gr", [0.0] * 5)[:5]):
+                d["gr"][i] = v if v > d["gr"][i] else d["gr"][i] + (v - d["gr"][i]) * .25
+            for key in ("lim", "clip"):
+                v = m.get(key, 0.0)
+                d[key] = v if v > d[key] else d[key] + (v - d[key]) * .2
+            vals = d["gr"] + [d["lim"], d["clip"]]
+            self.hold = [max(v, h - .15) for v, h in zip(vals, self.hold)]
+        self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        W, H = self.width(), self.height()
+        txt, mut = QColor(TXT), QColor(MUT)
+        grid = QColor("#d5d9e3" if LIGHT else "#252c3c")
+        f = QFont(self.font())
+        f.setPixelSize(11)
+        fb = QFont(f)
+        fb.setBold(True)
+        top, bot = 22, H - 22
+        live = self.state in ("air", "input")
+        bypass = bool(self.m.get("bypass")) and live
+        d = self.disp
+
+        def label(x, w, s, y=None, col=mut, font=f):
+            p.setFont(font)
+            p.setPen(col)
+            p.drawText(QRectF(x + w / 2 - 40, (bot + 4) if y is None else y, 80, 16), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, s)
+
+        def bar(x, w, frac, col, zero_top=True, center=False, val=0.0, hold=None):
+            r = QRectF(x, top, w, bot - top)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(TRACK))
+            p.drawRoundedRect(r, 4, 4)
+            if not live:
+                return
+            c = QColor(col)
+            if bypass:
+                c.setAlphaF(.35)
+            p.setBrush(c)
+            if center:                                   # AGC : barre centrée sur 0 (vers le haut = gain ajouté)
+                mid = (top + bot) / 2
+                hgt = max(-1.0, min(1.0, frac)) * (bot - top) / 2
+                p.drawRoundedRect(QRectF(x, min(mid, mid - hgt), w, abs(hgt) + 1), 3, 3)
+                p.setPen(QPen(QColor(TXT), 1))
+                p.drawLine(QPointF(x - 2, mid), QPointF(x + w + 2, mid))
+            else:                                        # réduction de gain : descend depuis le haut
+                hgt = max(0.0, min(1.0, frac)) * (bot - top)
+                p.drawRoundedRect(QRectF(x, top, w, hgt + .5), 3, 3)
+                if hold is not None and hold > 0.05:
+                    hy = top + max(0.0, min(1.0, hold)) * (bot - top)
+                    p.setPen(QPen(QColor(TXT), 1.6))
+                    p.drawLine(QPointF(x + 1, hy), QPointF(x + w - 1, hy))
+        # échelle des réductions de gain (0 à -18 dB)
+        xs0 = 40
+        p.setFont(f)
+        for db in (0, 6, 12, 18):
+            y = top + db / 18 * (bot - top)
+            p.setPen(QPen(grid, 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(xs0 + 74, y), QPointF(W - 170, y))
+            p.setPen(mut)
+            p.drawText(QRectF(xs0 + 40, y - 7, 32, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "-%d" % db if db else "0")
+        # AGC
+        bw = 18
+        bar(10, bw, d["agc"] / 15.0, "#4cc9f0", center=True)
+        label(10, bw, "AGC")
+        bar(36, bw - 4, d["bagc"] / 6.0, "#35d49a", center=True)
+        label(36, bw - 4, "Gr.")
+        if live and not bypass:
+            p.setFont(fb)
+            p.setPen(txt)
+            p.drawText(QRectF(0, 2, 70, 16), Qt.AlignmentFlag.AlignLeft, "%+.1f dB" % d["agc"])
+            if self.m.get("gate"):
+                p.setPen(QColor("#ffb020"))
+                p.setFont(f)
+                p.drawText(QRectF(70, 2, 110, 16), Qt.AlignmentFlag.AlignLeft, "porte : figée")
+        # 5 bandes
+        x = xs0 + 82
+        span = max(220, W - 170 - x - 70)
+        step = span / 5
+        bw2 = min(34.0, step * .62)
+        cols = SEGCOL if callable(SEGCOL) else None
+        for i in range(5):
+            bx = x + i * step + (step - bw2) / 2
+            v = d["gr"][i]
+            col = grad(.15 + i * .17) if not cols else cols(min(1.0, v / 18))
+            bar(bx, bw2, v / 18.0, col, hold=self.hold[i] / 18.0)
+            label(bx, bw2, PROC_SHORT[i])
+            if live:
+                label(bx, bw2, "%.1f" % v, y=top - 18, col=txt if v > .3 else mut, font=fb)
+        # limiteur final et écrêteur
+        lx = x + span + 10
+        bar(lx, 22, d["lim"] / 6.0, ONAIR_RED, hold=self.hold[5] / 6.0)
+        label(lx, 22, "Lim.")
+        if live:
+            label(lx, 22, "%.1f" % d["lim"], y=top - 18, col=txt, font=fb)
+        bar(lx + 36, 22, min(1.0, d["clip"] / 8.0), "#ffb020", hold=min(1.0, self.hold[6] / 8.0))
+        label(lx + 36, 22, "Écr.")
+        # sonie
+        rx = W - 150
+        r = QRectF(rx, top, 140, bot - top)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(FIELD))
+        p.drawRoundedRect(r, 10, 10)
+        big = QFont(self.font())
+        big.setPixelSize(30)
+        big.setBold(True)
+        lu, lm = self.m.get("lufs", -70.0), self.m.get("lufs_m", -70.0)
+        p.setFont(f)
+        p.setPen(mut)
+        p.drawText(QRectF(rx, top + 8, 140, 16), Qt.AlignmentFlag.AlignHCenter, "SONIE DE SORTIE")
+        p.setFont(big)
+        p.setPen(QColor(ACCT) if live and lu > -60 else mut)
+        p.drawText(QRectF(rx, top + 26, 140, 40), Qt.AlignmentFlag.AlignHCenter, ("%.1f" % lu).replace("-", "−") if live and lu > -60 else "––")
+        p.setFont(f)
+        p.setPen(mut)
+        p.drawText(QRectF(rx, top + 66, 140, 16), Qt.AlignmentFlag.AlignHCenter, "LUFS · court terme (3 s)")
+        p.setFont(fb)
+        p.setPen(txt if live else mut)
+        p.drawText(QRectF(rx, top + 92, 140, 16), Qt.AlignmentFlag.AlignHCenter,
+                   ("momentané %.1f" % lm) if live and lm > -60 else "momentané ––")
+        out = self.m.get("out", -90.0)
+        p.setFont(f)
+        p.setPen(mut)
+        p.drawText(QRectF(rx, top + 112, 140, 16), Qt.AlignmentFlag.AlignHCenter,
+                   ("crête %.1f dBFS" % out) if live and out > -80 else "")
+        # état
+        msg = ""
+        if self.state == "idle":
+            msg = "En attente : mesures dès la diffusion ou le contrôle d'entrée"
+        elif self.state == "off":
+            msg = "Processeur indisponible (numpy absent) : le son part sans traitement"
+        elif self.state == "input":
+            msg = "Hors antenne : mesures sur l'entrée (rien n'est diffusé)"
+        elif bypass:
+            msg = "BYPASS : son brut à l'antenne"
+        if msg:
+            p.setFont(fb)
+            fm = QFontMetrics(fb)
+            tw = fm.horizontalAdvance(msg) + 24
+            cx = (xs0 + 82 + lx + 60) / 2
+            rr = QRectF(cx - tw / 2, (top + bot) / 2 - 15, tw, 30)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qc("#000000", 150) if not LIGHT else qc("#ffffff", 220))
+            p.drawRoundedRect(rr, 15, 15)
+            p.setPen(QColor("#ffb020") if bypass else txt)
+            p.drawText(rr, Qt.AlignmentFlag.AlignCenter, msg)
+
+
+class PagesMixin2:
+    """Page « Traitement son » : le processeur d'antenne, réglé en temps réel."""
+
+    # --- réglages enregistrés (self.data["proc"]) et migration de l'ancien traitement par pages A-D
+    def proc_load(self):
+        d = self.data.get("proc")
+        if not isinstance(d, dict) or not isinstance(d.get("params"), dict):
+            pages = self.data.get("fx_pages") or {}
+            old = pages.get(self.data.get("fx_page", "A")) or self.data.get("fx") or {}
+            name = PROC_OLD.get(old.get("preset"), PROC_DEFAULT)
+            d = {"params": proc_params(name), "bypass": bool(old) and not old.get("on", True)}
+            if old.get("mono"):
+                d["params"]["mono"] = True
+            self.data["proc"] = d
+        p = proc_params(d["params"].get("preset", PROC_DEFAULT))
+        p.update({k: v for k, v in d["params"].items() if k in PROC_BASE})
+        p["preset"] = d["params"].get("preset", PROC_DEFAULT)
+        p["custom"] = bool(d["params"].get("custom"))
+        d["params"] = p
+        FX["proc"] = json.loads(json.dumps(p))
+        FX["bypass"] = bool(d.get("bypass"))
+        return d
+
+    def proc_send(self):
+        """Envoi au moteur (au plus 25 fois par seconde pendant qu'on bouge un curseur) : appliqué au bloc audio suivant."""
+        FX["proc"] = json.loads(json.dumps(self.proc["params"]))
+        FX["bypass"] = bool(self.proc.get("bypass"))
+        e = self.engine
+        if e is not None and getattr(e, "running", False):
+            try:
+                e.set_processor(FX["proc"], FX["bypass"])
+            except Exception:
+                pass
+
+    def proc_changed(self, refresh=True):
+        if not hasattr(self, "_proc_tm"):
+            self._proc_tm = QTimer(self)
+            self._proc_tm.setSingleShot(True)
+            self._proc_tm.timeout.connect(self.proc_send)
+            self._proc_save_tm = QTimer(self)
+            self._proc_save_tm.setSingleShot(True)
+            self._proc_save_tm.timeout.connect(self.save_settings)
+        if not self._proc_tm.isActive():
+            self._proc_tm.start(40)
+        self._proc_save_tm.start(700)
+        if refresh:
+            self.proc_refresh()
+
+    def proc_slider(self, card, label, key, lo, hi, fmt, idx=None, scale=10, tip=""):
         h = QHBoxLayout()
         l = lab(label, "")
-        l.setFixedWidth(100)
+        l.setFixedWidth(134)
+        if tip:
+            l.setToolTip(tip)
         h.addWidget(l)
         sl = Slider(Qt.Orientation.Horizontal)
-        sl.setRange(int(lo * 10), int(hi * 10))
-        sl.setValue(int(round(float(self.fx[key]) * 10)))
+        sl.setRange(int(lo * scale), int(hi * scale))
         val = lab("", "")
-        val.setFixedWidth(78)
+        val.setFixedWidth(84)
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         val.setStyleSheet(f"color:{ACCT};font-weight:700;")
-        val.setText(fmt % (sl.value() / 10))
 
-        def moved(v, k=key):
-            val.setText(fmt % (v / 10))
-            if not self._fx_loading:
-                self.fxv[k] = v / 10
-                self.fx_changed(True)
+        def get():
+            v = self.proc["params"][key]
+            return float(v[idx] if idx is not None else v)
+
+        def moved(v):
+            x = v / scale
+            val.setText(fmt(x) if callable(fmt) else fmt % x)
+            if self._proc_loading:
+                return
+            pp = self.proc["params"]
+            if idx is not None:
+                t = list(pp[key])
+                t[idx] = x
+                pp[key] = t
+            else:
+                pp[key] = x
+            pp["custom"] = True
+            self.proc_changed()
         sl.valueChanged.connect(moved)
         h.addWidget(sl, 1)
         h.addWidget(val)
         card.lay.addLayout(h)
-        self.fxw[key] = (sl, val, fmt)
+        self.procw.append((sl, val, fmt, get, scale))
+        sl.setValue(int(round(get() * scale)))
+        val.setText(fmt(get()) if callable(fmt) else fmt % get())
+        return sl
 
-    def fx_switch(self, card, text, key):
+    def proc_switch(self, card, text, key, tip=""):
         w = Switch(text)
-        w.setChecked(bool(self.fx[key]))
+        if tip:
+            w.setToolTip(tip)
+        w.setChecked(bool(self.proc["params"].get(key)))
 
-        def tg(on, k=key):
-            if not self._fx_loading:
-                self.fxv[k] = bool(on)
-                self.fx_changed()
+        def tg(on):
+            if not self._proc_loading:
+                self.proc["params"][key] = bool(on)
+                self.proc["params"]["custom"] = True
+                self.proc_changed()
         w.toggled.connect(tg)
         card.lay.addWidget(w)
-        self.fxw[key] = (w,)
+        self.procs.append((w, key))
         return w
 
     def _page_son(self):
         pg = Page()
         g = pg.grid
         g.setColumnStretch(2, 1)
-        pages = self.data.get("fx_pages")
-        if not pages:
-            old = self.data.get("fx") or {}
-            pages = {}
-            for k in FX_LETTERS:
-                pn, on = FX_PAGES_DEFAULT[k]
-                pages[k] = dict(FX_PRESETS[pn], on=on, preset=pn, lufs=-16)
-            if old:
-                pages["A"].update({k: v for k, v in old.items() if k != "gate"})
-            self.data["fx_pages"] = pages
-        for k in FX_LETTERS:
-            p_ = pages.setdefault(k, dict(FX_DEFAULT))
-            for kk, v in dict(FX_DEFAULT).items():
-                p_.setdefault(kk, v)
-            p_.pop("gate", None)
-        self.fx_page = self.data.get("fx_page", "A") if self.data.get("fx_page", "A") in FX_LETTERS else "A"
-        self.fx = pages[self.fx_page]
-        self.data["fx"] = self.fx
-        self.fxv = {k: self.fx[k] for k in self.FXNUM + self.FXBOOL}
-        self.fxw, self._fx_loading, self.fx_dirty, self._fx_proc = {}, False, False, None
-        self.fx_names = list(FX_PRESETS)
-        top = Card("Traitement son", "Quatre préréglages A–D, attribuables flux par flux")
+        self.proc = self.proc_load()
+        self.procw, self.procs, self._proc_loading, self.proc_btns = [], [], True, {}   # (construction : rien n'est envoyé)
+        # --- en-tête : bypass, préréglages radio
+        top = Card("Processeur d'antenne", "Traitement temps réel de tout ce qui part à l'antenne : AGC, compresseur-limiteur "
+                   "5 bandes à phase linéaire, élargisseur stéréo, écrêteur suréchantillonné, limiteur sur les crêtes vraies.")
         h = WrapRow()
-        h.addWidget(lab("Page", "mut"))
-        self.seg_page = Segmented(list(FX_LETTERS), 52, 28)
-        self.seg_page.setValue(FX_LETTERS.index(self.fx_page))
-        self.seg_page.changed.connect(self.fx_page_switch)
-        h.addWidget(self.seg_page)
-        h.addSpacing(14)
-        self.sw_fxon = Switch("Page active")
-        self.sw_fxon.setChecked(bool(self.fx["on"]))
-        self.sw_fxon.toggled.connect(self.fx_on_toggled)
-        h.addWidget(self.sw_fxon)
+        self.btn_bypass = btn("", "primary", self.proc_toggle_bypass,
+                              "Bypass : le son brut part à l'antenne (bascule en fondu, sans coupure, même latence)")
+        self.btn_bypass.setMinimumSize(250, 40)
+        h.addWidget(self.btn_bypass)
+        h.addSpacing(10)
+        self.l_preset = lab("", "")
+        self.l_preset.setStyleSheet("font-size:15px;font-weight:800;")
+        h.addWidget(self.l_preset)
         h.addStretch(1)
-        self.l_fx = lab("", "mut")
-        h.addWidget(self.l_fx)
+        self.btn_preset_reset = btn("Revenir au préréglage", "", lambda: self.proc_preset(self.proc["params"]["preset"]),
+                                    "Annule les réglages fins et reprend le préréglage tel quel")
+        h.addWidget(self.btn_preset_reset)
         top.lay.addLayout(h)
-        h = WrapRow()
-        h.addWidget(lab("Style", "mut"))
-        short = {"Neutre": "Neutre", "Voix parlée": "Voix", "Musique": "Musique", "Radio punchy": "Punchy", "Doux (nuit)": "Nuit"}
-        self.seg_fx = Segmented([short.get(n, n) for n in self.fx_names], 78, 28)
-        self.seg_fx.setValue(self.fx_names.index(self.fx["preset"]) if self.fx.get("preset") in self.fx_names else 1)
-        self.seg_fx.changed.connect(lambda k: self.fx_apply_preset(self.fx_names[k], False))
-        h.addWidget(self.seg_fx)
-        h.addStretch(1)
-        h.addWidget(btn("Écouter (20 s)", "", self.fx_listen))
-        h.addWidget(btn("Stop", "", self.fx_stop))
-        h.addWidget(btn("Remettre à zéro", "", lambda: self.fx_apply_preset("Neutre", True)))
-        h.addWidget(btn("Appliquer aux flux", "primary", self.fx_push))
-        top.lay.addLayout(h)
-        self.l_fxinfo = lab("", "mut")
-        top.lay.addWidget(self.l_fxinfo)
+        fl = WrapRow(None, 8)
+        box = QWidget()
+        box.setLayout(fl)
+        for name in PROC_ORDER:
+            b = btn(name.replace("&", "&&"), "", lambda n=name: self.proc_preset(n), PROC_INFO.get(name, ""))
+            b.setMinimumHeight(34)
+            fl.addWidget(b)
+            self.proc_btns[name] = b
+        top.lay.addWidget(box)
+        self.l_preset_info = lab("", "mut", True)
+        top.lay.addWidget(self.l_preset_info)
         g.addWidget(top, 0, 0, 1, 3)
-        eq = Card("Égaliseur", "Correction tonale trois bandes")
+        # --- mesures
+        mc = Card("Mesures", "AGC, réduction de gain par bande, limiteur final, écrêteur et sonie de sortie")
+        self.proc_meters = ProcMeters()
+        mc.lay.addWidget(self.proc_meters, 1)
+        g.addWidget(mc, 1, 0, 1, 2)
+        # --- densité
+        dn = Card("Densité", "MOINS ↔ PLUS : plus dense = plus fort et plus régulier, moins dense = plus naturel")
+        self.proc_slider(dn, "Moins ↔ Plus", "lm", 1, 10, "%.1f", tip="Comme le réglage LESS-MORE d'un Optimod")
+        self.proc_switch(dn, "AGC (volume automatique lent)", "agc",
+                         "Ramène doucement toutes les sources au même niveau ; se fige dans les silences (porte)")
+        self.proc_slider(dn, "Vitesse AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau")
+        self.proc_slider(dn, "Porte AGC", "agc_gate", -60, -25, "%.0f dBFS",
+                         tip="Sous ce niveau (silence, souffle), l'AGC et le multibande se figent : pas de bruit qui remonte")
+        self.proc_slider(dn, "AGC des graves", "bass_agc", 0, 6, "±%.0f dB", tip="Équilibre automatique des graves entre les sources")
+        dn.lay.addStretch(1)
+        g.addWidget(dn, 1, 2)
+        # --- égalisation
+        eq = Card("Égalisation", "Phase linéaire : aucune coloration de phase, voix nettes")
         self.eqc = EQCurve()
         eq.lay.addWidget(self.eqc)
-        for l, k, lo, hi in (("Graves", "bass", -12, 12), ("Médiums", "mid", -12, 12), ("Aigus", "treble", -12, 12)):
-            self.fx_slider(eq, l, k, lo, hi, "%+.0f dB")
-        self.fx_switch(eq, "Couper sous 70 Hz (souffle, chocs)", "hp")
+        self.proc_slider(eq, "Coupe-bas", "hpf", 0, 120, lambda v: "aucun" if v < 1 else "%.0f Hz" % v, scale=1)
+        self.proc_slider(eq, "Graves (90 Hz)", "bass", -6, 6, "%+.1f dB")
+        self.proc_slider(eq, "Présence (3 kHz)", "presence", -6, 6, "%+.1f dB")
+        self.proc_slider(eq, "Air (11 kHz)", "air", -6, 6, "%+.1f dB")
+        self.proc_switch(eq, "Bande FM : rien au-dessus de 15 kHz", "fm15",
+                         "Indispensable si une sortie va vers un émetteur FM (protège le pilote stéréo à 19 kHz)")
         eq.lay.addStretch(1)
-        g.addWidget(eq, 1, 0)
-        dy = Card("Dynamique", "AGC, compression et loudness")
-        self.fx_switch(dy, "AGC : volume automatique", "agc")
-        self.fx_slider(dy, "Force AGC", "agc_lvl", 0, 100, "%.0f %%")
-        self.fx_slider(dy, "Compresseur", "comp", 0, 100, "%.0f %%")
-        self.fx_slider(dy, "Plafond", "limit", -9, 0, "%.1f dB")
-        self.fx_switch(dy, "Normaliser (loudness)", "loud")
-        self.fx_slider(dy, "Cible", "lufs", -23, -12, "%.0f LUFS")
-        dy.lay.addStretch(1)
-        g.addWidget(dy, 1, 1)
-        vx = Card("Voix et espace", "Débruitage, de-essing et image stéréo")
-        self.fx_slider(vx, "Anti-bruit", "nr", 0, 100, "%.0f %%")
-        self.fx_slider(vx, "Anti-sifflement", "deess", 0, 100, "%.0f %%")
-        self.fx_slider(vx, "Brillance", "excite", 0, 100, "%.0f %%")
-        self.fx_slider(vx, "Largeur stéréo", "width", 0, 150, "%.0f %%")
-        self.fx_slider(vx, "Gain de sortie", "gain", -12, 12, "%+.1f dB")
-        self.fx_switch(vx, "Mono (compatible autoradio / FM)", "mono")
-        vx.lay.addStretch(1)
-        g.addWidget(vx, 1, 2)
-        pf = Card("Un traitement par flux", "Préréglage ou style appliqué à chaque destination")
+        g.addWidget(eq, 2, 0)
+        # --- multibande
+        mb = Card("Multibande 5 bandes", "Compresseur-limiteur par bande : le « son » de l'antenne")
+        self.proc_switch(mb, "Compresseur multibande", "mb_on")
+        self.proc_slider(mb, "Attaque (drive)", "mb_drive", 0, 15, "%.1f dB")
+        self.proc_slider(mb, "Taux", "ratio", 1.2, 20, lambda v: "%.1f:1" % v)
+        self.proc_slider(mb, "Retour", "mb_release", 60, 1200, "%.0f ms", scale=1)
+        self.proc_slider(mb, "Couplage", "coupling", 0, 100, "%.0f %%", scale=1,
+                         tip="Couplage des bandes : haut = équilibre tonal respecté, bas = chaque bande vit sa vie (plus dense)")
+        for i, nm in enumerate(BAND_NAMES):
+            self.proc_slider(mb, "Niveau " + nm.lower(), "mix", -6, 6, "%+.1f dB", idx=i)
+        mb.lay.addStretch(1)
+        g.addWidget(mb, 2, 1)
+        # --- stéréo et sortie
+        so = Card("Stéréo et sortie", "Image stéréo, écrêteur et plafond garanti")
+        self.proc_slider(so, "Élargisseur", "width", 0, 100, "%.0f %%", scale=1,
+                         tip="Élargit l'image par bande ; le côté reste plafonné à 85 % du milieu (jamais d'image trouée, mono intact)")
+        self.proc_switch(so, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles vinyle, FM et enceintes mono")
+        self.proc_switch(so, "Sortie mono", "mono")
+        self.proc_slider(so, "Écrêteur", "clip", 0, 100, "%.0f %%", scale=1,
+                         tip="Écrêtage doux suréchantillonné x2 : plus de volume perçu ; 0 pour la musique classique")
+        self.proc_slider(so, "Plafond (crête vraie)", "ceiling", -3, -0.1, "%.1f dBTP",
+                         tip="Aucun échantillon ne dépasse ce niveau, même entre les échantillons (-1 dBTP recommandé pour les flux)")
+        self.proc_slider(so, "Retour limiteur", "lim_release", 30, 400, "%.0f ms", scale=1)
+        so.lay.addStretch(1)
+        g.addWidget(so, 2, 2)
+        # --- flux
+        pf = Card("Son envoyé à chaque flux", "Son traité par le processeur, ou son brut (ex. : enregistrement de sécurité)")
         self.fx_rows = QGridLayout()
         pf.lay.addLayout(self.fx_rows)
-        g.addWidget(pf, 2, 0, 1, 3)
-        g.setRowStretch(3, 1)
+        g.addWidget(pf, 3, 0, 1, 3)
+        g.setRowStretch(4, 1)
         self.fx_flux_rows()
-        self.fx_refresh()
-        self.fx_chains_update()
+        self._proc_loading = False
+        self.proc_refresh()
         return pg
 
-    def fx_chains_update(self):
-        FX["chains"] = {k: build_fx_chain(self.data["fx_pages"][k]) for k in FX_LETTERS}
-        FX["chain"] = FX["chains"]["A"]
+    def proc_preset(self, name):
+        if name not in PROC_PRESETS:
+            return
+        self.proc["params"] = proc_params(name)
+        self.proc["params"]["custom"] = False
+        self.proc_load_widgets()
+        self.proc_changed()
+        self.log(f"Traitement son : préréglage « {name} »" + (" (en direct)." if self.on_air else "."))
 
-    def fx_load_widgets(self):
-        """Recopie les valeurs de la page courante dans les curseurs."""
-        self._fx_loading = True
+    def proc_load_widgets(self):
+        self._proc_loading = True
         try:
-            for k in self.FXNUM:
-                self.fxv[k] = float(self.fx[k])
-                sl, val, fmt = self.fxw[k]
-                sl.setValue(int(round(self.fxv[k] * 10)))
-                val.setText(fmt % (sl.value() / 10))
-            for k in ("hp", "loud", "agc", "mono"):
-                self.fxv[k] = bool(self.fx[k])
-                self.fxw[k][0].setChecked(self.fxv[k])
-            self.fxv["on"] = bool(self.fx["on"])
-            self.sw_fxon.setChecked(self.fxv["on"])
-            self.seg_fx.setValue(self.fx_names.index(self.fx["preset"]) if self.fx.get("preset") in self.fx_names else 0)
+            for sl, val, fmt, get, scale in self.procw:
+                sl.setValue(int(round(get() * scale)))
+                val.setText(fmt(get()) if callable(fmt) else fmt % get())
+            for w, key in self.procs:
+                w.setChecked(bool(self.proc["params"].get(key)))
         finally:
-            self._fx_loading = False
+            self._proc_loading = False
 
-    def fx_page_switch(self, idx):
-        k = FX_LETTERS[idx]
-        self.fx_page = k
-        self.data["fx_page"] = k
-        self.fx = self.data["fx_pages"][k]
-        self.data["fx"] = self.fx
-        self.fx_load_widgets()
-        self.fx_refresh()
+    def proc_toggle_bypass(self):
+        self.proc["bypass"] = not self.proc.get("bypass")
+        self.proc_send()
         self.save_settings()
+        self.proc_refresh()
+        self.log("Traitement son : " + ("BYPASS, le son brut part à l'antenne." if self.proc["bypass"] else "processeur remis à l'antenne."))
 
-    def fx_on_toggled(self, on):
-        if not self._fx_loading:
-            self.fxv["on"] = bool(on)
-            self.fx_changed()
+    def proc_refresh(self):
+        pp = self.proc["params"]
+        name = pp.get("preset", PROC_DEFAULT)
+        custom = bool(pp.get("custom"))
+        byp = bool(self.proc.get("bypass"))
+        self.set_kind(self.btn_bypass, "○  BYPASS · son brut  (réactiver)" if byp else "●  TRAITEMENT À L'ANTENNE", "stop" if byp else "primary")
+        self.l_preset.setText(name + ("  · modifié" if custom else ""))
+        set_ss(self.l_preset, f"font-size:15px;font-weight:800;color:{MUT if byp else TXT};")
+        self.btn_preset_reset.setVisible(custom)
+        self.l_preset_info.setText(PROC_INFO.get(name, ""))
+        for n, b in self.proc_btns.items():
+            self.set_kind(b, n.replace("&", "&&"), "primary" if n == name else "")
+        self.eqc.set(pp)
 
-    def fx_values(self):
-        d = dict(self.fxv)
-        for k in ("bass", "mid", "treble", "limit", "gain"):
-            d[k] = round(d[k] * 2) / 2
-        d["comp"], d["agc_lvl"], d["lufs"] = round(d["comp"]), round(d["agc_lvl"]), round(d["lufs"])
-        for k in ("nr", "deess", "excite", "width"):
-            d[k] = round(d[k])
-        return d
-
-    def fx_changed(self, manual=False):
-        """Appelé à chaque mouvement de curseur : la courbe se met à jour tout de suite, mais l'écriture sur le disque
-        (lente) n'a lieu qu'une fois le geste terminé : le curseur reste parfaitement fluide."""
-        self.fx.update(self.fx_values())
-        if manual:
-            self.fx["preset"] = "Personnalisé"
-        if not hasattr(self, "_fx_ref_tm"):
-            self._fx_ref_tm = QTimer(self)
-            self._fx_ref_tm.setSingleShot(True)
-            self._fx_ref_tm.timeout.connect(self.fx_refresh)
-            self._fx_save_tm = QTimer(self)
-            self._fx_save_tm.setSingleShot(True)
-            self._fx_save_tm.timeout.connect(self.save_settings)
-        self.eqc.set(self.fx_values())
-        self._fx_ref_tm.start(60)
-        self._fx_save_tm.start(700)
-
-    def fx_apply_preset(self, name, update_seg):
-        self.fx.update(FX_PRESETS[name])
-        self.fx["preset"] = name
-        self.fx_load_widgets()
-        self.fx.update(self.fx_values())
-        self.fx["preset"] = name
-        if update_seg:
-            self.seg_fx.setValue(self.fx_names.index(name))
-        self.fx_refresh()
-        self.save_settings()
-
-    def fx_refresh(self):
-        v = self.fx_values()
-        self.eqc.set(v)
-        on = bool(v["on"])
-        users = [c["name"] for c in self.outputs_cfg if c.get("fxmode", FX_PAGE) == "Page " + self.fx_page]
-        if on:
-            self.l_fx.setText(f"● Page {self.fx_page} active · " + (", ".join(users) if users else "aucun flux ne l'utilise"))
-        else:
-            self.l_fx.setText(f"○ Page {self.fx_page} désactivée : les flux qui l'utilisent partent sans traitement")
-        set_ss(self.l_fx, f"color:{OKC if on else MUT};")
-        now = {k: build_fx_chain(self.data["fx_pages"][k]) for k in FX_LETTERS}
-        same = (FX["chains"] == now) and not self.fx_dirty
-        self.l_fxinfo.setText("Réglages envoyés aux flux." if same else
-                              "Réglages modifiés : clique sur « Appliquer aux flux »"
-                              + (" : bascule en direct, sans couper les flux." if self.on_air else " (actif dès le démarrage de la diffusion)."))
-        set_ss(self.l_fxinfo, f"color:{MUT if same else ACC2};")
-
-    def fx_push(self):
-        self.fx_chains_update()
-        self.fx_dirty = False
-        self.fx_refresh()
-        self.save_settings()
-        if self.on_air and self.engine:
-            # nouveau réglage envoyé au moteur, qui bascule chaque flux à chaud (fondu de 0,3 s) : aucun flux n'est coupé
-            self.engine.set_out_fx({c["id"]: c.get("fxmode", FX_PAGE) for c in self.outputs_cfg})
-            self.log("Traitement son : application en direct, sans couper les flux…")
-        else:
-            self.log("Traitement son enregistré : il sera actif dès le démarrage de la diffusion.")
+    def son_tick(self, e):
+        """30 fois par seconde, page affichée : vumètres du processeur."""
+        if np is None:
+            self.proc_meters.set({}, "off")
+            return
+        pm = getattr(e, "pm", None) if e is not None else None
+        st = "idle"
+        if pm:
+            st = "air" if (self.on_air and e.air) else "input"
+        self.proc_meters.set(pm or {}, st)
 
     def fx_flux_rows(self):
         while self.fx_rows.count():
@@ -14422,7 +14848,6 @@ class PagesMixin2:
             if it.widget():
                 it.widget().hide()
                 it.widget().deleteLater()
-        choices = FX_CHOICES + [FX_NONE] + list(FX_PRESETS)
         for i, c in enumerate(self.outputs_cfg):
             h = QHBoxLayout()
             w = QWidget()
@@ -14432,11 +14857,10 @@ class PagesMixin2:
             l.setFixedWidth(150)
             h.addWidget(l)
             cb = QComboBox()
-            cb.addItems(choices)
-            cur = c.get("fxmode", FX_PAGE)
-            cb.setCurrentText(cur if cur in choices else FX_PAGE)
+            cb.addItems(FX_CHOICES)
+            cb.setCurrentText(FX_ON if out_processed(c) else FX_NONE)
             cb.activated.connect(lambda _i, cc=c, b=cb: self.fx_flux_set(cc, b.currentText()))
-            cb.setMinimumWidth(170)
+            cb.setMinimumWidth(220)
             h.addWidget(cb)
             h.addStretch(1)
             self.fx_rows.addWidget(w, i // 2, i % 2)
@@ -14445,34 +14869,10 @@ class PagesMixin2:
 
     def fx_flux_set(self, cfg, mode):
         cfg["fxmode"] = mode
-        self.fx_dirty = True
-        self.fx_refresh()
         self.save_all()
-
-    def fx_stop(self):
-        p, self._fx_proc = self._fx_proc, None
-        if p and p.poll() is None:
-            try:
-                p.terminate()
-            except OSError:
-                pass
-
-    def fx_listen(self):
-        if not shutil.which("ffplay"):
-            return info(self, "Écouter", "ffplay est introuvable (il est fourni avec ffmpeg).")
-        f = next((p for p in self.playlist if os.path.isfile(p)), "")
-        if not f:
-            f, _ = QFileDialog.getOpenFileName(self, "Choisis un son pour essayer l'effet", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;Tous (*)")
-        if not f:
-            return
-        self.fx_stop()
-        chain = build_fx_chain(self.fx_values(), force=True)
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-t", "20", "-ss", "20"] + (["-af", chain] if chain else []) + [f]
-        try:
-            self._fx_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.log("Écoute de l'effet : " + os.path.basename(f))
-        except OSError as e:
-            err(self, "Écouter", str(e))
+        if self.on_air and self.engine:
+            self.engine.set_out_fx({cfg["id"]: mode})
+            self.log(f"[{cfg.get('name')}] " + ("son traité par le processeur." if mode == FX_ON else "son brut, sans traitement."))
 
 # ------------------------------------------------------------------ Monitoring
 class FluxLamp(QWidget):
@@ -15394,12 +15794,19 @@ class GaelBrain:
             return ("Antenne " + ("coupée (mute)" if on else "rétablie") + " ?", [("Couper l'antenne" if on else "Rétablir le son", a.sos_mute, "danger" if on else "primary")])
         if H(n, "tonalite", "bip de test", "1 khz", "1khz", "son de test"):
             return ("Tonalité de test 1 kHz à l'antenne ?", [("Lancer / arrêter la tonalité", a.sos_tone, "primary")])
-        # --- traitement du son
-        if H(n, "traitement") and H(n, "voix", "musique", "punchy", "nuit", "neutre", "doux", "parole"):
-            name = ("Voix parlée" if H(n, "voix", "parole") else "Musique" if H(n, "musique") else "Radio punchy" if H(n, "punchy")
-                    else "Doux (nuit)" if H(n, "nuit", "doux") else "Neutre")
-            return self.propose("Traitement son", [("Page", a.fx_page), ("Style", name), ("Appliqué aux flux", "en direct, sans coupure")],
-                                lambda: (a.fx_apply_preset(name, True), a.fx_push()))
+        # --- traitement du son (processeur d'antenne)
+        if H(n, "traitement", "processeur", "processing") and H(n, "bypass", "desactive", "coupe le traitement", "son brut"):
+            return ("Je passe le processeur en bypass (son brut à l'antenne, en fondu) ?", [("Bypass", a.proc_toggle_bypass, "primary")]) \
+                if not a.proc.get("bypass") else ("Je remets le processeur à l'antenne ?", [("Réactiver", a.proc_toggle_bypass, "primary")])
+        if H(n, "traitement", "processeur", "processing", "preset", "prereglage") and H(
+                n, "voix", "talk", "parole", "info", "news", "journal", "classique", "jazz", "acoustique", "pop", "hits", "rock",
+                "urbain", "rap", "hip hop", "loud", "fort", "generaliste", "variete", "protection", "neutre"):
+            name = ("Talk-show" if H(n, "voix", "talk", "parole") else "Info (news)" if H(n, "info", "news", "journal")
+                    else "Classique" if H(n, "classique") else "Jazz & acoustique" if H(n, "jazz", "acoustique")
+                    else "Pop / Hits" if H(n, "pop", "hits") else "Rock" if H(n, "rock") else "Urbain" if H(n, "urbain", "rap", "hip hop")
+                    else "Loud" if H(n, "loud", "fort") else "Protection seule" if H(n, "protection", "neutre") else "Généraliste")
+            return self.propose("Traitement son", [("Préréglage", name), ("Appliqué", "en direct, sans coupure")],
+                                lambda: a.proc_preset(name))
         # --- redémarrer les flux, auditeurs, mise à jour
         if H(n, "redemarre les flux", "relance les flux", "reconnecte", "redemarre le flux", "relance le flux"):
             return ("Je relance tous les flux ?", [("Redémarrer les flux", a.sos_restart, "primary")])
@@ -16049,7 +16456,7 @@ Pour modifier un réglage, utilise toujours l'outil adapté : il affiche une car
 doit cliquer ; ne prétends jamais avoir modifié quelque chose toi-même. S'il manque une information indispensable
 (adresse du serveur, mot de passe source…), demande-la d'abord. Ne demande jamais de mot de passe d'administration.
 Quand tu as besoin de connaître la situation, appelle get_state ; pour un problème, run_diagnostic.
-Onglets de l'application : Diffusion (source audio, flux, secours, à l'antenne), Traitement son (bêta), Cartoucheur, Enregistrement (dont la pige ARCOM),
+Onglets de l'application : Diffusion (source audio, flux, secours, à l'antenne), Traitement son (processeur d'antenne temps réel : préréglages radio, bypass, densité Moins/Plus, égalisation, multibande, stéréo), Cartoucheur, Enregistrement (dont la pige ARCOM),
 Monitoring (surveillance de flux), Réseau (liens Internet et bascule), SOS (toi, alertes de panne, journal), Réglages, À propos.
 État actuel au moment du message :
 {state}"""
@@ -18231,25 +18638,91 @@ class OnAirPill(CLabel):
     """Voyant « EN ANTENNE » façon studio : pastille rouge pleine, texte blanc bien lisible, point qui pulse et halo doux.
     Ambre pendant la connexion, rouge sombre si aucun flux ne passe, discret (gris) hors antenne."""
 
+    NAMES_W = 210                         # zone des indicatifs des flux (défilent s'ils ne tiennent pas)
+
     def __init__(self):
         super().__init__("Hors antenne", color=MUT)
         self.mode, self.t = "off", 0.0
+        self.names, self.t_names = "", 0.0
         self.setMinimumHeight(36)
         f = self.font()
         f.setBold(True)
         f.setPixelSize(14)
         f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104)
         self.setFont(f)
-        Ticker.add(self, self.step, 30)
+        self.nfont = QFont(f)
+        self.nfont.setBold(False)
+        self.nfont.setWeight(QFont.Weight.DemiBold)
+        self.nfont.setPixelSize(13)
+        self.nfont.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 100)
+        Ticker.add(self, self.step, 60)
 
     def set_mode(self, mode):
         if mode != self.mode:
             self.mode = mode
             self.update()
 
+    def sizeHint(self):
+        sh = super().sizeHint()
+        return QSize(max(sh.width(), getattr(self, "wide", 0)), sh.height())
+
+    def minimumSizeHint(self):
+        return QSize(self.minimumWidth(), super().minimumSizeHint().height())
+
+    def set_names(self, names):
+        """Indicatifs des flux à l'antenne (« Radio Breizh Web · FM 99.1 · DAB+ ») : le défilement repart du début à chaque
+        changement, pour qu'on lise toujours le premier nom en premier."""
+        names = names or ""
+        if names != self.names:
+            self.names, self.t_names = names, self.t
+            self.setToolTip(("À l'antenne : " + names) if names else "")
+            self.update()
+
     def step(self, t, dt):
         self.t = t
         return self.mode in ("air", "wait")
+
+    def _names_layer(self, w, h, col):
+        """Indicatifs dans une bande de w px : immobiles s'ils tiennent, sinon défilement continu et doux (pause de lecture
+        au début de chaque tour), bords fondus pour une entrée et une sortie élégantes."""
+        dpr = self.devicePixelRatioF()
+        img = QImage(int(w * dpr), int(h * dpr), QImage.Format.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.GlobalColor.transparent)
+        q = QPainter(img)
+        q.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        q.setFont(self.nfont)
+        q.setPen(col)
+        fm = QFontMetricsF(self.nfont)
+        tw = fm.horizontalAdvance(self.names)
+        fade = 14.0
+        if tw <= w - 4:
+            q.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.names)
+            q.end()
+            return img
+        gap, speed, pause = 46.0, 30.0, 1.8 if ANIM else 0.0
+        cyc = pause + (tw + gap) / speed
+        ph = ((self.t - self.t_names) % cyc) if ANIM else 0.0
+        off = 0.0 if ph < pause else (ph - pause) * speed
+        k = min(1.0, max(0.0, ph - pause) / 0.6)
+        ease = off if k >= 1 else off * (k * k * (3 - 2 * k))       # départ en douceur (pas d'à-coup)
+        for x in (fade - ease, fade - ease + tw + gap):
+            q.drawText(QRectF(x, 0, tw + 4, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.names)
+        # point de séparation entre deux tours
+        q.setPen(Qt.PenStyle.NoPen)
+        dc = QColor(col)
+        dc.setAlphaF(.55)
+        q.setBrush(dc)
+        q.drawEllipse(QPointF(fade - ease + tw + gap / 2, h / 2), 2.2, 2.2)
+        q.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        g = QLinearGradient(0, 0, w, 0)
+        g.setColorAt(0, qc("#000000", 0))
+        g.setColorAt(fade / w, qc("#000000", 255))
+        g.setColorAt(1 - fade / w, qc("#000000", 255))
+        g.setColorAt(1, qc("#000000", 0))
+        q.fillRect(QRectF(0, 0, w, h), QBrush(g))
+        q.end()
+        return img
 
     def paintEvent(self, e):
         p = new_painter(self)
@@ -18296,7 +18769,11 @@ class OnAirPill(CLabel):
         fm = QFontMetrics(self.font())
         txt = self.text()
         tw = fm.horizontalAdvance(txt) + (16 if dot is not None else 0)
-        x = r.center().x() - tw / 2
+        names = self.names if m == "air" else ""
+        nw = min(self.NAMES_W, r.width() - tw - 48) if names else 0
+        if nw < 60:
+            nw, names = 0, ""
+        x = r.center().x() - (tw + (nw + 22 if names else 0)) / 2
         if dot is not None:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(dot)
@@ -18304,6 +18781,16 @@ class OnAirPill(CLabel):
             x += 16
         p.setPen(fg)
         p.drawText(QRectF(x, r.top(), tw, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+        if names:                                   # séparateur fin, puis les indicatifs des flux
+            x += tw - 16 + 11
+            sc = QColor(fg)
+            sc.setAlphaF(.45)
+            p.setPen(QPen(sc, 1.2))
+            p.drawLine(QPointF(x, r.top() + 9), QPointF(x, r.bottom() - 9))
+            x += 11
+            nc = QColor(fg)
+            nc.setAlphaF(.92)
+            p.drawImage(QPointF(x, r.top()), self._names_layer(nw, r.height(), nc))
 
 
 class SpeechBubble(QFrame):
@@ -18831,8 +19318,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         need = max(max(fm.horizontalAdvance(t), fmb.horizontalAdvance(t)) for t in
                    ("EN ANTENNE  00:00:00", "EN ANTENNE  88:88:88", "Contrôle d'entrée",
                     "Connexion des flux…", "Aucun flux en ligne", text)) + 16 + 34
-        if need > l.minimumWidth():
-            l.setFixedWidth(need)
+        if need > l.minimumWidth():                   # indispensable : l'état et la durée ; en plus, si la place le permet,
+            l.setMinimumWidth(need)                   # les indicatifs des flux (ils cèdent la place quand l'en-tête est serré)
+            l.setMaximumWidth(need + OnAirPill.NAMES_W + 22)
+            l.wide = need + OnAirPill.NAMES_W + 22
+            l.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            l.updateGeometry()
 
     def steady_labels(self):
         """Horloge, date et état d'antenne à largeur fixe et chiffres tabulaires : plus rien ne bouge à chaque seconde."""
@@ -18990,7 +19481,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def compact_header(self):
         """Fenêtre étroite : on replie l'antenne décorative et « Plein écran » (F11 reste dispo) pour que l'en-tête ne se chevauche jamais."""
         wide = self.width() >= 1320
-        self.l_beta.setVisible(self.page_key == "son" and not NAVTOP and wide)
+        self.l_beta.setVisible(False)
         self.air_fx.setVisible(wide and not MINI)
         self.btn_full.setVisible(wide or self.isFullScreen())
         if hasattr(self, "sa") and self.page_key == "cart":
@@ -20464,6 +20955,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.cart_now_update(st)
             if self.page_key == "cart":
                 self.cart_strip(e, st)
+            elif self.page_key == "son":
+                self.son_tick(e)
 
     def update_ui(self, e):
         if isinstance(e, EngineProxy) and e.running and not e._stopping and time.time() - e._s["t"] > 6:
@@ -20484,7 +20977,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if self.on_air:
             if n_live:
                 head, mode = f"EN ANTENNE  {fmt_dur(time.time() - e.started)}", "air"
-                self.l_air.setToolTip(f"{n_live} flux sur {n_all} en ligne")
+                self.l_air.set_names("  ·  ".join(o.cfg.get("name") or "flux" for o in outs if o.state == "live"))
             elif any(o.state == "connecting" for o in e.outputs):
                 head, mode = "Connexion des flux…", "wait"
             else:
@@ -20496,6 +20989,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.set_kind(self.btn_start, "Arrêter", "stop")
         else:
             self.l_air.set_mode("preview" if self.preview else "off")
+            self.l_air.set_names("")
             self.set_label(self.l_air, "Contrôle d'entrée" if self.preview else "Hors antenne", MUT)
             self.set_kind(self.btn_start, "Démarrer", "primary")
         if self.on_air:
@@ -20646,8 +21140,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def rupture_ui(self, e, n_live, n_all):
         """Deux alertes bien distinctes, stables (pas de clignotement, un seul bip par panne) :
         ROUGE = rupture de flux (un flux actif n'est plus en ligne depuis 6 s : les auditeurs ne reçoivent plus l'antenne) ;
-        AMBRE = silence à l'antenne (plus de son en entrée et rien ne prend le relais).
-        BLEU (calme) = la playlist de secours a pris le relais : c'est prévu, tout est sous contrôle."""
+        ORANGE = silence à l'antenne (plus de son en entrée et rien ne prend le relais) ;
+        JAUNE = la playlist de secours est à l'antenne : cadre jaune autour de l'application, comme le rouge, sans bip."""
         now = time.time()
         bad, silent = [], None
         down = self._out_down
@@ -20687,15 +21181,14 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 if silent == "dead":
                     txt += "  ·  et pas de son en entrée"
             elif kind == "son":
-                c, fg = "#d08a00", "#1d0d03"
+                c, fg = "#e8640f", "white"
                 p = e.fb_params()
                 why = ("la playlist de secours est désactivée" if not p["enabled"] else
                        "la playlist de secours est vide" if not p["files"] else "la playlist de secours n'a pas pu démarrer")
                 txt = f"⚠  SILENCE À L'ANTENNE  ·  aucun son en entrée depuis {e.silent_ms // 1000} s  ·  {why}"
             else:
-                c, fg = "#24527d", "white"
-                txt = ("PLAYLIST DE SECOURS À L'ANTENNE  ·  plus de son en entrée  ·  "
-                       "retour au direct automatique dès que le son revient")
+                c, fg = SECOURS_Y, "#2a2200"
+                txt = "PLAYLIST DE SECOURS À L'ANTENNE"
             self.banner.set_colors(c, fg)
             if self.banner.text() != txt:
                 self.banner.setText(txt)
@@ -20703,7 +21196,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             prev = getattr(self, "alert_kind", None)
             self.alert_kind = kind
             self.banner.setVisible(bool(kind))
-            border = {"flux": "#ff4d5e", "son": "#ffb020"}.get(kind)
+            border = {"flux": "#ff4d5e", "son": "#ff7a1a", "secours": SECOURS_Y}.get(kind)
             self.centralWidget().set_border(border)
             if kind in ("flux", "son"):
                 if kind not in self._air_beeped:            # un seul bip par panne (la sirène, si elle est cochée, répète)
@@ -20719,7 +21212,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.alert_on = kind == "flux"
         self.onair_chip(e, bad)
         air = bool(self.on_air)                           # hors antenne : le phare reste éteint et immobile
-        self.air_fx.set(bool(air and n_live > 0), ("flux" if kind == "flux" else ("son" if kind == "son" else False)) if air else False)
+        mode = (kind if kind in ("flux", "son", "secours") else False) if air else False
+        self.air_fx.set(bool(air and n_live > 0), mode)
+        if hasattr(self.nav_w, "set_alert"):
+            self.nav_w.set_alert(mode if (air and (n_live > 0 or mode)) else False)
 
     def onair_chip(self, e, bad):
         """« ● 3 flux · Web, FM, DAB+ » dans le bandeau : vert si tout passe, ambre si un flux est HS (nommé en infobulle)."""
@@ -21064,10 +21560,6 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             pass
         try:
             self.mon_stop_all()
-        except Exception:
-            pass
-        try:
-            self.fx_stop()
         except Exception:
             pass
         try:
