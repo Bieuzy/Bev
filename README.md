@@ -4,6 +4,8 @@ Diffusion radio multi-sorties (Internet, FM, DAB+, enregistrement), playlist de 
 Portée par des radios associatives de Bretagne.
 
 ## Télécharger
+Page de téléchargement : **https://bieuzy.github.io/bev/**
+
 Onglet **Releases** de ce dépôt : `Bev-Setup-x.y.z.exe` (installateur Windows : menu Démarrer, raccourci, désinstallation, mises à jour depuis l'appli) ou `Bev-macOS.dmg` (Mac à puce Apple).
 
 Premier lancement sur Mac : clic droit sur Bev > **Ouvrir** (l'application n'est pas signée par Apple).
