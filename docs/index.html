@@ -80,7 +80,11 @@ p{margin:0}
 @keyframes souffle{50%{opacity:.6}}
 .splash h1{font-size:clamp(68px,11vw,116px);font-weight:800;letter-spacing:-.03em;line-height:.9}
 .splash .sub{display:block;font-size:14px;font-weight:600;letter-spacing:.18em;color:var(--splash-sub);margin-top:14px}
-.splash .lede{font-size:18px;color:var(--splash-mut);max-width:40ch;margin:22px 0 26px}
+.splash .lede{font-size:19px;color:var(--splash-txt);font-weight:500;margin:22px 0 12px}
+.outs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:26px}
+.outs span{font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:8px;background:rgba(255,255,255,.08);color:var(--splash-txt)}
+.first{font-size:13px;color:var(--splash-mut);margin-top:14px}
+.first b{color:var(--splash-txt);font-weight:600}
 .splash .lede strong{color:var(--splash-txt);font-weight:600}
 .dl{display:flex;flex-wrap:wrap;gap:10px}
 .splash .btn:not(.primary){background:rgba(255,255,255,.08);color:var(--splash-txt)}
@@ -90,7 +94,7 @@ p{margin:0}
 .meta .chip{background:rgba(255,255,255,.08);color:var(--splash-txt)}
 
 /* ---------- sections : titres comme dans l'appli */
-section{padding-block:48px 8px}
+section{padding-block:40px}
 section:last-of-type{padding-bottom:56px}
 .sh{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:end;gap:6px 24px;margin-bottom:18px}
 .sh h2{font-size:24px;font-weight:700;letter-spacing:-.01em}
@@ -195,13 +199,7 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
       <svg width="38" height="38" aria-hidden="true"><use href="#tuile"/></svg>
       <span class="nm"><b>Bev</b><small>BROADCAST TOOL</small></span>
     </a>
-    <nav>
-      <a href="#sorties">Sorties</a>
-      <a href="#antenne">Antenne</a>
-      <a href="#installer">Installer</a>
-      <a href="#nouveautes">Nouveautés</a>
-      <a class="gh" href="https://github.com/Bieuzy/bev">GitHub</a>
-    </nav>
+    <nav><a class="gh" href="https://github.com/Bieuzy/Bev">GitHub</a></nav>
   </div>
 </header>
 
@@ -217,125 +215,30 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
     </svg>
     <div>
       <h1>Bev<span class="sub">BROADCAST TOOL</span></h1>
-      <p class="lede">Bev veut dire « en direct » en breton. C'est un outil de régie pensé pour <strong>les radios associatives</strong> : on branche le micro, on lance l'antenne, et le son part sur Internet, en FM, en DAB+ et sur le disque en même temps.</p>
+      <p class="lede">Le logiciel de diffusion des radios associatives.</p>
+      <div class="outs"><span>Internet</span><span>FM</span><span>DAB+</span><span>Enregistrement</span></div>
       <div class="dl">
-        <a class="btn primary" id="btn-win" href="https://github.com/Bieuzy/bev/releases/latest">
+        <a class="btn primary" id="btn-win" href="https://github.com/Bieuzy/Bev/releases/latest">
           <svg width="20" height="20" aria-hidden="true"><use href="#i-win"/></svg>
           <span class="t"><b>Télécharger pour Windows</b><small id="win-info">Installateur .exe</small></span>
         </a>
-        <a class="btn" id="btn-mac" href="https://github.com/Bieuzy/bev/releases/latest/download/Bev-macOS.dmg">
+        <a class="btn" id="btn-mac" href="https://github.com/Bieuzy/Bev/releases/latest/download/Bev-macOS.dmg">
           <svg width="20" height="20" aria-hidden="true"><use href="#i-mac"/></svg>
           <span class="t"><b>Télécharger pour Mac</b><small id="mac-info">Image disque .dmg · puce Apple</small></span>
         </a>
       </div>
+      <p class="first" id="first">Premier lancement : Windows → <b>Informations complémentaires</b> › <b>Exécuter quand même</b> · Mac → clic droit › <b>Ouvrir</b></p>
       <div class="meta">
         <span class="chip" id="ver">Version 1.1.1</span>
-        <span id="ver-date">Gratuit, sans compte ni publicité</span>
-        <a href="#nouveautes">Voir les nouveautés</a>
+        <span id="ver-date">Gratuit</span>
       </div>
     </div>
   </div>
 </div>
 
-<section id="sorties">
-  <div class="wrap">
-    <div class="sh">
-      <h2>Un seul direct, partout à la fois</h2>
-      <p>Vous choisissez où part l'émission. Bev s'occupe d'envoyer le même son à chaque endroit, sans décalage entre eux.</p>
-    </div>
-    <div class="grid g4">
-      <div class="card">
-        <div class="ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><path d="M2 10h16M10 2c2.5 2.6 2.5 13.4 0 16M10 2c-2.5 2.6-2.5 13.4 0 16"/></svg></div>
-        <h3>Sur Internet</h3>
-        <p class="sub">Pour qu'on vous écoute depuis le site de la radio ou une appli, où que l'on soit.</p>
-        <div class="foot"><span class="chip">Icecast</span><span class="chip">Shoutcast</span></div>
-      </div>
-      <div class="card">
-        <div class="ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10 9v9M6.5 18h7"/><circle cx="10" cy="7" r="1.6"/><path d="M6.3 3.6a5 5 0 0 0 0 6.8M13.7 3.6a5 5 0 0 1 0 6.8"/></svg></div>
-        <h3>En FM</h3>
-        <p class="sub">Une carte son reliée à l'émetteur, et la bande FM du coin vous entend.</p>
-        <div class="foot"><span class="chip">Carte son</span></div>
-      </div>
-      <div class="card">
-        <div class="ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2.5" y="5" width="15" height="11" rx="2"/><path d="M6 2.5l3 2.5M6 9h3M6 12h8" stroke-linecap="round"/></svg></div>
-        <h3>En DAB+</h3>
-        <p class="sub">Pour les radios qui ont une place sur le multiplex numérique de leur secteur.</p>
-        <div class="foot"><span class="chip">odr-audioenc</span></div>
-      </div>
-      <div class="card">
-        <div class="ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="7.5"/><circle cx="10" cy="10" r="3" fill="currentColor"/></svg></div>
-        <h3>Sur le disque</h3>
-        <p class="sub">Chaque émission est gardée, pour la rediffusion, le podcast ou les archives.</p>
-        <div class="foot"><span class="chip">Enregistrement</span></div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="antenne">
-  <div class="wrap">
-    <div class="sh">
-      <h2>Ce qui tient l'antenne pour vous</h2>
-      <p>Dans une radio associative, la régie change de mains toutes les heures. Bev rattrape les petits oublis pour que l'antenne ne reste jamais muette.</p>
-    </div>
-    <div class="grid g3">
-      <div class="card"><h3>Une playlist de secours</h3><p class="sub">Le micro est resté coupé, l'invité est en retard ? Après dix secondes de silence, Bev enchaîne doucement sur votre playlist, puis rend la main au direct dès que ça reparle.</p></div>
-      <div class="card"><h3>Un cartoucheur pour les jingles</h3><p class="sub">Vos jingles, virgules et annonces sont prêts à partir d'un clic. On peut les écouter au casque avant, même quand l'antenne est coupée.</p></div>
-      <div class="card"><h3>Un retard de sécurité</h3><p class="sub">Un gros mot en direct, un appel qui dérape : le bouton DUMP efface ce qui n'est pas encore parti avant que les auditeurs l'entendent.</p></div>
-      <div class="card"><h3>Des niveaux à l'œil</h3><p class="sub">Les vu-mètres, l'écoute de l'antenne au casque et un journal qui raconte ce qui s'est passé, même quand vous n'étiez pas là.</p></div>
-      <div class="card"><h3>Un son régulier</h3><p class="sub">Bev égalise le volume entre les voix et la musique, sans faire remonter le souffle pendant les blancs.</p></div>
-      <div class="card"><h3>Un onglet SOS</h3><p class="sub">Si quelque chose manque sur l'ordinateur, Bev le dit en français et propose de l'installer, sans ligne de commande.</p></div>
-    </div>
-    <div class="card" style="margin-top:12px">
-      <h3>Un coup d'œil au phare suffit</h3>
-      <p class="sub">Le phare dans le coin de Bev change d'allure selon l'état de l'antenne. Vous savez où vous en êtes depuis l'autre bout du studio.</p>
-      <div class="states">
-        <div class="st"><span class="dot" style="background:var(--ok)"></span><div><b>Tout roule</b><span>Le direct part sur toutes les sorties.</span></div></div>
-        <div class="st"><span class="dot" style="background:var(--warn)"></span><div><b>Playlist de secours</b><span>La lanterne tourne et balaie l'horizon.</span></div></div>
-        <div class="st"><span class="dot" style="background:var(--orange)"></span><div><b>Plus de son</b><span>Les ondes reviennent vers le phare, il tend l'oreille.</span></div></div>
-        <div class="st"><span class="dot" style="background:var(--bad)"></span><div><b>Flux coupé</b><span>Le phare lance des éclats rouges.</span></div></div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="installer">
-  <div class="wrap">
-    <div class="sh">
-      <h2>Installer Bev</h2>
-      <p>Bev est gratuit mais pas encore signé par Microsoft ni Apple. La première fois, votre ordinateur vous demandera de confirmer : c'est normal.</p>
-    </div>
-    <div class="grid g2 os">
-      <div class="card" id="card-win">
-        <h3>Sous Windows <span class="chip acc" id="tag-win" hidden>Votre ordinateur</span></h3>
-        <ol class="steps">
-          <li><span>Téléchargez l'installateur avec le bouton en haut de la page.</span></li>
-          <li><span>Ouvrez-le. Si Windows affiche un écran bleu SmartScreen, cliquez sur <kbd>Informations complémentaires</kbd> puis <kbd>Exécuter quand même</kbd>.</span></li>
-          <li><span>C'est prêt : Bev est dans le menu Démarrer, avec un raccourci sur le bureau.</span></li>
-        </ol>
-      </div>
-      <div class="card" id="card-mac">
-        <h3>Sur Mac <span class="chip acc" id="tag-mac" hidden>Votre ordinateur</span></h3>
-        <ol class="steps">
-          <li><span>Téléchargez <kbd>Bev-macOS.dmg</kbd>. Il fonctionne sur les Mac à puce Apple (M1 et suivants).</span></li>
-          <li><span>Ouvrez-le et glissez Bev dans le dossier <kbd>Applications</kbd>.</span></li>
-          <li><span>La première fois, faites un clic droit sur Bev puis <kbd>Ouvrir</kbd>. Ensuite, il s'ouvre normalement.</span></li>
-        </ol>
-      </div>
-    </div>
-    <div class="card" style="margin-top:12px">
-      <h3>Ensuite, Bev se met à jour tout seul</h3>
-      <p class="sub">Quand une nouvelle version sort, Bev vous le propose. La plupart du temps, il n'y a qu'un petit fichier d'environ 1 Mo à récupérer : Bev vérifie qu'il est intact, redémarre en quelques secondes, et vous ne repassez pas par l'installateur. Si une version demande un changement plus profond, Bev vous propose l'installateur complet.</p>
-    </div>
-  </div>
-</section>
-
 <section id="nouveautes">
   <div class="wrap">
-    <div class="sh">
-      <h2>Nouveautés</h2>
-      <p>Les dernières versions publiées sur GitHub, avec ce qui a changé.</p>
-    </div>
+    <div class="sh"><h2>Nouveautés</h2><a href="https://github.com/Bieuzy/Bev/releases">Toutes les versions</a></div>
     <div class="rel" id="releases">
       <div class="card"><div class="skel" style="width:30%;margin-top:0"></div><div class="skel"></div><div class="skel" style="width:80%"></div></div>
     </div>
@@ -345,22 +248,19 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 <footer>
   <div class="wrap">
     <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · porté par des radios associatives de Bretagne</span>
-    <a href="https://github.com/Bieuzy/bev">Le code sur GitHub</a>
+    <a href="https://github.com/Bieuzy/Bev">GitHub</a>
   </div>
 </footer>
 
 <script>
-var REPO = "Bieuzy/bev";
+var REPO = "Bieuzy/Bev";
 
 // Le bouton du système du visiteur passe en premier
 (function(){
-  var ua = navigator.userAgent || "", mac = /Macintosh|Mac OS X/.test(ua) && !/iPhone|iPad/.test(ua), win = /Windows/.test(ua);
+  var ua = navigator.userAgent || "", mac = /Macintosh|Mac OS X/.test(ua) && !/iPhone|iPad/.test(ua);
   var w = document.getElementById("btn-win"), m = document.getElementById("btn-mac");
   if (mac) {
     w.classList.remove("primary"); m.classList.add("primary"); m.parentNode.insertBefore(m, w);
-    document.getElementById("tag-mac").hidden = false; document.getElementById("card-mac").classList.add("me");
-  } else if (win) {
-    document.getElementById("tag-win").hidden = false; document.getElementById("card-win").classList.add("me");
   }
 })();
 
@@ -404,7 +304,7 @@ function render(list){
   if (m) { document.getElementById("btn-mac").href = m.browser_download_url; document.getElementById("mac-info").textContent = m.name + " · " + mo(m.size); }
 
   box.innerHTML = "";
-  list.slice(0, 5).forEach(function(r, i){
+  list.slice(0, 1).forEach(function(r, i){
     var c = document.createElement("article");
     c.className = "card";
     var aw = findAsset(r, WIN), am = findAsset(r, MAC), btns = "";
@@ -422,7 +322,6 @@ function render(list){
     if (more) more.addEventListener("click", function(){ c.querySelector(".notes").classList.remove("clip"); more.remove(); });
     box.appendChild(c);
   });
-  box.insertAdjacentHTML("beforeend", '<p class="mut" style="font-size:13.5px">Les versions plus anciennes sont <a href="https://github.com/' + REPO + '/releases">sur GitHub</a>.</p>');
 }
 function fail(){
   document.getElementById("releases").innerHTML =
