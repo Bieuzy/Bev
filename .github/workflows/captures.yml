@@ -1,0 +1,31 @@
+# Captures d'écran de l'interface (à la demande) : Actions > Captures d'écran > Run workflow.
+# Les images sont dans l'artefact « captures » de l'exécution.
+name: Captures d'écran
+
+on:
+  workflow_dispatch:
+
+jobs:
+  captures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bibliothèques système
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libportaudio2 fonts-dejavu-core
+      - name: Modules Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Captures
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/captures.py captures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captures
+          path: captures/*.png
