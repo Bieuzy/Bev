@@ -3037,6 +3037,72 @@ class LevelMeter(QWidget):
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.note)
 
 
+class LoudChip(QWidget):
+    """Sonie de sortie, dans le bandeau (visible sur tous les onglets) : valeur court terme (3 s) en LUFS, et une échelle
+    où la barre suit le court terme et le point la sonie instantanée (400 ms). Grise quand rien ne passe."""
+    LO, HI = -36.0, -6.0
+
+    def __init__(self):
+        super().__init__()
+        self.st, self.mo, self.on, self.what = None, None, False, ""
+        self.setFixedSize(232, 38)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Sonie de sortie (norme EBU R128) : court terme sur 3 s, et point = instantanée (400 ms).\n"
+                        "Repères : −23 LUFS télévision, −16 LUFS flux Internet, −10 à −8 LUFS FM très traitée.\n"
+                        "(clic : Processeur d'antenne)")
+
+    def set(self, st, mo, on, what=""):
+        st = None if st is None or st <= -69 else round(st, 1)
+        mo = None if mo is None or mo <= -69 else round(mo, 1)
+        if (st, mo, on, what) != (self.st, self.mo, self.on, self.what):
+            self.st, self.mo, self.on, self.what = st, mo, on, what
+            self.update()
+
+    def paintEvent(self, e):
+        p = new_painter(self)
+        r = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(FIELD))
+        p.drawRoundedRect(r, 12, 12)
+        live = self.on and self.st is not None
+        f = QFont(self.font())
+        f.setPixelSize(10)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
+        p.setFont(f)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(12, 3, 90, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SONIE" + (f" · {self.what}" if self.what else ""))
+        f2 = QFont(self.font())
+        f2.setPixelSize(15)
+        f2.setBold(True)
+        try:
+            f2.setFeature(QFont.Tag("tnum"), 1)
+        except Exception:
+            pass
+        p.setFont(f2)
+        p.setPen(QColor(TXT if live else MUT))
+        txt = (f"{self.st:+.1f}".replace(".", ",").replace("+", "") + " LUFS") if live else "— LUFS"
+        p.drawText(QRectF(12, 17, 100, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt.replace("-", "−"))
+        # échelle
+        x0, x1, y = 118.0, r.right() - 12, r.center().y()
+        p.setBrush(QColor(TRACK))
+        p.drawRoundedRect(QRectF(x0, y - 3, x1 - x0, 6), 3, 3)
+        k = lambda v: x0 + (x1 - x0) * max(0.0, min(1.0, (v - self.LO) / (self.HI - self.LO)))
+        for v in (-23, -16):                                   # repères télévision / Internet
+            p.setPen(QPen(qc(MUT, 150), 1))
+            p.drawLine(QPointF(k(v), y - 6), QPointF(k(v), y + 6))
+        p.setPen(Qt.PenStyle.NoPen)
+        if live:
+            g = QLinearGradient(x0, 0, x1, 0)
+            g.setColorAt(0, QColor(ACC2))
+            g.setColorAt(1, QColor(ACC))
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(QRectF(x0, y - 3, max(6.0, k(self.st) - x0), 6), 3, 3)
+            if self.mo is not None:
+                p.setBrush(QColor(TXT))
+                p.drawEllipse(QPointF(k(self.mo), y), 4, 4)
+
+
 class MiniMeter(QWidget):
     """Petits vumètres du bandeau. Repeints seulement quand l'affichage change (hors antenne : jamais)."""
     SEG = 28
@@ -14172,7 +14238,8 @@ class CLabel(QLabel):
 
 class OnAirPill(CLabel):
     """Voyant « EN ANTENNE » façon studio : pastille rouge pleine, texte blanc bien lisible, point qui pulse et halo doux.
-    Ambre pendant la connexion, rouge sombre si aucun flux ne passe, discret (gris) hors antenne."""
+    Orange si un flux est HS, jaune quand la playlist de secours est à l'antenne, ambre pendant la connexion, rouge sombre si
+    aucun flux ne passe, discret (gris) hors antenne. Largeur fixe : les noms des flux sont dans l'infobulle."""
 
     NAMES_W = 210                         # zone des indicatifs des flux (défilent s'ils ne tiennent pas)
 
@@ -14216,7 +14283,7 @@ class OnAirPill(CLabel):
 
     def step(self, t, dt):
         self.t = t
-        return self.mode in ("air", "wait")
+        return self.mode in ("air", "wait", "secours", "partial")
 
     def _names_layer(self, w, h, col):
         """Indicatifs dans une bande de w px : immobiles s'ils tiennent, sinon défilement continu et doux (pause de lecture
@@ -14280,6 +14347,17 @@ class OnAirPill(CLabel):
             p.setBrush(QBrush(g))
             p.drawRoundedRect(r, rad, rad)
             fg, dot = QColor("#ffffff"), qc("#ffffff", int(255 * (.55 + .45 * br)))
+        elif m in ("secours", "partial"):
+            br = (math.sin(t * 2.6) + 1) / 2 if ANIM else .5
+            c1, c2, fg = (("#ffd23f", "#f2b705", QColor("#2a2000")) if m == "secours" else ("#ff8a2a", "#e8590c", QColor("#ffffff")))
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())
+            g.setColorAt(0, QColor(c1))
+            g.setColorAt(1, QColor(c2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(r, rad, rad)
+            dot = QColor(fg)
+            dot.setAlphaF(.55 + .45 * br)
         elif m == "wait":
             p.setPen(QPen(QColor("#ffb020"), 1.6))
             p.setBrush(qc("#ffb020", 30))
@@ -14769,14 +14847,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.cart_now = CartNow()
         self.cart_now.clicked.connect(lambda: self.engine and self.engine.stop_cart())
         bh.addWidget(self.cart_now)
-        # flux à l'antenne : combien, et lesquels (en bref ; la liste complète en infobulle)
-        self.l_onair = CLabel("", color=OKC)
-        self.l_onair.setStyleSheet(f"background:{FIELD};font-weight:700;border-radius:12px;padding:4px 12px;")
-        self.l_onair.setMaximumWidth(330)
-        self.l_onair.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.l_onair.mouseReleaseEvent = lambda _e: self.go_tab("diff")
-        self.l_onair.hide()
-        bh.addWidget(self.l_onair)
+        # sonie de sortie, visible sur tous les onglets (les flux à l'antenne sont déjà dans le voyant EN ANTENNE)
+        self.loud = LoudChip()
+        self.loud.mouseReleaseEvent = lambda _e: self.go_tab("son")
+        bh.addWidget(self.loud)
         self.l_net = lab("Réseau : détection…", "")
         self.l_net.setStyleSheet(f"background:{FIELD};color:{MUT};font-weight:700;border-radius:12px;padding:4px 14px;")
         self.l_net.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -14906,13 +14980,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         f.setBold(True)
         fmb = QFontMetrics(f)
         need = max(max(fm.horizontalAdvance(t), fmb.horizontalAdvance(t)) for t in
-                   ("EN ANTENNE  00:00:00", "EN ANTENNE  88:88:88", "Contrôle d'entrée",
+                   ("EN ANTENNE  88:88:88", "SECOURS  88:88:88", "8 FLUX HS  88:88:88", "Contrôle d'entrée",
                     "Connexion des flux…", "Aucun flux en ligne", text)) + 16 + 34
-        if need > l.minimumWidth():                   # indispensable : l'état et la durée ; en plus, si la place le permet,
-            l.setMinimumWidth(need)                   # les indicatifs des flux (ils cèdent la place quand l'en-tête est serré)
-            l.setMaximumWidth(need + OnAirPill.NAMES_W + 22)
-            l.wide = need + OnAirPill.NAMES_W + 22
-            l.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        if need > l.minimumWidth():                   # largeur juste nécessaire, fixe : la pastille ne déborde plus et ne
+            l.setFixedWidth(need)                     # bouge pas (les noms des flux sont dans l'infobulle)
+            l.wide = need
+            l.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             l.updateGeometry()
 
     def steady_labels(self):
@@ -16565,13 +16638,25 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if self.bot_btn:
             self.bot_btn.air = n_live > 0
         if self.on_air:
-            if n_live:
-                head, mode = f"EN ANTENNE  {fmt_dur(time.time() - e.started)}", "air"
-                self.l_air.set_names("  ·  ".join(o.cfg.get("name") or "flux" for o in outs if o.state == "live"))
+            # couleur selon l'état : rouge = tous les flux passent ; orange = un flux (ou plus) est HS ;
+            # jaune = la playlist de secours est à l'antenne ; rouge sombre = aucun flux ne passe
+            live_names = [o.cfg.get("name") or "flux" for o in outs if o.state == "live"]
+            hs = [o.cfg.get("name") or "flux" for o in outs if o.state == "error"]
+            dur = fmt_dur(time.time() - e.started)
+            if n_live and e.backup:
+                head, mode = f"SECOURS  {dur}", "secours"
+            elif n_live and hs:
+                head, mode = f"{len(hs)} FLUX HS  {dur}", "partial"
+            elif n_live:
+                head, mode = f"EN ANTENNE  {dur}", "air"
             elif any(o.state == "connecting" for o in e.outputs):
                 head, mode = "Connexion des flux…", "wait"
             else:
                 head, mode = "Aucun flux en ligne", "bad"
+            tip = ("À l'antenne : " + (", ".join(live_names) or "aucun flux")) + (("\nHS : " + ", ".join(hs)) if hs else "") + \
+                  ("\nLa playlist de secours est à l'antenne." if e.backup else "")
+            if self.l_air.toolTip() != tip:
+                self.l_air.setToolTip(tip)
             self.l_air.set_mode(mode)
             self.set_label(self.l_air, head, TXT)
             if self.l_air.fontMetrics().horizontalAdvance(head) + 12 > self.l_air.width():
@@ -16579,7 +16664,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.set_kind(self.btn_start, "Arrêter", "stop")
         else:
             self.l_air.set_mode("preview" if self.preview else "off")
-            self.l_air.set_names("")
+            if self.l_air.toolTip():
+                self.l_air.setToolTip("")
             self.set_label(self.l_air, "Contrôle d'entrée" if self.preview else "Hors antenne", MUT)
             self.set_kind(self.btn_start, "Démarrer", "primary")
         if self.on_air:
@@ -16808,34 +16894,15 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.nav_w.set_alert(mode if (air and (n_live > 0 or mode)) else False)
 
     def onair_chip(self, e, bad):
-        """« ● 3 flux · Web, FM, DAB+ » dans le bandeau : vert si tout passe, ambre si un flux est HS (nommé en infobulle)."""
-        l = getattr(self, "l_onair", None)
-        if l is None:
+        """Bandeau : sonie de sortie (banque principale à l'antenne ; entrée traitée pendant le contrôle d'entrée)."""
+        w = getattr(self, "loud", None)
+        if w is None:
             return
-        if not (self.on_air and e and not self.preview):
-            if l.isVisible():
-                l.hide()
-            return
-        act = [o for o in e.outputs if o.cfg.get("enabled", True)]
-        live = [o.cfg.get("name") or "flux" for o in act if o.state == "live"]
-        sig = (tuple(live), tuple(bad), len(act))
-        if sig != getattr(self, "_onair_sig", None):
-            self._onair_sig = sig
-            n = len(live)
-            if not act:
-                txt, col = "Aucun flux actif", MUT
-            elif n == len(act):
-                txt, col = f"● {n} flux à l'antenne · " + ", ".join(live), OKC
-            else:
-                txt, col = f"● {n}/{len(act)} flux · " + (", ".join(live) if live else "aucun ne passe"), (BADC if bad else ACC2)
-            l.setText(l.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, 300))
-            l.set_color(col)
-            tip = "À l'antenne : " + (", ".join(live) or "aucun")
-            if bad:
-                tip += "\nHS : " + ", ".join(bad)
-            l.setToolTip(tip + "\n(clic : onglet Diffusion)")
-        if not l.isVisible():
-            l.show()
+        pm = {}
+        if e is not None and (self.on_air or self.preview):
+            pm = (getattr(e, "pm_main", None) or getattr(e, "pm", None) or {}) if self.on_air else (getattr(e, "pm", None) or {})
+        what = "" if not pm else ("ANTENNE" if self.on_air else "ENTRÉE")
+        w.set(pm.get("lufs"), pm.get("lufs_m"), bool(pm), what)
 
     def update_playlist_visuals(self, e):
         cur = e.pl_cur if (e and e.backup) else None

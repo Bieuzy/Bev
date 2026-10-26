@@ -480,17 +480,28 @@ class AirProcessor:
         self.meter["lufs_m"] = -0.691 + 10 * math.log10(mm + 1e-12)
 
 
-# --- état partagé interface <-> moteur : réglages du processeur et contournement (bypass)
-FX = {"proc": proc_params(), "bypass": False}
-FX_ON = "Son traité (processeur)"
+# --- état partagé interface <-> moteur : quatre banques de réglages du processeur (A, B, C, D), contournement (bypass)
+# et banque affichée dans l'onglet (ses mesures). Chaque flux choisit sa banque, ou le son brut : plusieurs traitements
+# tournent en même temps (ex. Internet sur A, FM sur B avec le filtre 15 kHz, enregistrement en brut).
+BANKS = ("A", "B", "C", "D")
+RAW = "brut"
+FX = {"banks": {b: proc_params() for b in BANKS}, "bypass": False, "edit": "A"}
+FX_ON = "Son traité (processeur)"                  # (anciennes valeurs, migrées vers une banque)
 FX_NONE = "Son brut (sans traitement)"
-FX_CHOICES = [FX_ON, FX_NONE]
+
+
+def out_bank(cfg):
+    """Banque de traitement de ce flux (« A » à « D ») ou « brut ». Ancien réglage : traité -> A, brut -> brut."""
+    b = cfg.get("fx")
+    if b in BANKS or b == RAW:
+        return b
+    m = cfg.get("fxmode") or ""
+    return RAW if (m == FX_NONE or m == "Aucun traitement") else "A"
 
 
 def out_processed(cfg):
-    """Ce flux reçoit-il le son du processeur d'antenne ? (ancien réglage « Aucun traitement » = son brut)"""
-    m = cfg.get("fxmode") or ""
-    return not (m == FX_NONE or m == "Aucun traitement")
+    """Ce flux reçoit-il le son du processeur d'antenne ?"""
+    return out_bank(cfg) != RAW
 
 
 FM_PROC = "Radio FM (filtre 15 kHz + compresseur + limiteur)"
@@ -1386,13 +1397,13 @@ class Engine:
         self.gain = 1.0
         self.set_gain(prof.get("gain", "0"))
         self.cmon = CartMonitor(self.log)
-        self.proc = None                       # processeur d'antenne (traitement du son temps réel)
-        self.pm = {}                           # ses mesures (AGC, réduction de gain par bande, limiteur, LUFS…)
-        if np is not None:
-            try:
-                self.proc = AirProcessor(FX.get("proc"), bool(FX.get("bypass")))
-            except Exception as ex:
-                self.log(f"Processeur d'antenne indisponible ({ex}) : le son part sans traitement.")
+        # processeur d'antenne : une instance par banque UTILISÉE (par un flux, ou affichée dans l'onglet), créée à la demande
+        self.procs, self.proc_used = {}, {}    # banque -> AirProcessor ; banque -> dernier instant où elle a servi
+        self.proc_making = set()
+        self.proc_ok = np is not None          # passe à False si le processeur échoue (le son part alors brut)
+        self.pm = {}                           # mesures de la banque affichée (AGC, réduction de gain par bande, LUFS…)
+        self.pm_main = {}                      # mesures de la banque principale (celle du 1er flux traité) : sonie d'antenne
+        self.main_bank = "A"
         self.cap_proc = self.pl_proc = None
         self.cap_stream = None
         self.outputs = []                      # flux : créés seulement à la mise à l'antenne
@@ -1406,6 +1417,18 @@ class Engine:
         for fn in (self.capture_loop, self.playlist_loop, self.feeder_loop, self.meta_loop,
                    self.preload_carts, self.jingle_loop):
             threading.Thread(target=fn, daemon=True).start()
+        self.prewarm()
+
+    def prewarm(self):
+        """Prépare à l'avance les processeurs des banques qui vont servir (sinon les premiers dixièmes de seconde
+        d'antenne partiraient en son brut, le temps de calculer les filtres)."""
+        if not self.proc_ok:
+            return
+        want = {FX.get("edit") if FX.get("edit") in BANKS else "A"}
+        want |= {out_bank(c) for c in self.prof.get("outputs", []) if c.get("enabled", True)}
+        for b in want - {RAW}:
+            if b not in self.procs:
+                self._proc_make(b)
 
     def stop(self):
         self.running = False
@@ -1438,6 +1461,7 @@ class Engine:
                 self.late, self.late_hist = 0, []
                 self.started = time.time()
                 self.outputs = [make_output(c, self) for c in self.prof.get("outputs", [])]
+                self.prewarm()
                 self.air = True
                 self._cap_kick()
                 for o in self.outputs:
@@ -1602,29 +1626,70 @@ class Engine:
         for k in [k for k in self.inc if k.startswith("out-") and k not in ids]:
             self.inc.pop(k, None)                 # sortie retirée ou désactivée
 
-    # --- traitement du son : le processeur d'antenne traite chaque bloc UNE fois ; chaque flux reçoit le son traité ou,
-    # s'il est réglé ainsi, le son brut. Changer un réglage ou passer en bypass ne touche jamais aux encodeurs.
-    def set_processor(self, params=None, bypass=None):
+    # --- traitement du son : chaque banque utilisée traite chaque bloc UNE fois ; chaque flux reçoit le son de sa banque
+    # ou le son brut. Changer un réglage, une banque ou passer en bypass ne touche jamais aux encodeurs.
+    def apply_fx(self):
+        """Réglages des banques / bypass modifiés (FX) : appliqués aux processeurs en marche, au bloc suivant."""
+        banks = FX.get("banks") or {}
+        for b, pr in list(self.procs.items()):
+            try:
+                pr.update(banks.get(b) or proc_params())
+                pr.set_bypass(bool(FX.get("bypass")))
+            except Exception as ex:
+                self.log(f"Processeur d'antenne (banque {b}) : réglage refusé ({ex})")
+
+    def set_processor(self, params=None, bypass=None, bank=None):
+        """(compatibilité) réglages d'une banque (A par défaut) et/ou bypass."""
         if params is not None:
-            FX["proc"] = params
-            if self.proc is not None:
-                self.proc.update(params)
+            FX.setdefault("banks", {})[bank or FX.get("edit") or "A"] = params
         if bypass is not None:
             FX["bypass"] = bool(bypass)
-            if self.proc is not None:
-                self.proc.set_bypass(bypass)
+        self.apply_fx()
 
-    def distribute(self, out, raw):
-        """Bloc de 20 ms vers les sorties : son traité, ou son brut pour les flux réglés « sans traitement »."""
+    def _proc_make(self, b):
+        """Crée le processeur d'une banque dans un autre fil (le calcul des filtres prend quelques dizaines de ms : pas de
+        trou dans l'antenne). En attendant, ce flux reçoit le son de la banque principale, ou le son brut."""
+        if b in self.proc_making or not self.proc_ok:
+            return
+        self.proc_making.add(b)
+
+        def work():
+            try:
+                pr = AirProcessor((FX.get("banks") or {}).get(b) or proc_params(), bool(FX.get("bypass")))
+                self.procs[b] = pr
+            except Exception as ex:
+                self.proc_ok = False
+                self.log(f"Processeur d'antenne indisponible ({ex}) : le son part sans traitement.")
+            finally:
+                self.proc_making.discard(b)
+        threading.Thread(target=work, daemon=True).start()
+
+    def banks_needed(self, air):
+        """Banques à faire tourner : celles des flux actifs (à l'antenne) et celle affichée dans l'onglet."""
+        need = []
+        if air:
+            for o in self.outputs:
+                b = out_bank(o.cfg)
+                if b != RAW and o.cfg.get("enabled", True) and b not in need:
+                    need.append(b)
+        main = need[0] if need else None
+        ed = FX.get("edit") if FX.get("edit") in BANKS else "A"
+        if ed not in need:
+            need.append(ed)
+        return need, main or ed
+
+    def distribute(self, outs, raw):
+        """Bloc de 20 ms vers les sorties : le son de leur banque, ou le son brut."""
         for o in self.outputs:
-            o.push(out if out_processed(o.cfg) else raw)
+            b = out_bank(o.cfg)
+            o.push(raw if b == RAW else outs.get(b, outs.get(self.main_bank, raw)))
 
     def set_out_fx(self, modes):
-        """Traité / brut choisi flux par flux : pris en compte au bloc suivant, sans redémarrer l'encodeur."""
+        """Banque (ou son brut) choisie flux par flux : prise en compte au bloc suivant, sans redémarrer l'encodeur."""
         for o in list(self.outputs):
             m = modes.get(o.cfg.get("id"))
             if m is not None:
-                o.cfg["fxmode"] = m
+                o.cfg["fx"] = m if (m in BANKS or m == RAW) else out_bank({"fxmode": m})
 
     def remove_output(self, oid):
         """Retire une sortie de l'antenne en cours (elle s'arrête en arrière-plan)."""
@@ -2401,25 +2466,39 @@ class Engine:
             else:
                 out = prog
             raw = out
-            pr = self.proc
-            if pr is not None and (air or cap):         # processeur d'antenne (hors antenne : mesures sur l'entrée seulement)
-                try:
-                    po = pr.process(out if air else live)
-                    if air:
-                        out = po
-                    self.pm = pr.meter
-                except Exception as ex:
-                    self.proc = None
-                    self.log(f"Processeur d'antenne arrêté ({ex}) : le son part sans traitement.")
-            elif self.pm:
-                self.pm = {}
+            outs = {}
+            if self.proc_ok and (air or cap):           # processeur d'antenne (hors antenne : mesures sur l'entrée seulement)
+                need, main = self.banks_needed(air)
+                self.main_bank = main
+                now_ = time.time()
+                src = out if air else live
+                for b in need:
+                    pr = self.procs.get(b)
+                    if pr is None:
+                        self._proc_make(b)
+                        continue
+                    self.proc_used[b] = now_
+                    try:
+                        outs[b] = pr.process(src)
+                    except Exception as ex:
+                        self.procs.pop(b, None)
+                        self.log(f"Processeur d'antenne (banque {b}) arrêté ({ex}) : son de la banque principale ou brut.")
+                for b in [b for b in self.procs if now_ - self.proc_used.get(b, 0) > 10 and b not in need]:
+                    self.procs.pop(b, None)             # banque plus utilisée depuis 10 s : libérée
+                ed = FX.get("edit") if FX.get("edit") in BANKS else "A"
+                self.pm = self.procs[ed].meter if ed in self.procs and ed in outs else {}
+                self.pm_main = self.procs[main].meter if main in self.procs and main in outs else {}
+                if air and main in outs:
+                    out = outs[main]                    # (antenne écoutée, crêtes, voyant : la banque principale)
+            elif self.pm or self.pm_main:
+                self.pm, self.pm_main = {}, {}
             lv = peak_db(out)
             if max(lv) > -0.3:
                 self.clip_t = time.time()
             for ch in (0, 1):
                 self.peak[ch] = max(self.peak[ch], lv[ch])
             if air:
-                self.distribute(out, raw)
+                self.distribute(outs, raw)
             if self.cmon.stream:                   # casque : antenne écoutée (si demandé) + pré-écoute des cartouches
                 parts = []
                 if self.listen and air:
@@ -2652,7 +2731,7 @@ class Output:
 
     def filters(self):
         # son traité par le processeur d'antenne : pas de second traitement dans l'encodeur (il recompresserait)
-        if getattr(self.eng, "proc", None) is not None and out_processed(self.cfg):
+        if getattr(self.eng, "proc_ok", False) and out_processed(self.cfg):
             return []
         f = PROCESSING.get(self.cfg.get("processing", "Aucun"), "")
         return ["-af", f] if f else []
@@ -3329,7 +3408,7 @@ class EngineWorker:
                 "slow": e.slow_now(), "mix_g": e.mix_g, "carts": st, "loading": set(loading),
                 "voices": [(v["id"], bool(v["stopping"])) for v in list(e.voices)],
                 "outs": [(o.cfg.get("id"), o.state, o.detail, o.t_live) for o in outs], "cmon": e.cmon.label,
-                "pm": dict(e.pm) if e.pm else {}}
+                "pm": dict(e.pm) if e.pm else {}, "pm_main": dict(e.pm_main) if e.pm_main else {}}
 
     def sender(self):
         """Seul fil qui écrit vers l'interface (une connexion ne supporte pas deux écritures simultanées)."""
@@ -3374,7 +3453,7 @@ class EngineWorker:
             return
         elif k == "fx":
             FX.update(m[1])
-            e.set_processor(FX.get("proc"), FX.get("bypass"))
+            e.apply_fx()
         elif k == "call":
             getattr(e, m[1])(*m[2], **m[3])
         elif k == "set":
@@ -3678,7 +3757,7 @@ class EngineProxy:
                    "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
                    "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": [],
                    "air": False, "monitor": False, "listen": False, "cap_state": "off", "cap_err": "",
-                   "src_dev": (prof.get("source") or {}).get("device", ""), "pm": {}}
+                   "src_dev": (prof.get("source") or {}).get("device", ""), "pm": {}, "pm_main": {}}
         d["in_peak"], d["peak"] = [-90.0, -90.0], [-90.0, -90.0]
         d["pid"] = slot.pid
 
@@ -3954,10 +4033,13 @@ class EngineProxy:
     def set_cart_live(self, cid, **kw):
         self._call("set_cart_live", cid, **kw)
 
-    def set_processor(self, params=None, bypass=None):
-        """Réglages du processeur d'antenne / bypass : envoyés tout de suite au moteur (appliqués au bloc suivant)."""
+    def apply_fx(self):
+        """Banques du processeur / bypass modifiés (FX) : envoyés tout de suite au moteur (appliqués au bloc suivant)."""
+        self._send(("noop",))
+
+    def set_processor(self, params=None, bypass=None, bank=None):
         if params is not None:
-            FX["proc"] = params
+            FX.setdefault("banks", {})[bank or FX.get("edit") or "A"] = params
         if bypass is not None:
             FX["bypass"] = bool(bypass)
         self._send(("noop",))
@@ -3966,7 +4048,7 @@ class EngineProxy:
         for o in self.outputs:
             m = modes.get(o.cfg.get("id"))
             if m is not None:
-                o.cfg["fxmode"] = m
+                o.cfg["fx"] = m
         self._call("set_out_fx", modes)
 
     def set_manual(self, on):

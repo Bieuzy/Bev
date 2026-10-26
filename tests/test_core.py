@@ -150,3 +150,46 @@ def test_fichier_express(tmp_path):
         r = subprocess.run([sys.executable, "-I", "-c", probe, str(f)], capture_output=True, text=True, timeout=60)
         assert r.stdout.strip() == "ok", r.stderr
     assert any(n.startswith("bev_core-") for n in os.listdir(tmp_path / "cache"))
+
+
+@needs_ffmpeg
+def test_banques_par_flux(tmp_path):
+    """Trois flux, trois traitements en même temps : banque A (« Loud »), banque B (« Classique ») et son brut."""
+    src = str(tmp_path / "musique.wav")
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "sine=f=220:d=30,volume=-24dB", "-ac", "2", src], check=True)
+    old = {k: (dict(v) if isinstance(v, dict) else v) for k, v in bc.FX.items()}
+    bc.FX["banks"] = {"A": bc.proc_params("Loud"), "B": bc.proc_params("Classique"), "C": bc.proc_params(), "D": bc.proc_params()}
+    bc.FX["edit"], bc.FX["bypass"] = "A", False
+    prof = bc.default_profile()
+    prof["source"] = {"device": ""}
+    prof["fallback"].update(enabled=True, playlist=[src], silence_s="1", threshold="-60")
+    outs = []
+    for b in ("A", "B", "brut"):
+        o = bc.new_output("record")
+        o.update(folder=str(tmp_path / b), format="WAV", fx=b, name=b)
+        outs.append(o)
+    prof["outputs"] = outs
+    e = bc.Engine(prof, lambda m: None)
+    try:
+        e.start()
+        e.set_air(True)
+        time.sleep(9)
+        assert set(e.procs) == {"A", "B"}, e.procs           # deux processeurs en marche, pas de processeur pour « brut »
+        assert e.pm_main and e.main_bank == "A"
+    finally:
+        e.set_air(False)
+        time.sleep(1.5)
+        e.stop()
+        bc.FX.clear()
+        bc.FX.update(old)
+
+    def mean_db(b):
+        f = next((tmp_path / b).iterdir())
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-ss", "4", "-i", str(f), "-af", "volumedetect", "-f", "null", "-"],
+                           capture_output=True, text=True)
+        import re
+        return float(re.search(r"mean_volume:\s*(-?[\d.]+)", r.stderr).group(1))
+    a, b, raw = mean_db("A"), mean_db("B"), mean_db("brut")
+    assert a > raw + 6, (a, b, raw)            # « Loud » : nettement plus fort que le son brut
+    assert abs(b - raw) < a - raw, (a, b, raw)  # « Classique » : bien plus proche du brut que « Loud »

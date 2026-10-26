@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 OUT = os.path.abspath(_ARGS[0] if _ARGS else "captures")
 SIZES = [(1440, 900), (1180, 760)]
 PAGES = [k for k in bev.PAGE_KEYS]
+STATES = ("air", "partial", "secours", "bad")
 
 
 def main():
@@ -35,7 +36,7 @@ def main():
     for (W, H) in SIZES:
         for k in PAGES:
             jobs.append((W, H, k, None))
-        for state in getattr(w, "CAPTURE_STATES", ()):
+        for state in STATES:
             jobs.append((W, H, "diff", state))
 
     def step(i=0):
@@ -46,17 +47,19 @@ def main():
         W, H, k, state = jobs[i]
         w.resize(W, H)
         w.go_tab(k)
-        if state is not None:
-            w.capture_state(state)
         QTimer.singleShot(900, lambda: shoot(i))
 
     def shoot(i):
         W, H, k, state = jobs[i]
+        if state is not None:                      # état simulé, dessiné juste avant la capture
+            text = {"air": "EN ANTENNE  01:12:09", "partial": "1 FLUX HS  01:12:09", "secours": "SECOURS  01:12:09",
+                    "bad": "Aucun flux en ligne", "wait": "Connexion des flux…"}[state]
+            w.l_air.set_mode(state)
+            w.set_label(w.l_air, text, bev.TXT)
+            w.loud.set(-16.4, -14.9, True, "ANTENNE")
         name = f"{W}x{H}-{PAGE_KEYS_IDX[k]:02d}-{k}" + (f"-{state}" if state else "") + ".png"
         w.grab().save(os.path.join(out, name))
         print("capture", name, flush=True)
-        if state is not None:
-            w.capture_state(None)
         QTimer.singleShot(50, lambda: step(i + 1))
 
     QTimer.singleShot(2500, step)
