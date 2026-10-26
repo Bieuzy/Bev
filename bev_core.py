@@ -3347,6 +3347,258 @@ def public_info(ip):
     except Exception:
         return {}
 
+# ------------------------------------------------- métadonnées d'un automate de diffusion (Radiologik, RadioDJ, Rivendell…)
+AUTO_PORT = 8765
+AUTO_KEYS = {"title": ("title", "titre", "song", "track", "name"), "artist": ("artist", "artiste", "interprete", "performer"),
+             "album": ("album",), "cover": ("cover", "artwork", "art", "image", "picture", "pochette", "coverurl", "cover_url")}
+
+
+def auto_parse(raw, ctype=""):
+    """Titre en cours envoyé ou écrit par un automate -> {"artist", "title", "album", "cover"} (valeurs vides si absentes).
+    Accepte : JSON, XML (balises ou attributs), formulaire / adresse « artist=…&title=… », ou texte « Artiste - Titre »."""
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                raw = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    t = (raw or "").strip().lstrip("﻿")
+    out = {"artist": "", "title": "", "album": "", "cover": ""}
+
+    def take(d):
+        low = {str(k).lower().replace("-", "_"): v for k, v in d.items()}
+        for field, names in AUTO_KEYS.items():
+            for n in names:
+                v = low.get(n)
+                if isinstance(v, list):
+                    v = v[0] if v else ""
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    out[field] = str(v).strip()
+                    break
+    if not t:
+        return out
+    if t[:1] in "{[":
+        try:
+            js = json.loads(t)
+            if isinstance(js, list):
+                js = js[0] if js else {}
+            if isinstance(js, dict):
+                for k in ("now", "nowplaying", "now_playing", "current", "track", "song"):  # {"now": {...}}
+                    if isinstance(js.get(k), dict):
+                        js = {**js, **js[k]}
+                take(js)
+                return out
+        except ValueError:
+            pass
+    if t.startswith("<"):
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(t)
+            d = {}
+            for el in root.iter():
+                tag = el.tag.split("}")[-1]
+                if (el.text or "").strip() and tag.lower() not in d:
+                    d[tag] = el.text.strip()
+                for k, v in el.attrib.items():
+                    d.setdefault(k, v)
+            take(d)
+            return out
+        except ET.ParseError:
+            pass
+    if "=" in t and ("&" in t or t.split("=", 1)[0].lower() in sum(AUTO_KEYS.values(), ())) and "\n" not in t:
+        take(urllib.parse.parse_qs(t.lstrip("?"), keep_blank_values=False))
+        if out["title"] or out["artist"]:
+            return out
+    line = next((ln.strip() for ln in t.splitlines() if ln.strip()), "")
+    if " - " in line:
+        out["artist"], out["title"] = [x.strip() for x in line.split(" - ", 1)]
+    elif " – " in line:
+        out["artist"], out["title"] = [x.strip() for x in line.split(" – ", 1)]
+    else:
+        out["title"] = line
+    return out
+
+
+def auto_text(info):
+    a, t = (info.get("artist") or "").strip(), (info.get("title") or "").strip()
+    return f"{a} - {t}" if a and t else (t or a)
+
+
+class AutomateMeta:
+    """Reçoit le titre en cours d'un automate de deux façons (au choix, ou les deux) :
+      - FICHIER : l'automate écrit le titre dans un fichier (texte, XML ou JSON) ; Bev le relit dès qu'il change ;
+      - RÉSEAU : l'automate appelle une adresse de Bev à chaque titre, par ex.
+        http://127.0.0.1:8765/?artist=…&title=…&cover=… (GET), ou envoie du JSON / un formulaire / du texte (POST).
+    La pochette peut être une adresse web (téléchargée) ou un fichier image. on_change(info) est appelé à chaque nouveau titre,
+    info = {"artist", "title", "album", "cover" (fichier local ou ""), "text", "source", "t"}."""
+
+    def __init__(self, on_change, log=lambda m: None):
+        self.on_change, self.log = on_change, log
+        self.cfg = {}
+        self.last, self.last_sig = None, None
+        self.srv = None
+        self.port_err = ""
+        self.stop_ev = threading.Event()
+        self.cover_dir = os.path.join(os.path.expanduser("~"), ".broadcast_tool_covers", "automate")
+        threading.Thread(target=self._watch_file, daemon=True).start()
+
+    # --- réglages : {"on": bool, "file": chemin, "net": bool, "port": int, "lan": bool}
+    def configure(self, cfg):
+        cfg = dict(cfg or {})
+        old = self.cfg
+        self.cfg = cfg
+        want = bool(cfg.get("on") and cfg.get("net"))
+        key = (want, int(cfg.get("port") or AUTO_PORT), bool(cfg.get("lan")))
+        if key != getattr(self, "_srv_key", None):
+            self._srv_key = key
+            self._stop_server()
+            if want:
+                self._start_server(key[1], key[2])
+        if cfg.get("file") != old.get("file"):
+            self._fsig = None
+
+    def stop(self):
+        self.stop_ev.set()
+        self._stop_server()
+
+    def url(self, host="127.0.0.1"):
+        return f"http://{host}:{int(self.cfg.get('port') or AUTO_PORT)}/"
+
+    # --- fichier
+    def _watch_file(self):
+        self._fsig = None
+        while not self.stop_ev.wait(1.0):
+            f = (self.cfg.get("file") or "").strip()
+            if not (self.cfg.get("on") and f):
+                continue
+            try:
+                stt = os.stat(f)
+                sig = (stt.st_mtime_ns, stt.st_size)
+                if sig == self._fsig:
+                    continue
+                self._fsig = sig
+                time.sleep(0.15)                          # l'automate finit d'écrire
+                with open(f, "rb") as fh:
+                    raw = fh.read(65536)
+                self.receive(auto_parse(raw), "fichier", base=os.path.dirname(f))
+            except OSError:
+                continue
+
+    # --- réseau
+    def _start_server(self, port, lan):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import ipaddress
+        me = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _allowed(self):
+                try:
+                    ip = ipaddress.ip_address(self.client_address[0])
+                    return ip.is_loopback or (lan and ip.is_private)
+                except ValueError:
+                    return False
+
+            def _answer(self, code, text):
+                body = (text + "\n").encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _handle(self, raw, ctype):
+                if not self._allowed():
+                    return self._answer(403, "refusé : adresse hors du réseau local")
+                info = auto_parse(raw, ctype)
+                if not (info["title"] or info["artist"]):
+                    return self._answer(400, "aucun titre reçu (paramètres attendus : artist, title, cover)")
+                me.receive(info, "réseau")
+                self._answer(200, "ok : " + auto_text(info))
+
+            def do_GET(self):
+                q = urllib.parse.urlsplit(self.path).query
+                if not q:
+                    return self._answer(200 if self._allowed() else 403, "Bev : prêt à recevoir le titre en cours "
+                                        "(?artist=…&title=…&cover=…)")
+                self._handle(q, "")
+
+            def do_POST(self):
+                n = min(int(self.headers.get("Content-Length") or 0), 65536)
+                raw = self.rfile.read(n) if n else b""
+                ctype = self.headers.get("Content-Type", "")
+                q = urllib.parse.urlsplit(self.path).query
+                self._handle(raw if raw.strip() else q.encode(), ctype)
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0" if lan else "127.0.0.1", port), H)
+            srv.daemon_threads = True
+            self.srv, self.port_err = srv, ""
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True).start()
+            self.log(f"Automate : réception des titres sur le port {port}" + (" (réseau local)." if lan else " (cet ordinateur)."))
+        except OSError as ex:
+            self.srv, self.port_err = None, f"port {port} indisponible ({ex.strerror or ex})"
+            self.log(f"Automate : {self.port_err}.")
+
+    def _stop_server(self):
+        srv, self.srv = self.srv, None
+        if srv is not None:
+            threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
+
+    # --- titre reçu
+    def receive(self, info, source, base=""):
+        if not (info.get("title") or info.get("artist")):
+            return
+        sig = (info.get("artist"), info.get("title"), info.get("album"), info.get("cover"))
+        if sig == self.last_sig:
+            return
+        self.last_sig = sig
+        cov = self.fetch_cover(info.get("cover") or "", base)
+        res = {**info, "cover": cov, "text": auto_text(info), "source": source, "t": time.time()}
+        self.last = res
+        try:
+            self.on_change(res)
+        except Exception as ex:
+            self.log(f"Automate : titre non affiché ({ex})")
+
+    def fetch_cover(self, ref, base=""):
+        """Pochette : fichier local (chemin, éventuellement relatif au fichier de l'automate, ou file://), ou adresse web
+        téléchargée (2 Mo au plus) dans un petit cache. Renvoie un chemin de fichier, ou ""."""
+        ref = (ref or "").strip()
+        if not ref:
+            return ""
+        if ref.lower().startswith("file://"):
+            ref = urllib.parse.unquote(urllib.parse.urlsplit(ref).path)
+            if SYS == "Windows" and re.match(r"^/[A-Za-z]:", ref):
+                ref = ref[1:]
+        if not ref.lower().startswith(("http://", "https://")):
+            p = ref if os.path.isabs(ref) else os.path.join(base or "", ref)
+            return p if os.path.isfile(p) else ""
+        try:
+            os.makedirs(self.cover_dir, exist_ok=True)
+            fn = os.path.join(self.cover_dir, hashlib.sha1(ref.encode("utf-8")).hexdigest()[:16] + ".img")
+            if not os.path.isfile(fn):
+                rq = urllib.request.Request(ref, headers={"User-Agent": "Bev"})
+                with urllib.request.urlopen(rq, timeout=6) as r:
+                    data = r.read(2_000_001)
+                if len(data) > 2_000_000 or not data:
+                    return ""
+                with open(fn + ".tmp", "wb") as fh:
+                    fh.write(data)
+                os.replace(fn + ".tmp", fn)
+                for old in sorted(os.listdir(self.cover_dir), key=lambda n: os.path.getmtime(os.path.join(self.cover_dir, n)))[:-60]:
+                    try:
+                        os.remove(os.path.join(self.cover_dir, old))       # cache borné aux 60 dernières pochettes
+                    except OSError:
+                        pass
+            return fn
+        except Exception as ex:
+            self.log(f"Automate : pochette non récupérée ({redact(ex)})")
+            return ""
+
+
 # ============================================================ INTERFACE Qt (PySide6)
 # ------------------------------------------------------------------ moteur audio dans un processus séparé
 # Le moteur (capture, mixage, cartouches, encodeurs) tourne dans son propre processus Python : il a son propre cœur de

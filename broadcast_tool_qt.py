@@ -2440,7 +2440,7 @@ class NavBase(QWidget):
 
 class Rail(NavBase):
     BG_HZ = 12             # halos colorés (ambiance Psyché) : ils dérivent très lentement, 12 images/s sont invisibles à l'œil
-    LAYOUT = (("sec", "Antenne"), ("diff", "Diffusion"), ("son", "Traitement son"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"),
+    LAYOUT = (("sec", "Antenne"), ("diff", "Diffusion"), ("son", "Processeur"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"),
               ("sec", "Contrôle"), ("mon", "Monitoring"), ("net", "Réseau"), ("sos", "SOS"),
               ("sec", "Application"), ("set", "Réglages"), ("about", "À propos"))
     W, RH = 214, 40
@@ -2657,7 +2657,7 @@ class Rail(NavBase):
             p.setPen(QColor(TXT if (on or hv) else LABEL_C))
             tx = 62 + (3 if hv else 0)
             p.drawText(QRectF(tx, y, w - 70, self.RH), Qt.AlignmentFlag.AlignVCenter, lab)
-            if k == "son" and False:                        # (ancienne étiquette BÊTA : le traitement son est sorti de bêta)
+            if k == "son":                                  # processeur d'antenne : en bêta
                 bx = tx + QFontMetrics(lf).horizontalAdvance(lab) + 6
                 bf = QFont(self.font())
                 bf.setPointSizeF(6.4)
@@ -2756,7 +2756,7 @@ class Rail(NavBase):
 
 
 class TopNav(NavBase):
-    ITEMS = tuple(i for i in (("diff", "Diffusion"), ("son", "Traitement"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"), ("mon", "Monitoring"),
+    ITEMS = tuple(i for i in (("diff", "Diffusion"), ("son", "Processeur"), ("cart", "Cartoucheur"), ("rec", "Enregistrement"), ("mon", "Monitoring"),
                               ("net", "Réseau"), ("sos", "SOS"), ("set", "Réglages"), ("about", "À propos"))
                   if not MINI or i[0] in ("diff", "cart", "rec", "mon", "sos", "set"))
     H = 44
@@ -4055,9 +4055,9 @@ class AssistantKB:
                     "puis choisis « Son de l'ordinateur » dans la liste des entrées.")
         add("Son saturé", ["sature", "clip", "distorsion", "trop fort", "grésille", "gresille", "craque", "ecrete", "rouge"],
             lambda: "Son saturé (CLIP) : baisse le gain d'entrée de quelques dB et vérifie que la table de mixage ne sature pas déjà. Vise des crêtes autour de -6 dB. "
-                    "Le processeur d'antenne (page « Traitement son ») tient le niveau et garantit le plafond : vérifie qu'il n'est pas en bypass.")
+                    "Le processeur d'antenne (onglet « Processeur d'antenne ») tient le niveau et garantit le plafond : vérifie qu'il n'est pas en bypass.")
         add("Son trop faible", ["trop faible", "trop bas", "volume bas", "pas assez fort", "niveau bas", "gain"],
-            lambda: "Son trop faible : monte le gain d'entrée (+6 dB max), ou choisis un préréglage plus dense dans « Traitement son » (son AGC ramène les sources faibles au bon niveau).")
+            lambda: "Son trop faible : monte le gain d'entrée (+6 dB max), ou choisis un préréglage plus dense dans « Processeur d'antenne » (son AGC ramène les sources faibles au bon niveau).")
         add("Écho / larsen", ["echo", "larsen", "retour", "eco", "double son", "on s'entend"],
             lambda: "Écho ou larsen : coupe le haut-parleur d'écoute pendant les prises de parole, ou écoute au casque. Si l'écho vient des auditeurs, ils entendent leur radio avec le retard "
                     "du flux (10 à 30 s) : demande-leur de couper leur poste.")
@@ -8885,7 +8885,7 @@ def row(label, w, width=150):
 
 
 class PagesMixin1:
-    TABNAMES = {"Diffusion": "diff", "Traitement son": "son", "Cartoucheur": "cart", "Enregistrement": "rec", "Monitoring": "mon", "SOS": "sos"}
+    TABNAMES = {"Diffusion": "diff", "Processeur d'antenne": "son", "Cartoucheur": "cart", "Enregistrement": "rec", "Monitoring": "mon", "SOS": "sos"}
 
     @property
     def outputs_cfg(self):
@@ -10175,36 +10175,56 @@ class ProcMeters(QWidget):
 
 
 class PagesMixin2:
-    """Page « Traitement son » : le processeur d'antenne, réglé en temps réel."""
+    """Page « Processeur d'antenne » (bêta) : quatre banques de réglages, un traitement par flux, réglé en temps réel."""
 
-    # --- réglages enregistrés (self.data["proc"]) et migration de l'ancien traitement par pages A-D
+    # --- réglages enregistrés : self.data["proc"] = {"banks": {A, B, C, D}, "edit": banque affichée, "bypass": bool}
+    @staticmethod
+    def proc_norm(params):
+        p = proc_params((params or {}).get("preset", PROC_DEFAULT))
+        p.update({k: v for k, v in (params or {}).items() if k in PROC_BASE})
+        p["preset"] = (params or {}).get("preset", PROC_DEFAULT) if (params or {}).get("preset") in PROC_PRESETS else (
+            "zero" if (params or {}).get("preset") == "zero" else PROC_DEFAULT)
+        p["custom"] = bool((params or {}).get("custom"))
+        return p
+
     def proc_load(self):
         d = self.data.get("proc")
-        if not isinstance(d, dict) or not isinstance(d.get("params"), dict):
-            pages = self.data.get("fx_pages") or {}
-            old = pages.get(self.data.get("fx_page", "A")) or self.data.get("fx") or {}
-            name = PROC_OLD.get(old.get("preset"), PROC_DEFAULT)
-            d = {"params": proc_params(name), "bypass": bool(old) and not old.get("on", True)}
-            if old.get("mono"):
-                d["params"]["mono"] = True
+        if not isinstance(d, dict) or not isinstance(d.get("banks"), dict):
+            base = None
+            if isinstance(d, dict) and isinstance(d.get("params"), dict):       # 1.1 : un seul réglage -> les 4 banques
+                base, byp = d["params"], bool(d.get("bypass"))
+            else:                                                               # plus ancien : pages A-D de traitement
+                pages = self.data.get("fx_pages") or {}
+                old = pages.get(self.data.get("fx_page", "A")) or self.data.get("fx") or {}
+                base = proc_params(PROC_OLD.get(old.get("preset"), PROC_DEFAULT))
+                if old.get("mono"):
+                    base["mono"] = True
+                byp = bool(old) and not old.get("on", True)
+            d = {"banks": {b: json.loads(json.dumps(base)) for b in BANKS}, "edit": "A", "bypass": byp}
             self.data["proc"] = d
-        p = proc_params(d["params"].get("preset", PROC_DEFAULT))
-        p.update({k: v for k, v in d["params"].items() if k in PROC_BASE})
-        p["preset"] = d["params"].get("preset", PROC_DEFAULT)
-        p["custom"] = bool(d["params"].get("custom"))
-        d["params"] = p
-        FX["proc"] = json.loads(json.dumps(p))
-        FX["bypass"] = bool(d.get("bypass"))
+        d["banks"] = {b: self.proc_norm(d["banks"].get(b)) for b in BANKS}
+        d["edit"] = d.get("edit") if d.get("edit") in BANKS else "A"
+        d["bypass"] = bool(d.get("bypass"))
+        self.proc_fx(d)
         return d
+
+    @staticmethod
+    def proc_fx(d):
+        FX["banks"] = json.loads(json.dumps(d["banks"]))
+        FX["bypass"] = bool(d.get("bypass"))
+        FX["edit"] = d.get("edit", "A")
+
+    def pp(self):
+        """Réglages de la banque affichée."""
+        return self.proc["banks"][self.proc["edit"]]
 
     def proc_send(self):
         """Envoi au moteur (au plus 25 fois par seconde pendant qu'on bouge un curseur) : appliqué au bloc audio suivant."""
-        FX["proc"] = json.loads(json.dumps(self.proc["params"]))
-        FX["bypass"] = bool(self.proc.get("bypass"))
+        self.proc_fx(self.proc)
         e = self.engine
         if e is not None and getattr(e, "running", False):
             try:
-                e.set_processor(FX["proc"], FX["bypass"])
+                e.apply_fx()
             except Exception:
                 pass
 
@@ -10222,22 +10242,28 @@ class PagesMixin2:
         if refresh:
             self.proc_refresh()
 
-    def proc_slider(self, card, label, key, lo, hi, fmt, idx=None, scale=10, tip=""):
+    def proc_slider(self, card, label, key, lo, hi, fmt, idx=None, scale=10, tip="", get=None, put=None, lay=None):
+        """Curseur d'un réglage. get / put : conversion pour les réglages simplifiés (ex. « Médiums » = bandes 2 et 3)."""
         h = QHBoxLayout()
+        h.setSpacing(8)
         l = lab(label, "")
-        l.setFixedWidth(134)
+        l.setFixedWidth(118)
         if tip:
             l.setToolTip(tip)
         h.addWidget(l)
         sl = Slider(Qt.Orientation.Horizontal)
         sl.setRange(int(lo * scale), int(hi * scale))
+        if tip:
+            sl.setToolTip(tip)
         val = lab("", "")
-        val.setFixedWidth(84)
+        val.setFixedWidth(70)
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         val.setStyleSheet(f"color:{ACCT};font-weight:700;")
 
-        def get():
-            v = self.proc["params"][key]
+        def _get():
+            if get is not None:
+                return float(get(self.pp()))
+            v = self.pp()[key]
             return float(v[idx] if idx is not None else v)
 
         def moved(v):
@@ -10245,8 +10271,10 @@ class PagesMixin2:
             val.setText(fmt(x) if callable(fmt) else fmt % x)
             if self._proc_loading:
                 return
-            pp = self.proc["params"]
-            if idx is not None:
+            pp = self.pp()
+            if put is not None:
+                put(pp, x)
+            elif idx is not None:
                 t = list(pp[key])
                 t[idx] = x
                 pp[key] = t
@@ -10257,135 +10285,204 @@ class PagesMixin2:
         sl.valueChanged.connect(moved)
         h.addWidget(sl, 1)
         h.addWidget(val)
-        card.lay.addLayout(h)
-        self.procw.append((sl, val, fmt, get, scale))
-        sl.setValue(int(round(get() * scale)))
-        val.setText(fmt(get()) if callable(fmt) else fmt % get())
+        (lay or card.lay).addLayout(h)
+        self.procw.append((sl, val, fmt, _get, scale))
+        sl.setValue(int(round(_get() * scale)))
+        val.setText(fmt(_get()) if callable(fmt) else fmt % _get())
         return sl
 
-    def proc_switch(self, card, text, key, tip=""):
+    def proc_switch(self, card, text, key, tip="", lay=None):
         w = Switch(text)
         if tip:
             w.setToolTip(tip)
-        w.setChecked(bool(self.proc["params"].get(key)))
+        w.setChecked(bool(self.pp().get(key)))
 
         def tg(on):
             if not self._proc_loading:
-                self.proc["params"][key] = bool(on)
-                self.proc["params"]["custom"] = True
+                self.pp()[key] = bool(on)
+                self.pp()["custom"] = True
                 self.proc_changed()
         w.toggled.connect(tg)
-        card.lay.addWidget(w)
+        (lay or card.lay).addWidget(w)
         self.procs.append((w, key))
         return w
+
+    # équilibre tonal simplifié : 3 curseurs pour les 5 bandes du multibande
+    TONE = (("Graves", (0,)), ("Médiums", (1, 2)), ("Aigus", (3, 4)))
+
+    @staticmethod
+    def _rel_get(pp):                    # vitesse 1 (lent, 1,2 s) … 10 (rapide, 60 ms) <-> retour du multibande
+        r = max(60.0, min(1200.0, float(pp.get("mb_release", 250.0))))
+        return 1 + 9 * math.log(1200.0 / r) / math.log(20.0)
+
+    @staticmethod
+    def _rel_put(pp, v):
+        pp["mb_release"] = round(1200.0 / 20.0 ** ((v - 1) / 9), 0)
 
     def _page_son(self):
         pg = Page()
         g = pg.grid
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
         g.setColumnStretch(2, 1)
         self.proc = self.proc_load()
-        self.procw, self.procs, self._proc_loading, self.proc_btns = [], [], True, {}   # (construction : rien n'est envoyé)
-        # --- en-tête : bypass, préréglages radio
-        top = Card("Processeur d'antenne", "Traitement temps réel de tout ce qui part à l'antenne : AGC, compresseur-limiteur "
-                   "5 bandes à phase linéaire, élargisseur stéréo, écrêteur suréchantillonné, limiteur sur les crêtes vraies.")
-        h = WrapRow()
-        self.btn_bypass = btn("", "primary", self.proc_toggle_bypass,
-                              "Bypass : le son brut part à l'antenne (bascule en fondu, sans coupure, même latence)")
-        self.btn_bypass.setMinimumSize(250, 40)
-        h.addWidget(self.btn_bypass)
-        h.addSpacing(10)
+        self.procw, self.procs, self._proc_loading = [], [], True          # (construction : rien n'est envoyé)
+        # --- en-tête : banque, préréglages, à zéro, réinitialiser, bypass
+        top = Card()
+        top.lay.setSpacing(8)
+        h = QHBoxLayout()
+        h.setSpacing(10)
+        t = lab("Processeur d'antenne", "")
+        t.setStyleSheet("font-size:17px;font-weight:800;")
+        h.addWidget(t)
+        beta = lab("BÊTA", "")
+        beta.setStyleSheet(f"background:{ACC};color:{ONACC};font-size:10px;font-weight:800;border-radius:8px;padding:2px 8px;")
+        beta.setToolTip("Fonction en cours de mise au point : écoutez le résultat avant de l'utiliser à l'antenne.")
+        h.addWidget(beta, 0, Qt.AlignmentFlag.AlignVCenter)
+        h.addSpacing(12)
+        h.addWidget(lab("Banque", "mut"))
+        self.seg_bank = Segmented(list(BANKS), w=44, h=30)
+        self.seg_bank.setValue(BANKS.index(self.proc["edit"]))
+        self.seg_bank.changed.connect(lambda k: self.proc_bank(BANKS[k]))
+        self.seg_bank.setToolTip("Quatre banques de réglages. Chaque flux choisit la sienne (à droite) : plusieurs traitements "
+                                 "peuvent tourner en même temps.")
+        h.addWidget(self.seg_bank)
         self.l_preset = lab("", "")
-        self.l_preset.setStyleSheet("font-size:15px;font-weight:800;")
+        self.l_preset.setStyleSheet("font-size:14px;font-weight:700;")
         h.addWidget(self.l_preset)
         h.addStretch(1)
-        self.btn_preset_reset = btn("Revenir au préréglage", "", lambda: self.proc_preset(self.proc["params"]["preset"]),
-                                    "Annule les réglages fins et reprend le préréglage tel quel")
-        h.addWidget(self.btn_preset_reset)
+        self.btn_bypass = btn("", "primary", self.proc_toggle_bypass,
+                              "Bypass : le son brut part à l'antenne sur tous les flux (bascule en fondu, sans coupure)")
+        self.btn_bypass.setMinimumHeight(36)
+        h.addWidget(self.btn_bypass)
         top.lay.addLayout(h)
-        fl = WrapRow(None, 8)
-        box = QWidget()
-        box.setLayout(fl)
+        h2 = QHBoxLayout()
+        h2.setSpacing(8)
+        mb_ = btn("Préréglages  ▾", "", None, "Charger un préréglage radio dans la banque affichée")
+        menu = QMenu(mb_)
         for name in PROC_ORDER:
-            b = btn(name.replace("&", "&&"), "", lambda n=name: self.proc_preset(n), PROC_INFO.get(name, ""))
-            b.setMinimumHeight(34)
-            fl.addWidget(b)
-            self.proc_btns[name] = b
-        top.lay.addWidget(box)
-        self.l_preset_info = lab("", "mut", True)
-        top.lay.addWidget(self.l_preset_info)
+            a_ = menu.addAction(name.replace("&", "&&"))
+            a_.setToolTip(PROC_INFO.get(name, ""))
+            a_.triggered.connect(lambda _c=False, n=name: self.proc_preset(n))
+        menu.setToolTipsVisible(True)
+        mb_.setMenu(menu)
+        h2.addWidget(mb_)
+        h2.addWidget(btn("À zéro", "", self.proc_zero, "Réglage neutre : aucune couleur ni compression, seul le limiteur "
+                                                         "final garantit le plafond. Point de départ pour construire son son."))
+        self.btn_preset_reset = btn("Réinitialiser", "", self.proc_reset, "Annule les réglages fins de cette banque")
+        h2.addWidget(self.btn_preset_reset)
+        self.l_preset_info = lab("", "mut")
+        h2.addWidget(self.l_preset_info, 1)
+        top.lay.addLayout(h2)
         g.addWidget(top, 0, 0, 1, 3)
-        # --- mesures
-        mc = Card("Mesures", "AGC, réduction de gain par bande, limiteur final, écrêteur et sonie de sortie")
+        # --- niveau et densité (AGC + mesures + densité, un seul module)
+        nv = Card("Niveau et densité", "Volume automatique (AGC), densité, et ce que fait le processeur en ce moment")
+        hh = QHBoxLayout()
+        hh.setSpacing(18)
         self.proc_meters = ProcMeters()
-        mc.lay.addWidget(self.proc_meters, 1)
-        g.addWidget(mc, 1, 0, 1, 2)
-        # --- densité
-        dn = Card("Densité", "MOINS ↔ PLUS : plus dense = plus fort et plus régulier, moins dense = plus naturel")
-        self.proc_slider(dn, "Moins ↔ Plus", "lm", 1, 10, "%.1f", tip="Comme le réglage LESS-MORE d'un Optimod")
-        self.proc_switch(dn, "AGC (volume automatique lent)", "agc",
-                         "Ramène doucement toutes les sources au même niveau ; se fige dans les silences (porte)")
-        self.proc_slider(dn, "Vitesse AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau")
-        self.proc_slider(dn, "Porte AGC", "agc_gate", -60, -25, "%.0f dBFS",
-                         tip="Sous ce niveau (silence, souffle), l'AGC et le multibande se figent : pas de bruit qui remonte")
-        self.proc_slider(dn, "AGC des graves", "bass_agc", 0, 6, "±%.0f dB", tip="Équilibre automatique des graves entre les sources")
-        dn.lay.addStretch(1)
-        g.addWidget(dn, 1, 2)
+        self.proc_meters.setMinimumHeight(170)
+        hh.addWidget(self.proc_meters, 3)
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        self.proc_slider(nv, "Densité", "lm", 1, 10, lambda v: ("naturel" if v < 3.5 else "dense" if v > 7 else "moyen") + f"  {v:.1f}",
+                         tip="MOINS ↔ PLUS : plus dense = plus fort et plus régulier, moins dense = plus naturel", lay=col)
+        self.proc_switch(nv, "Volume automatique (AGC)", "agc",
+                         "Ramène doucement toutes les sources au même niveau ; se fige dans les silences", lay=col)
+        self.proc_slider(nv, "Vitesse de l'AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau", lay=col)
+        col.addStretch(1)
+        hh.addLayout(col, 2)
+        nv.lay.addLayout(hh, 1)
+        g.addWidget(nv, 1, 0, 1, 2)
+        # --- son envoyé à chaque flux
+        pf = Card("Traitement de chaque flux", "Une banque par flux, ou le son brut")
+        self.fx_rows = QVBoxLayout()
+        self.fx_rows.setSpacing(4)
+        pf.lay.addLayout(self.fx_rows)
+        n_ = lab("Chaque banque utilisée ajoute un peu de calcul (environ 2 ms par bloc de 20 ms).", "mut", True)
+        n_.setStyleSheet(f"color:{MUT};font-size:11px;")
+        pf.lay.addStretch(1)
+        pf.lay.addWidget(n_)
+        g.addWidget(pf, 1, 2)
         # --- égalisation
-        eq = Card("Égalisation", "Phase linéaire : aucune coloration de phase, voix nettes")
+        eq = Card("Égalisation", "")
         self.eqc = EQCurve()
+        self.eqc.setMinimumHeight(64)
+        self.eqc.setMaximumHeight(84)
         eq.lay.addWidget(self.eqc)
         self.proc_slider(eq, "Coupe-bas", "hpf", 0, 120, lambda v: "aucun" if v < 1 else "%.0f Hz" % v, scale=1)
-        self.proc_slider(eq, "Graves (90 Hz)", "bass", -6, 6, "%+.1f dB")
-        self.proc_slider(eq, "Présence (3 kHz)", "presence", -6, 6, "%+.1f dB")
-        self.proc_slider(eq, "Air (11 kHz)", "air", -6, 6, "%+.1f dB")
-        self.proc_switch(eq, "Bande FM : rien au-dessus de 15 kHz", "fm15",
-                         "Indispensable si une sortie va vers un émetteur FM (protège le pilote stéréo à 19 kHz)")
+        self.proc_slider(eq, "Graves", "bass", -6, 6, "%+.1f dB", tip="Plateau à 90 Hz")
+        self.proc_slider(eq, "Présence", "presence", -6, 6, "%+.1f dB", tip="Autour de 3 kHz : voix plus devant")
+        self.proc_slider(eq, "Air", "air", -6, 6, "%+.1f dB", tip="Plateau à 11 kHz : brillance")
+        self.proc_switch(eq, "FM : rien au-dessus de 15 kHz", "fm15",
+                         "Indispensable pour un émetteur FM (protège le pilote stéréo à 19 kHz)")
         eq.lay.addStretch(1)
         g.addWidget(eq, 2, 0)
-        # --- multibande
-        mb = Card("Multibande 5 bandes", "Compresseur-limiteur par bande : le « son » de l'antenne")
+        # --- multibande, épuré : force, vitesse, équilibre graves / médiums / aigus
+        mb = Card("Multibande", "Le « son » de l'antenne, en 3 réglages")
         self.proc_switch(mb, "Compresseur multibande", "mb_on")
-        self.proc_slider(mb, "Attaque (drive)", "mb_drive", 0, 15, "%.1f dB")
-        self.proc_slider(mb, "Taux", "ratio", 1.2, 20, lambda v: "%.1f:1" % v)
-        self.proc_slider(mb, "Retour", "mb_release", 60, 1200, "%.0f ms", scale=1)
-        self.proc_slider(mb, "Couplage", "coupling", 0, 100, "%.0f %%", scale=1,
-                         tip="Couplage des bandes : haut = équilibre tonal respecté, bas = chaque bande vit sa vie (plus dense)")
-        for i, nm in enumerate(BAND_NAMES):
-            self.proc_slider(mb, "Niveau " + nm.lower(), "mix", -6, 6, "%+.1f dB", idx=i)
+        self.proc_slider(mb, "Force", "mb_drive", 0, 15, lambda v: ("légère" if v < 4 else "forte" if v > 9 else "moyenne") + f"  {v:.0f}",
+                         tip="Quantité de compression : plus fort = son plus dense et plus égal")
+        self.proc_slider(mb, "Vitesse", "mb_release", 1, 10, lambda v: ("lente" if v < 4 else "rapide" if v > 7 else "normale"),
+                         get=self._rel_get, put=self._rel_put, tip="Vitesse de retour : lente = naturel, rapide = punchy")
+        for nm, bands in self.TONE:
+            self.proc_slider(mb, nm, "mix", -6, 6, "%+.1f dB",
+                             get=lambda pp, b=bands: sum(pp["mix"][i] for i in b) / len(b),
+                             put=lambda pp, x, b=bands: pp.__setitem__("mix", [x if i in b else v for i, v in enumerate(pp["mix"])]),
+                             tip=f"Niveau des {nm.lower()} après compression")
         mb.lay.addStretch(1)
         g.addWidget(mb, 2, 1)
         # --- stéréo et sortie
-        so = Card("Stéréo et sortie", "Image stéréo, écrêteur et plafond garanti")
+        so = Card("Stéréo et sortie", "")
         self.proc_slider(so, "Élargisseur", "width", 0, 100, "%.0f %%", scale=1,
-                         tip="Élargit l'image par bande ; le côté reste plafonné à 85 % du milieu (jamais d'image trouée, mono intact)")
-        self.proc_switch(so, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles vinyle, FM et enceintes mono")
+                         tip="Élargit l'image stéréo ; le mono reste intact")
+        self.proc_switch(so, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles FM et enceintes mono")
         self.proc_switch(so, "Sortie mono", "mono")
         self.proc_slider(so, "Écrêteur", "clip", 0, 100, "%.0f %%", scale=1,
-                         tip="Écrêtage doux suréchantillonné x2 : plus de volume perçu ; 0 pour la musique classique")
-        self.proc_slider(so, "Plafond (crête vraie)", "ceiling", -3, -0.1, "%.1f dBTP",
-                         tip="Aucun échantillon ne dépasse ce niveau, même entre les échantillons (-1 dBTP recommandé pour les flux)")
-        self.proc_slider(so, "Retour limiteur", "lim_release", 30, 400, "%.0f ms", scale=1)
+                         tip="Plus de volume perçu ; 0 pour la musique classique")
+        self.proc_slider(so, "Plafond", "ceiling", -3, -0.1, "%.1f dBTP",
+                         tip="Aucun échantillon ne dépasse ce niveau, même entre les échantillons (-1 dBTP pour les flux)")
         so.lay.addStretch(1)
         g.addWidget(so, 2, 2)
-        # --- flux
-        pf = Card("Son envoyé à chaque flux", "Son traité par le processeur, ou son brut (ex. : enregistrement de sécurité)")
-        self.fx_rows = QGridLayout()
-        pf.lay.addLayout(self.fx_rows)
-        g.addWidget(pf, 3, 0, 1, 3)
-        g.setRowStretch(4, 1)
+        g.setRowStretch(1, 1)
         self.fx_flux_rows()
         self._proc_loading = False
         self.proc_refresh()
         return pg
 
+    def proc_bank(self, b):
+        """Affiche (et règle) une autre banque ; ses mesures s'affichent."""
+        if b not in BANKS:
+            return
+        self.proc["edit"] = b
+        self.proc_load_widgets()
+        self.proc_changed()
+
+    def proc_set_bank(self, params, what):
+        self.proc["banks"][self.proc["edit"]] = params
+        self.proc_load_widgets()
+        self.proc_changed()
+        self.log(f"Processeur d'antenne, banque {self.proc['edit']} : {what}" + (" (en direct)." if self.on_air else "."))
+
     def proc_preset(self, name):
         if name not in PROC_PRESETS:
             return
-        self.proc["params"] = proc_params(name)
-        self.proc["params"]["custom"] = False
-        self.proc_load_widgets()
-        self.proc_changed()
-        self.log(f"Traitement son : préréglage « {name} »" + (" (en direct)." if self.on_air else "."))
+        p = proc_params(name)
+        p["custom"] = False
+        self.proc_set_bank(p, f"préréglage « {name} »")
+
+    def proc_zero(self):
+        """Réglage à zéro : rien ne colore ni ne compresse, seul le limiteur final (plafond) reste actif."""
+        p = proc_params("Protection seule", bass=0.0, presence=0.0, air=0.0, hpf=0, width=0, clip=0, lm=5.0,
+                        mix=(0.0, 0.0, 0.0, 0.0, 0.0), makeup=0.0, mono=False, fm15=self.pp().get("fm15", False))
+        p["preset"], p["custom"] = "zero", False
+        self.proc_set_bank(p, "réglage à zéro")
+
+    def proc_reset(self):
+        """Annule les réglages fins : la banque revient à son préréglage (ou au réglage à zéro)."""
+        cur = self.pp().get("preset", PROC_DEFAULT)
+        if cur == "zero":
+            return self.proc_zero()
+        self.proc_preset(cur if cur in PROC_PRESETS else PROC_DEFAULT)
 
     def proc_load_widgets(self):
         self._proc_loading = True
@@ -10394,7 +10491,7 @@ class PagesMixin2:
                 sl.setValue(int(round(get() * scale)))
                 val.setText(fmt(get()) if callable(fmt) else fmt % get())
             for w, key in self.procs:
-                w.setChecked(bool(self.proc["params"].get(key)))
+                w.setChecked(bool(self.pp().get(key)))
         finally:
             self._proc_loading = False
 
@@ -10403,24 +10500,27 @@ class PagesMixin2:
         self.proc_send()
         self.save_settings()
         self.proc_refresh()
-        self.log("Traitement son : " + ("BYPASS, le son brut part à l'antenne." if self.proc["bypass"] else "processeur remis à l'antenne."))
+        self.log("Processeur d'antenne : " + ("BYPASS, le son brut part à l'antenne." if self.proc["bypass"] else "remis à l'antenne."))
 
     def proc_refresh(self):
-        pp = self.proc["params"]
+        pp = self.pp()
         name = pp.get("preset", PROC_DEFAULT)
         custom = bool(pp.get("custom"))
         byp = bool(self.proc.get("bypass"))
-        self.set_kind(self.btn_bypass, "○  BYPASS · son brut  (réactiver)" if byp else "●  TRAITEMENT À L'ANTENNE", "stop" if byp else "primary")
-        self.l_preset.setText(name + ("  · modifié" if custom else ""))
-        set_ss(self.l_preset, f"font-size:15px;font-weight:800;color:{MUT if byp else TXT};")
-        self.btn_preset_reset.setVisible(custom)
-        self.l_preset_info.setText(PROC_INFO.get(name, ""))
-        for n, b in self.proc_btns.items():
-            self.set_kind(b, n.replace("&", "&&"), "primary" if n == name else "")
+        self.set_kind(self.btn_bypass, "○  BYPASS · son brut  (réactiver)" if byp else "●  PROCESSEUR À L'ANTENNE", "stop" if byp else "primary")
+        shown = "Réglage à zéro" if name == "zero" else name
+        self.l_preset.setText(shown + ("  · modifié" if custom else ""))
+        set_ss(self.l_preset, f"font-size:14px;font-weight:700;color:{MUT if byp else TXT};")
+        self.btn_preset_reset.setEnabled(custom)
+        used = [c.get("name") or "flux" for c in getattr(self, "outputs_cfg", []) if out_bank(c) == self.proc["edit"]]
+        info = ("Aucun réglage, seul le limiteur final." if name == "zero" else PROC_INFO.get(name, ""))
+        self.l_preset_info.setText(info + ("   ·   Utilisée par : " + ", ".join(used) if used else "   ·   Utilisée par aucun flux"))
+        if self.seg_bank.val != BANKS.index(self.proc["edit"]):
+            self.seg_bank.setValue(BANKS.index(self.proc["edit"]))
         self.eqc.set(pp)
 
     def son_tick(self, e):
-        """30 fois par seconde, page affichée : vumètres du processeur."""
+        """30 fois par seconde, page affichée : vumètres de la banque affichée."""
         if np is None:
             self.proc_meters.set({}, "off")
             return
@@ -10430,37 +10530,42 @@ class PagesMixin2:
             st = "air" if (self.on_air and e.air) else "input"
         self.proc_meters.set(pm or {}, st)
 
+    FX_LABELS = {**{b: f"Banque {b}" for b in BANKS}, RAW: "Son brut (sans traitement)"}
+
     def fx_flux_rows(self):
         while self.fx_rows.count():
             it = self.fx_rows.takeAt(0)
             if it.widget():
                 it.widget().hide()
                 it.widget().deleteLater()
-        for i, c in enumerate(self.outputs_cfg):
+        for c in self.outputs_cfg:
             h = QHBoxLayout()
             w = QWidget()
             w.setLayout(h)
-            h.setContentsMargins(0, 2, 12, 2)
+            h.setContentsMargins(0, 0, 0, 0)
             l = lab(c["name"], "")
-            l.setFixedWidth(150)
-            h.addWidget(l)
+            l.setMinimumWidth(90)
+            h.addWidget(l, 1)
             cb = QComboBox()
-            cb.addItems(FX_CHOICES)
-            cb.setCurrentText(FX_ON if out_processed(c) else FX_NONE)
-            cb.activated.connect(lambda _i, cc=c, b=cb: self.fx_flux_set(cc, b.currentText()))
-            cb.setMinimumWidth(220)
+            cb.addItems(list(self.FX_LABELS.values()))
+            cb.setCurrentText(self.FX_LABELS[out_bank(c)])
+            cb.activated.connect(lambda _i, cc=c, b=cb: self.fx_flux_set(cc, next(k for k, v in self.FX_LABELS.items() if v == b.currentText())))
+            cb.setMinimumWidth(170)
             h.addWidget(cb)
-            h.addStretch(1)
-            self.fx_rows.addWidget(w, i // 2, i % 2)
+            self.fx_rows.addWidget(w)
         if not self.outputs_cfg:
-            self.fx_rows.addWidget(lab("Aucun flux pour l'instant : ajoute-en un dans Diffusion.", "mut"), 0, 0)
+            self.fx_rows.addWidget(lab("Aucun flux pour l'instant : ajoutez-en un dans Diffusion.", "mut", True))
+        if hasattr(self, "l_preset_info"):
+            self.proc_refresh()
 
-    def fx_flux_set(self, cfg, mode):
-        cfg["fxmode"] = mode
+    def fx_flux_set(self, cfg, bank):
+        cfg["fx"] = bank
+        cfg.pop("fxmode", None)
         self.save_all()
         if self.on_air and self.engine:
-            self.engine.set_out_fx({cfg["id"]: mode})
-            self.log(f"[{cfg.get('name')}] " + ("son traité par le processeur." if mode == FX_ON else "son brut, sans traitement."))
+            self.engine.set_out_fx({cfg["id"]: bank})
+        self.log(f"[{cfg.get('name')}] " + (f"banque {bank} du processeur d'antenne." if bank != RAW else "son brut, sans traitement."))
+        self.proc_refresh()
 
 # ------------------------------------------------------------------ Monitoring
 class FluxLamp(QWidget):
@@ -11393,7 +11498,7 @@ class GaelBrain:
                     else "Classique" if H(n, "classique") else "Jazz & acoustique" if H(n, "jazz", "acoustique")
                     else "Pop / Hits" if H(n, "pop", "hits") else "Rock" if H(n, "rock") else "Urbain" if H(n, "urbain", "rap", "hip hop")
                     else "Loud" if H(n, "loud", "fort") else "Protection seule" if H(n, "protection", "neutre") else "Généraliste")
-            return self.propose("Traitement son", [("Préréglage", name), ("Appliqué", "en direct, sans coupure")],
+            return self.propose("Processeur d'antenne", [("Préréglage", name), ("Appliqué", "en direct, sans coupure")],
                                 lambda: a.proc_preset(name))
         # --- redémarrer les flux, auditeurs, mise à jour
         if H(n, "redemarre les flux", "relance les flux", "reconnecte", "redemarre le flux", "relance le flux"):
@@ -12045,7 +12150,7 @@ Pour modifier un réglage, utilise toujours l'outil adapté : il affiche une car
 doit cliquer ; ne prétends jamais avoir modifié quelque chose toi-même. S'il manque une information indispensable
 (adresse du serveur, mot de passe source…), demande-la d'abord. Ne demande jamais de mot de passe d'administration.
 Quand tu as besoin de connaître la situation, appelle get_state ; pour un problème, run_diagnostic.
-Onglets de l'application : Diffusion (source audio, flux, secours, à l'antenne), Traitement son (processeur d'antenne temps réel : préréglages radio, bypass, densité Moins/Plus, égalisation, multibande, stéréo), Cartoucheur, Enregistrement (dont la pige ARCOM),
+Onglets de l'application : Diffusion (source audio, flux, secours, à l'antenne), Processeur d'antenne (bêta, temps réel : 4 banques A-D, une banque par flux, préréglages radio, réglage à zéro, bypass, densité, égalisation, multibande simplifié, stéréo), Cartoucheur, Enregistrement (dont la pige ARCOM),
 Monitoring (surveillance de flux), Réseau (liens Internet et bascule), SOS (toi, alertes de panne, journal), Réglages, À propos.
 État actuel au moment du message :
 {state}"""
@@ -14151,7 +14256,7 @@ class UndoMixin:
 
 # ------------------------------------------------------------------ fenêtre principale
 PAGE_KEYS = ["diff", "son", "cart", "rec", "mon", "net", "sos", "set", "about"]
-PAGE_TITLES = {"diff": "Diffusion", "son": "Traitement son", "cart": "Cartoucheur", "rec": "Enregistrement", "mon": "Monitoring",
+PAGE_TITLES = {"diff": "Diffusion", "son": "Processeur d'antenne", "cart": "Cartoucheur", "rec": "Enregistrement", "mon": "Monitoring",
                "net": "Réseau", "sos": "SOS", "set": "Réglages", "about": "À propos"}
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac")
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -14647,6 +14752,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.bridge.logged.connect(self.add_log)
         self.bridge.call.connect(lambda fn: fn())
         self.alerts = Alerts(self)
+        self.auto_info = None
+        self.automate = AutomateMeta(lambda info: self.ui(self.automate_got, info), self.log)
         self.log_lines, self.log_rec = [], []
         self.waves = WaveLoader()
         self.waves.done.connect(self.wave_ready)
@@ -14681,6 +14788,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.setAcceptDrops(True)
         self.add_log("Mat eo ! Bienvenue.")
         self.go_tab(S.get("start_tab", "diff") if S.get("start_tab") in PAGE_KEYS else "diff")
+        QTimer.singleShot(400, self.automate_apply)        # automate de diffusion (titre en cours), s'il est relié
         self.apply_settings(first=True)
         self.undo_init()
         self.props_init()
@@ -14885,7 +14993,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.page_key = key
         self.stack.setCurrentIndex(PAGE_KEYS.index(key))
         self.rail.select(key)
-        self.l_title.setText({"son": "Traitement", "mon": "Monitoring"}.get(key, PAGE_TITLES[key]) if NAVTOP else PAGE_TITLES[key])
+        self.l_title.setText({"son": "Processeur", "mon": "Monitoring"}.get(key, PAGE_TITLES[key]) if NAVTOP else PAGE_TITLES[key])
         self.compact_header()
         self.l_title.setMinimumWidth(self.l_title.fontMetrics().horizontalAdvance(self.l_title.text()) + 6)
         if key == "rec":
@@ -15528,6 +15636,15 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         mt.addWidget(btn("Envoyer", "", self.send_meta_now))
         mt.addWidget(btn("Image…", "", self.pick_cover))
         air.lay.addLayout(mt)
+        at = QHBoxLayout()                       # titre en cours reçu d'un automate de diffusion (Radiologik…)
+        self.l_auto = CLabel("Automate : non relié", "mut", False, MUT)
+        self.l_auto.elide = True
+        self.l_auto.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.l_auto.setMinimumWidth(40)
+        at.addWidget(self.l_auto, 1)
+        at.addWidget(btn("Automate…", "", self.automate_dialog,
+                         "Récupérer titre, artiste et pochette depuis un automate de diffusion (Radiologik, RadioDJ…)"))
+        air.lay.addLayout(at)
         self.sw_follow = Switch("Pendant la playlist, afficher le titre du morceau joué")
         self.sw_follow.toggled.connect(lambda *_: self.live_meta())
         air.lay.addWidget(self.sw_follow)
@@ -15777,6 +15894,124 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.log("Titre envoyé : " + (self.ed_meta.text() or "(vide)"))
         else:
             self.log("Titre enregistré : il sera envoyé au démarrage.")
+
+    # --- automate de diffusion : titre, artiste et pochette
+    def automate_cfg(self):
+        c = self.data.setdefault("automate", {})
+        c.setdefault("on", False)
+        c.setdefault("file", "")
+        c.setdefault("net", True)
+        c.setdefault("port", AUTO_PORT)
+        c.setdefault("lan", False)
+        return c
+
+    def automate_apply(self):
+        self.automate.configure(self.automate_cfg())
+        self.automate_label()
+
+    def automate_got(self, info):
+        """Nouveau titre de l'automate : affiché ici, envoyé aux flux (titre Icecast / RDS / DLS), pochette affichée."""
+        if not self.automate_cfg().get("on"):
+            return
+        self.auto_info = info
+        txt = info["text"]
+        self.ed_meta.setText(txt)
+        if self.engine:
+            self.engine.meta_manual = txt
+        self.log(f"Automate : « {txt} »" + ("" if self.on_air else " (sera envoyé à l'antenne)"))
+        self.automate_label()
+
+    def automate_label(self):
+        l = getattr(self, "l_auto", None)
+        if l is None:
+            return
+        c = self.automate_cfg()
+        ai = self.auto_info
+        if not c.get("on"):
+            txt, col = "Automate : non relié", MUT
+        elif self.automate.port_err and c.get("net"):
+            txt, col = f"Automate : {self.automate.port_err}", BADC
+        elif ai:
+            age = time.time() - ai["t"]
+            when = time.strftime("%H:%M", time.localtime(ai["t"]))
+            alb = f"  ·  {ai['album']}" if ai.get("album") else ""
+            txt, col = f"● Automate ({ai['source']}, {when}) : {ai['text']}{alb}", (OKC if age < 3600 else ACC2)
+        else:
+            txt, col = "Automate : en attente d'un premier titre…", ACC2
+        if l.text() != txt:
+            self.set_label(l, txt, col)
+
+    def automate_dialog(self):
+        c = dict(self.automate_cfg())
+        d = QDialog(self)
+        d.setWindowTitle("Titre en cours depuis un automate")
+        d.setMinimumWidth(560)
+        v = QVBoxLayout(d)
+        v.setContentsMargins(22, 18, 22, 16)
+        t = lab("Automate de diffusion", "")
+        t.setStyleSheet("font-size:18px;font-weight:700;")
+        v.addWidget(t)
+        v.addWidget(lab("Bev peut récupérer le titre, l'artiste et la pochette depuis votre automate (Radiologik, RadioDJ, "
+                        "Rivendell, mAirList…), les afficher dans « 4 · À l'antenne » et les envoyer à vos flux.", "mut", True))
+        sw_on = Switch("Utiliser l'automate")
+        sw_on.setChecked(bool(c["on"]))
+        v.addWidget(sw_on)
+        f = QFormLayout()
+        f.setVerticalSpacing(8)
+        ed_f = QLineEdit(c["file"])
+        ed_f.setPlaceholderText("(facultatif) fichier écrit par l'automate : texte, XML ou JSON")
+        rowf = QHBoxLayout()
+        rowf.addWidget(ed_f, 1)
+        rowf.addWidget(btn("…", "", lambda: ed_f.setText(QFileDialog.getOpenFileName(d, "Fichier du titre en cours", ed_f.text())[0] or ed_f.text())))
+        f.addRow("Fichier", rowf)
+        sw_net = Switch("Recevoir les titres par le réseau (l'automate appelle une adresse de Bev)")
+        sw_net.setChecked(bool(c["net"]))
+        f.addRow("", sw_net)
+        sp = QSpinBox()
+        sp.setRange(1024, 65535)
+        sp.setValue(int(c["port"] or AUTO_PORT))
+        sp.setMaximumWidth(110)
+        f.addRow("Port", sp)
+        sw_lan = Switch("Accepter les autres ordinateurs du réseau local (automate sur un autre poste)")
+        sw_lan.setChecked(bool(c["lan"]))
+        f.addRow("", sw_lan)
+        v.addLayout(f)
+        ex = QPlainTextEdit()
+        ex.setReadOnly(True)
+        ex.setMaximumHeight(118)
+        v.addWidget(ex)
+
+        def explain(*_):
+            host = "127.0.0.1"
+            if sw_lan.isChecked():
+                try:
+                    host = default_route_ip() or host
+                except Exception:
+                    pass
+            base = f"http://{host}:{sp.value()}/"
+            ex.setPlainText(f"Adresse à indiquer dans l'automate (envoi à chaque titre) :\n{base}?artist=ARTISTE&title=TITRE&cover=ADRESSE_POCHETTE\n\n"
+                            "Dans Radiologik : réglages de publication du titre en cours (Now Playing), envoi par adresse web, en "
+                            "remplaçant ARTISTE, TITRE et ADRESSE_POCHETTE par les balises correspondantes de Radiologik. "
+                            "Bev accepte aussi un envoi POST (JSON, formulaire ou texte « Artiste - Titre »), ou un fichier.")
+        for w_ in (sw_lan, sp):
+            (w_.toggled if isinstance(w_, Switch) else w_.valueChanged).connect(explain)
+        explain()
+        h = QHBoxLayout()
+        h.addWidget(btn("Copier l'adresse", "", lambda: self.copy_text(ex.toPlainText().splitlines()[1], "Adresse")))
+        h.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        h.addWidget(bb)
+        v.addLayout(h)
+        if d.exec():
+            cfg = self.automate_cfg()
+            cfg.update(on=sw_on.isChecked(), file=ed_f.text().strip(), net=sw_net.isChecked(), port=sp.value(), lan=sw_lan.isChecked())
+            if not cfg["on"]:
+                self.auto_info = None
+            self.save_settings()
+            self.automate_apply()
+            self.log("Automate : " + ("relié." if cfg["on"] else "désactivé."))
 
     def pick_cover(self):
         f, _ = QFileDialog.getOpenFileName(self, "Pochette par défaut (logo de la radio)", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp);;Tous (*)")
@@ -16740,6 +16975,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                            (f" · relève après {p['delay'] / 1000:g} s de silence" if covered else " · pas de relève automatique")), OKC)
         flags = ("  MUTE" if e.mute else "") + ("  TON" if e.tone else "")
         self.set_label(self.l_now, ("Titre : " + (e.meta or "-")) + flags, TXT)
+        self.automate_label()
         if self.slow_n % 20 == 0 and self.page_key == "rec":
             self.rec_tick()
         elif self.slow_n % 20 == 0 and self.on_air:
@@ -16916,7 +17152,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.pl_tv.set_prog(max(0.0, (e.pl_out - cur["start"]) / 176400) / cur["dur"])
         else:
             self.pl_tv.set_prog(0.0)
-        self.set_cover(cur["path"] if cur else (self.cover_path or None))
+        ai = self.auto_info if (self.auto_info and (self.data.get("automate") or {}).get("on")) else None
+        self.set_cover(cur["path"] if cur else ((ai or {}).get("cover") or self.cover_path or None))
 
     def update_nowbar(self, e):
         if not e or not (self.on_air or self.preview):
@@ -17539,6 +17776,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         try:
             if self.slot is not None:
                 self.slot.close()
+        except Exception:
+            pass
+        try:
+            self.automate.stop()
         except Exception:
             pass
         if getattr(self, "upd_pending", None):     # mise à jour téléchargée pendant le direct : elle s'installe maintenant
