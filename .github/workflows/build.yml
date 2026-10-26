@@ -24,6 +24,36 @@ env:
   SIGN: ${{ vars.AZURE_SIGN_ACCOUNT != '' && 'oui' || '' }}
 
 jobs:
+  # Tests automatiques (tests/) et vérification de l'interface depuis le code source, avant toute publication.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ffmpeg et bibliothèques système de Qt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libportaudio2
+
+      - name: Modules Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Tests
+        run: python -m pytest -q tests
+
+      - name: Vérification de l'interface (selftest, depuis le code source)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python broadcast_tool_qt.py --selftest || { cat selftest.txt; exit 1; }
+          cat selftest.txt
+
   windows:
     runs-on: windows-latest
     steps:
@@ -34,9 +64,14 @@ jobs:
           python-version: "3.12"
 
       - name: Modules Python
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller pillow
+          pip install -r requirements.txt pillow
+          # Chargeur (bootloader) de PyInstaller compilé ici même, au lieu du chargeur générique précompilé : celui-ci est
+          # partagé par des milliers de programmes (malveillants compris) et Defender le signale souvent à tort.
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          pip install --no-binary pyinstaller pyinstaller
 
       - name: ffmpeg (Windows)
         shell: pwsh
@@ -57,8 +92,9 @@ jobs:
       # Bev s'ouvre en quelques secondes ; l'image de démarrage s'affiche dès le double-clic.
       - name: Construction (PyInstaller)
         run: >
-          pyinstaller --noconfirm --clean --onedir --windowed --name Bev
+          pyinstaller --noconfirm --clean --onedir --windowed --name Bev --noupx
           --icon build/icon.ico
+          --version-file build/version_info.txt
           --splash build/splash.png
           --add-binary "ffmpeg/ffmpeg.exe;bin"
           --add-binary "ffmpeg/ffprobe.exe;bin"
@@ -79,7 +115,8 @@ jobs:
           signing-account-name: ${{ vars.AZURE_SIGN_ACCOUNT }}
           certificate-profile-name: ${{ vars.AZURE_SIGN_PROFILE }}
           files-folder: ${{ github.workspace }}\dist\Bev
-          files-folder-filter: exe
+          # exe ET dll/pyd : Smart App Control contrôle chaque module chargé (Python, Qt, numpy…), pas seulement Bev.exe
+          files-folder-filter: exe,dll,pyd
           files-folder-recurse: true
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
@@ -210,10 +247,10 @@ jobs:
 
   # Mise à jour express : le code de cette version (~1 Mo) + son manifeste, joints à la Release. Les Bev déjà installés
   # passent à la nouvelle version sans installateur (voir tools/express.py et _express_boot dans broadcast_tool_qt.py).
-  # needs : le code express n'est joint à la Release qu'une fois les deux constructions ET leur selftest réussis. Avant, il
+  # needs : le code express n'est joint à la Release qu'une fois les tests, les deux constructions ET leur selftest réussis. Avant, il
   # partait en parallèle : une version qui ne démarrait pas était quand même proposée en express à tous les Bev installés.
   express:
-    needs: [windows, mac]
+    needs: [tests, windows, mac]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
