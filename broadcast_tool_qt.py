@@ -10180,7 +10180,7 @@ class ProcMeters(QWidget):
         # état
         msg = ""
         if self.state == "idle":
-            msg = "En attente : mesures dès la diffusion ou le contrôle d'entrée"
+            msg = "En attente du son (antenne ou contrôle d'entrée)"
         elif self.state == "off":
             msg = "Processeur indisponible (numpy absent) : le son part sans traitement"
         elif self.state == "input":
@@ -10282,7 +10282,7 @@ class PagesMixin2:
         if tip:
             sl.setToolTip(tip)
         val = lab("", "")
-        val.setFixedWidth(70)
+        val.setFixedWidth(86)
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         val.setStyleSheet(f"color:{ACCT};font-weight:700;")
 
@@ -10416,7 +10416,11 @@ class PagesMixin2:
                          "Ramène doucement toutes les sources au même niveau ; se fige dans les silences", lay=col)
         self.proc_slider(nv, "Vitesse de l'AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau", lay=col)
         col.addStretch(1)
-        hh.addLayout(col, 2)
+        cw_ = QWidget()
+        cw_.setLayout(col)
+        cw_.setMaximumWidth(330)
+        col.setContentsMargins(0, 0, 0, 0)
+        hh.addWidget(cw_, 2)
         nv.lay.addLayout(hh, 1)
         g.addWidget(nv, 1, 0, 1, 2)
         # --- son envoyé à chaque flux
@@ -15284,8 +15288,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if hasattr(self, "assistant"):
             self.assistant.chips_compact(lvl >= 1)
         if hasattr(self, "eqc"):                        # (onglet Processeur : tout tient sur un écran)
-            self.eqc.setMinimumHeight(60 if lvl < 1 else 44)
-            self.eqc.setMaximumHeight(84 if lvl < 1 else 56)
+            self.eqc.setMinimumHeight(62 if lvl < 1 else 56)
+            self.eqc.setMaximumHeight(84 if lvl < 1 else 62)
         if hasattr(self, "proc_meters"):
             self.proc_meters.setMinimumHeight(150 if lvl < 1 else 112)
         QTimer.singleShot(0, self.air_min)
