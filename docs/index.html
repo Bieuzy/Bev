@@ -81,8 +81,11 @@ p{margin:0}
 .splash h1{font-size:clamp(68px,11vw,116px);font-weight:800;letter-spacing:-.03em;line-height:.9}
 .splash .sub{display:block;font-size:14px;font-weight:600;letter-spacing:.18em;color:var(--splash-sub);margin-top:14px}
 .splash .lede{font-size:19px;color:var(--splash-txt);font-weight:500;margin:22px 0 12px}
-.origin{font-size:14px;color:var(--splash-mut);margin:-4px 0 14px}
-.origin a{color:var(--splash-sub);font-weight:600}
+.why{display:grid;grid-template-columns:1fr 1fr;gap:12px 40px;align-items:start}
+.why h2{font-size:24px;font-weight:700;letter-spacing:-.01em}
+.why p{color:var(--mut);font-size:15px;max-width:60ch}
+.why p+p{margin-top:10px}
+@media (max-width:760px){.why{grid-template-columns:1fr}}
 .outs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:26px}
 .outs span{font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:8px;background:rgba(255,255,255,.08);color:var(--splash-txt)}
 .first{font-size:13px;color:var(--splash-mut);margin-top:14px}
@@ -153,7 +156,7 @@ kbd{font-family:var(--font);font-size:12.5px;font-weight:600;background:var(--fi
 .hist .row b{font-size:14.5px;font-variant-numeric:tabular-nums}
 .hist .row time{color:var(--mut);font-size:13px}
 .hist .links{display:flex;gap:6px;margin-left:auto}
-footer a{color:var(--acct)}
+footer a{color:var(--mut);text-decoration-color:var(--line);text-underline-offset:3px}footer a:hover{color:var(--txt)}
 footer{background:var(--rail);border-top:1px solid var(--line)}
 footer .wrap{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding-block:22px;font-size:13.5px;color:var(--mut)}
 footer .l{display:flex;align-items:center;gap:10px}
@@ -224,7 +227,6 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
     <div>
       <h1>Bev<span class="sub">BROADCAST TOOL</span></h1>
       <p class="lede">Le logiciel de diffusion des radios associatives.</p>
-      <p class="origin">Né pour la diffusion de <a href="https://rbg.bzh">Radio Bro Gwened</a>.</p>
       <div class="outs"><span>Internet</span><span>FM</span><span>DAB+</span><span>Enregistrement</span></div>
       <div class="dl">
         <a class="btn primary" id="btn-win" href="https://github.com/Bieuzy/Bev/releases/latest">
@@ -245,6 +247,16 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
   </div>
 </div>
 
+<section id="radios">
+  <div class="wrap why">
+    <h2>Pourquoi les radios associatives comptent</h2>
+    <div>
+      <p>Elles donnent la parole à ceux qu'on n'entend pas ailleurs : les associations du coin, les musiciens d'ici, les langues régionales, les habitants eux-mêmes. Souvent, ce sont les seules à parler de ce qui se passe à deux rues de chez vous.</p>
+      <p>Elles tiennent grâce à des bénévoles et à des budgets serrés. Bev est gratuit pour qu'aucune d'elles n'ait à choisir entre un logiciel de diffusion et le reste.</p>
+    </div>
+  </div>
+</section>
+
 <section id="nouveautes">
   <div class="wrap">
     <div class="sh"><h2>Nouveautés</h2><a href="https://github.com/Bieuzy/Bev/releases">Toutes les versions</a></div>
@@ -256,7 +268,7 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 
 <footer>
   <div class="wrap">
-    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · un projet né à <a href="https://rbg.bzh">Radio Bro Gwened</a></span>
+    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · né à <a href="https://rbg.bzh">Radio Bro Gwened</a></span>
     <a href="https://github.com/Bieuzy/Bev">GitHub</a>
   </div>
 </footer>
