@@ -9899,6 +9899,7 @@ class PagesMixin1:
         sc.setFrameShape(QFrame.Shape.NoFrame)
         sc.setWidget(tx)
         sc.setMinimumHeight(80)
+        sc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)   # défile en interne, n'agrandit pas la page
         sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
         nw.lay.addWidget(sc, 1)
         h = QHBoxLayout()
