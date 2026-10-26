@@ -3662,8 +3662,13 @@ def download(url, dst, prog=None, size=0, timeout=30):
     return got, h.hexdigest()
 
 
+AV_GONE = "Windows Defender (ou l'antivirus) a supprimé l'installateur en le prenant à tort pour un virus"
+
+
 def friendly_dl_error(ex):
     t = str(ex)
+    if getattr(ex, "winerror", None) in (225, 226) or "virus" in t.lower():
+        return AV_GONE                                     # ERROR_VIRUS_INFECTED / ERROR_VIRUS_DELETED
     if isinstance(ex, urllib.error.HTTPError):
         return f"GitHub a répondu avec l'erreur {ex.code}"
     if isinstance(ex, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError)):
@@ -17142,9 +17147,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         url = r.get("asset") or ""
         if not url:
             return webbrowser.open(r.get("url") or "")
-        import tempfile
         new = r.get("tag", "").lstrip("vV")
-        dst = os.path.join(tempfile.gettempdir(), r.get("asset_name") or "Bev-Setup.exe")
+        # dans le dossier de Bev (et non le dossier temporaire de Windows) : un programme qui dépose un .exe dans %TEMP% puis
+        # le lance, c'est exactement ce que guettent Defender et les antivirus, d'où des suppressions « pour virus »
+        dst = os.path.join(UPD_DIR, os.path.basename(r.get("asset_name") or "Bev-Setup.exe"))
         self.gael_maj("dl", 0.0)
         self.gael_bubble(f"Je télécharge l'installateur de Bev {new}…", "Préparation…", progress=0.0, mode="dl")
         t0 = time.time()
@@ -17164,6 +17170,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         def work():
             res = {}
             try:
+                os.makedirs(UPD_DIR, exist_ok=True)
                 _, sha = download(url, dst + ".part", lambda g, t: self.ui(prog, g, t), size=r.get("size", 0))
                 dg = r.get("digest", "")
                 if dg.startswith("sha256:") and dg[7:].lower() != sha:
@@ -17175,9 +17182,22 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                     os.remove(dst + ":Zone.Identifier")
                 except OSError:
                     pass
+                # Defender analyse le fichier juste après son enregistrement et peut le supprimer quelques secondes plus
+                # tard : on vérifie qu'il est toujours là (et lisible) avant d'annoncer « Installateur prêt »
+                time.sleep(2.0)
+                with open(dst, "rb") as fh:
+                    fh.read(4096)
                 res["ok"] = True
+            except FileNotFoundError:
+                res["err"], res["av"] = AV_GONE, True
             except Exception as e:
                 res["err"] = friendly_dl_error(e)
+                res["av"] = res["err"] == AV_GONE
+            if not res.get("ok"):
+                try:
+                    os.remove(dst + ".part")
+                except OSError:
+                    pass
             self.ui(self.full_downloaded, r, dst, res)
         threading.Thread(target=work, daemon=True).start()
 
@@ -17185,6 +17205,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         new = r.get("tag", "").lstrip("vV")
         if not res.get("ok"):
             self.gael_maj("err")
+            self.log(f"Installateur de Bev {new} : {res.get('err')}")
+            if res.get("av"):                     # réessayer ne servirait à rien : Defender le supprimerait encore
+                return self.full_blocked(res["err"], "av")
             self.gael_bubble("Le téléchargement n'a pas abouti.", f"{res.get('err')}\nRien n'a changé : Bev continue normalement.",
                              [("Réessayer", "primary", lambda: self.full_install(r)),
                               ("Page des versions", "", lambda: (self.close_maj(), webbrowser.open(r.get("url") or "")))], mode="err")
@@ -17207,7 +17230,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.bubble_set(title="Ouverture de l'installateur…", line="Si Windows demande une confirmation, accepte-la.", buttons=[], progress=-1)
         p, why = self.update_launch(relaunch=True)
         if p is None:
-            return self.full_blocked(why)
+            return self.full_blocked(why, getattr(self, "_upd_block", ""))
 
         def check(n=0):
             rc = p.poll()
@@ -17220,17 +17243,36 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.close()
         QTimer.singleShot(400, check)
 
-    def full_blocked(self, why):
+    def full_blocked(self, why, kind=""):
+        """L'installateur n'a pas pu s'ouvrir. kind : "sac" (Smart App Control), "av" (Defender / antivirus), "policy"
+        (stratégie de l'ordinateur) ou "" (autre). Dans les trois premiers cas, Windows refusera de nouveau : on ne
+        réessaie PAS à la fermeture de Bev (avant, chaque fermeture redéclenchait le blocage) et on explique quoi faire."""
         self.gael_maj("err")
-        self.upd_pending = getattr(self, "_upd_last_dst", None)
+        self.upd_pending = None if kind in ("sac", "av", "policy") else getattr(self, "_upd_last_dst", None)
         self.log(f"Mise à jour bloquée : {why}")
         r = self.upd_info or {}
-        self.gael_bubble(why[:1].upper() + why[1:] + ".",
-                         "Rien n'a changé : Bev continue normalement. Ouvre le dossier et double-clique sur l'installateur "
-                         "(Windows peut proposer « Exécuter quand même »), ou installe depuis la page des versions.",
-                         [("Ouvrir le dossier", "primary", self.open_installer_folder),
-                          ("Page des versions", "", lambda: (self.close_maj(), webbrowser.open(r.get("url") or ""))),
-                          ("Fermer", "", self.close_maj)], mode="err")
+        page = ("Page des versions", "", lambda: (self.close_maj(), webbrowser.open(r.get("url") or "")))
+        fermer = ("Fermer", "", self.close_maj)
+        if kind == "sac":
+            line = ("Smart App Control n'accepte que les programmes signés, et l'installateur de Bev ne l'est pas encore. "
+                    "Bev continue normalement dans sa version actuelle ; les prochaines mises à jour passeront en express, "
+                    "sans installateur. Le mieux est d'attendre une version signée plutôt que de désactiver Smart App Control (avant "
+                    "Windows 11 25H2, il ne peut plus être réactivé ensuite).")
+            btns = [page, fermer]
+        elif kind == "av":
+            line = ("C'est une fausse alerte, fréquente pour les logiciels libres non signés. Bev continue normalement. "
+                    "Pour installer quand même : Sécurité Windows > Protection contre les virus et menaces > Historique de "
+                    "protection > Autoriser, puis télécharge l'installateur depuis la page des versions.")
+            btns = [page, fermer]
+        elif kind == "policy":
+            line = ("Une règle de cet ordinateur (gérée par l'informatique de la structure) interdit les programmes non "
+                    "signés. Bev continue normalement ; demande à la personne qui gère l'ordinateur d'installer la mise à jour.")
+            btns = [page, fermer]
+        else:
+            line = ("Rien n'a changé : Bev continue normalement. Ouvre le dossier et double-clique sur l'installateur "
+                    "(Windows peut proposer « Exécuter quand même »), ou installe depuis la page des versions.")
+            btns = [("Ouvrir le dossier", "primary", self.open_installer_folder), page, fermer]
+        self.gael_bubble(why[:1].upper() + why[1:] + ".", line, btns, mode="err")
 
     def open_installer_folder(self):
         """Montre l'installateur téléchargé dans l'Explorateur : un double-clic le lance (Windows peut alors proposer
@@ -17250,7 +17292,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         plus sûr, Windows peut poser ses questions et l'on voit ce qui se passe. Bev se rouvre via la case « Lancer Bev »
         de fin d'installation. Renvoie (processus, None) ou (None, raison)."""
         dst = getattr(self, "upd_pending", None)
+        self._upd_block = ""
         if not dst or not os.path.isfile(dst):
+            self.upd_pending = None
+            if dst:                                   # téléchargé, puis disparu : Defender l'a mis en quarantaine
+                self._upd_block = "av"
+                return None, AV_GONE
             return None, "installateur introuvable"
         self._upd_last_dst = dst
         try:
@@ -17264,7 +17311,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         except OSError as ex:
             w = getattr(ex, "winerror", None)
             why = {4551: "Smart App Control (Windows) a bloqué l'installateur", 1260: "une stratégie de Windows bloque l'installateur",
-                   225: "l'antivirus a bloqué l'installateur", 5: "Windows a refusé l'accès à l'installateur"}.get(w, f"lancement impossible ({ex})")
+                   225: AV_GONE, 226: AV_GONE, 5: "Windows a refusé l'accès à l'installateur"}.get(w, f"lancement impossible ({ex})")
+            self._upd_block = {4551: "sac", 1260: "policy", 225: "av", 226: "av"}.get(w, "")
             self.log(f"Impossible de lancer la mise à jour : {ex}")
             return None, why
         except Exception as ex:

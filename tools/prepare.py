@@ -81,3 +81,26 @@ open(SRC, "w", encoding="utf-8").write(src)
 ver = re.search(r'^VERSION = "(.*?)"', src, re.M).group(1)
 open("build/version.txt", "w").write(ver)
 print("Version :", ver, "(publiée)" if tag else "(non publiée)", "· dépôt :", repo or "(aucun)")
+
+# 4) informations de version de Bev.exe (Propriétés > Détails : éditeur, produit, version). Un exécutable qui ne dit pas
+# qui l'a fait ni ce qu'il est paraît plus suspect aux antivirus ; Windows les affiche aussi dans ses avertissements.
+nums = [int(n) for n in re.findall(r"\d+", ver)[:4]]
+nums += [0] * (4 - len(nums))
+t = tuple(nums)
+open("build/version_info.txt", "w", encoding="utf-8").write(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={t}, prodvers={t}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040C04B0', [
+      StringStruct('CompanyName', 'Radios associatives de Bretagne'),
+      StringStruct('FileDescription', 'Bev - diffusion radio'),
+      StringStruct('FileVersion', '{ver}'),
+      StringStruct('InternalName', 'Bev'),
+      StringStruct('LegalCopyright', 'Radios associatives de Bretagne'),
+      StringStruct('OriginalFilename', 'Bev.exe'),
+      StringStruct('ProductName', 'Bev'),
+      StringStruct('ProductVersion', '{ver}')])]),
+    VarFileInfo([VarStruct('Translation', [0x040C, 1200])])
+  ]
+)
+""")
+print("Informations de version de l'exécutable prêtes.")
