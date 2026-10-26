@@ -480,17 +480,28 @@ class AirProcessor:
         self.meter["lufs_m"] = -0.691 + 10 * math.log10(mm + 1e-12)
 
 
-# --- état partagé interface <-> moteur : réglages du processeur et contournement (bypass)
-FX = {"proc": proc_params(), "bypass": False}
-FX_ON = "Son traité (processeur)"
+# --- état partagé interface <-> moteur : quatre banques de réglages du processeur (A, B, C, D), contournement (bypass)
+# et banque affichée dans l'onglet (ses mesures). Chaque flux choisit sa banque, ou le son brut : plusieurs traitements
+# tournent en même temps (ex. Internet sur A, FM sur B avec le filtre 15 kHz, enregistrement en brut).
+BANKS = ("A", "B", "C", "D")
+RAW = "brut"
+FX = {"banks": {b: proc_params() for b in BANKS}, "bypass": False, "edit": "A"}
+FX_ON = "Son traité (processeur)"                  # (anciennes valeurs, migrées vers une banque)
 FX_NONE = "Son brut (sans traitement)"
-FX_CHOICES = [FX_ON, FX_NONE]
+
+
+def out_bank(cfg):
+    """Banque de traitement de ce flux (« A » à « D ») ou « brut ». Ancien réglage : traité -> A, brut -> brut."""
+    b = cfg.get("fx")
+    if b in BANKS or b == RAW:
+        return b
+    m = cfg.get("fxmode") or ""
+    return RAW if (m == FX_NONE or m == "Aucun traitement") else "A"
 
 
 def out_processed(cfg):
-    """Ce flux reçoit-il le son du processeur d'antenne ? (ancien réglage « Aucun traitement » = son brut)"""
-    m = cfg.get("fxmode") or ""
-    return not (m == FX_NONE or m == "Aucun traitement")
+    """Ce flux reçoit-il le son du processeur d'antenne ?"""
+    return out_bank(cfg) != RAW
 
 
 FM_PROC = "Radio FM (filtre 15 kHz + compresseur + limiteur)"
@@ -1368,6 +1379,8 @@ class Engine:
         self.pl_pause = False                 # playlist de secours en pause (reprend exactement où elle s'était arrêtée)
         self.pl_stop = False                  # playlist de secours arrêtée à la main (pas de relève auto avant le retour du son)
         self.silent_ms = self.loud_ms = 0
+        self.pl_silent_ms = 0                 # playlist de secours à l'antenne mais muette (ms)
+        self.inc = {}                         # pannes en cours déjà signalées : clé -> instant du début
         self.mix_g, self.rec_ms = 0.0, 2000.0
         self.peak = [-90.0, -90.0]
         self.track, self.meta = "", ""
@@ -1384,13 +1397,13 @@ class Engine:
         self.gain = 1.0
         self.set_gain(prof.get("gain", "0"))
         self.cmon = CartMonitor(self.log)
-        self.proc = None                       # processeur d'antenne (traitement du son temps réel)
-        self.pm = {}                           # ses mesures (AGC, réduction de gain par bande, limiteur, LUFS…)
-        if np is not None:
-            try:
-                self.proc = AirProcessor(FX.get("proc"), bool(FX.get("bypass")))
-            except Exception as ex:
-                self.log(f"Processeur d'antenne indisponible ({ex}) : le son part sans traitement.")
+        # processeur d'antenne : une instance par banque UTILISÉE (par un flux, ou affichée dans l'onglet), créée à la demande
+        self.procs, self.proc_used = {}, {}    # banque -> AirProcessor ; banque -> dernier instant où elle a servi
+        self.proc_making = set()
+        self.proc_ok = np is not None          # passe à False si le processeur échoue (le son part alors brut)
+        self.pm = {}                           # mesures de la banque affichée (AGC, réduction de gain par bande, LUFS…)
+        self.pm_main = {}                      # mesures de la banque principale (celle du 1er flux traité) : sonie d'antenne
+        self.main_bank = "A"
         self.cap_proc = self.pl_proc = None
         self.cap_stream = None
         self.outputs = []                      # flux : créés seulement à la mise à l'antenne
@@ -1404,6 +1417,18 @@ class Engine:
         for fn in (self.capture_loop, self.playlist_loop, self.feeder_loop, self.meta_loop,
                    self.preload_carts, self.jingle_loop):
             threading.Thread(target=fn, daemon=True).start()
+        self.prewarm()
+
+    def prewarm(self):
+        """Prépare à l'avance les processeurs des banques qui vont servir (sinon les premiers dixièmes de seconde
+        d'antenne partiraient en son brut, le temps de calculer les filtres)."""
+        if not self.proc_ok:
+            return
+        want = {FX.get("edit") if FX.get("edit") in BANKS else "A"}
+        want |= {out_bank(c) for c in self.prof.get("outputs", []) if c.get("enabled", True)}
+        for b in want - {RAW}:
+            if b not in self.procs:
+                self._proc_make(b)
 
     def stop(self):
         self.running = False
@@ -1436,6 +1461,7 @@ class Engine:
                 self.late, self.late_hist = 0, []
                 self.started = time.time()
                 self.outputs = [make_output(c, self) for c in self.prof.get("outputs", [])]
+                self.prewarm()
                 self.air = True
                 self._cap_kick()
                 for o in self.outputs:
@@ -1540,29 +1566,130 @@ class Engine:
     def output(self, oid):
         return next((o for o in self.outputs if o.cfg["id"] == oid), None)
 
-    # --- traitement du son : le processeur d'antenne traite chaque bloc UNE fois ; chaque flux reçoit le son traité ou,
-    # s'il est réglé ainsi, le son brut. Changer un réglage ou passer en bypass ne touche jamais aux encodeurs.
-    def set_processor(self, params=None, bypass=None):
+    # --- pannes : UN message quand une panne commence, UN quand elle se termine, pour chaque panne de la session.
+    # (Avant : un délai anti-répétition de 2 min par type d'alerte faisait sauter la 2e panne si elle suivait de près la 1re,
+    # et une sortie qui se reconnectait par intermittence envoyait « en erreur » sans jamais « rétablie », ou l'inverse.)
+    OUT_OK_S = 15.0                           # une sortie est « rétablie » après 15 s en ligne sans interruption
+
+    def incident(self, key, on, text):
+        """Ouvre (on=True) ou ferme une panne ; n'envoie que les changements d'état."""
+        if on and key not in self.inc:
+            self.inc[key] = time.time()
+            self.alert(text, key)
+        elif not on and key in self.inc:
+            dur = time.time() - self.inc.pop(key)
+            self.alert(f"{text} (après {fmt_dur(dur)})", key + "-ok")
+
+    def watch_incidents(self, p, air, cap):
+        if not air:
+            self.inc.clear()                      # fin d'antenne : ce n'est pas une panne, rien à « rétablir »
+            return
+        delay = p["delay"]
+        # 1) pas d'audio en entrée depuis le délai de la playlist de secours (même délai, même seuil)
+        if cap and not self.mute and self.silent_ms >= delay and "silence" not in self.inc:
+            why = f" ({self.cap_err})" if getattr(self, "cap_state", "") == "error" and self.cap_err else ""
+            if self.backup:
+                tail = "la playlist de secours a pris le relais."
+            elif p["enabled"] and not p["files"]:
+                tail = "la playlist de secours est vide : rien ne prend le relais !"
+            elif not p["enabled"]:
+                tail = "la playlist de secours est désactivée : rien ne prend le relais !"
+            else:
+                tail = "rien ne prend encore le relais."
+            self.incident("silence", True, f"Pas de son en entrée depuis {delay / 1000:g} s{why} : {tail}")
+        elif "silence" in self.inc and (self.loud_ms >= p["rec"] or not cap or self.mute):
+            self.incident("silence", False, "Le son est revenu en entrée")
+        # 2) playlist de secours à l'antenne, mais sans son (fichiers silencieux, illisibles, clé USB débranchée…)
+        if self.pl_silent_ms >= delay:
+            self.incident("fallback-silent", True, f"La playlist de secours est à l'antenne mais sans son depuis {delay / 1000:g} s "
+                          "(fichier silencieux ou illisible, dossier débranché ?) : silence à l'antenne !")
+        elif "fallback-silent" in self.inc and (self.pl_silent_ms == 0):
+            self.incident("fallback-silent", False, "La playlist de secours a retrouvé du son" if self.backup
+                          else "Fin du silence de la playlist de secours (retour au direct)")
+        # 3) sorties : en erreur / rétablies (une fois par panne, et « rétablie » après 15 s stables en ligne)
+        now = time.time()
+        ids = set()
+        for o in list(self.outputs):
+            if not o.cfg.get("enabled", True):
+                continue
+            k = "out-" + o.cfg["id"]
+            ids.add(k)
+            if o.state == "error":
+                o._ok_since = None
+                self.incident(k, True, f"Sortie « {o.name} » en erreur : {o.detail or '?'}")
+            elif o.state == "live":
+                o._ok_since = getattr(o, "_ok_since", None) or now
+                if k in self.inc and now - o._ok_since >= self.OUT_OK_S:
+                    self.incident(k, False, f"Sortie « {o.name} » rétablie")
+            else:
+                o._ok_since = None
+        for k in [k for k in self.inc if k.startswith("out-") and k not in ids]:
+            self.inc.pop(k, None)                 # sortie retirée ou désactivée
+
+    # --- traitement du son : chaque banque utilisée traite chaque bloc UNE fois ; chaque flux reçoit le son de sa banque
+    # ou le son brut. Changer un réglage, une banque ou passer en bypass ne touche jamais aux encodeurs.
+    def apply_fx(self):
+        """Réglages des banques / bypass modifiés (FX) : appliqués aux processeurs en marche, au bloc suivant."""
+        banks = FX.get("banks") or {}
+        for b, pr in list(self.procs.items()):
+            try:
+                pr.update(banks.get(b) or proc_params())
+                pr.set_bypass(bool(FX.get("bypass")))
+            except Exception as ex:
+                self.log(f"Processeur d'antenne (banque {b}) : réglage refusé ({ex})")
+
+    def set_processor(self, params=None, bypass=None, bank=None):
+        """(compatibilité) réglages d'une banque (A par défaut) et/ou bypass."""
         if params is not None:
-            FX["proc"] = params
-            if self.proc is not None:
-                self.proc.update(params)
+            FX.setdefault("banks", {})[bank or FX.get("edit") or "A"] = params
         if bypass is not None:
             FX["bypass"] = bool(bypass)
-            if self.proc is not None:
-                self.proc.set_bypass(bypass)
+        self.apply_fx()
 
-    def distribute(self, out, raw):
-        """Bloc de 20 ms vers les sorties : son traité, ou son brut pour les flux réglés « sans traitement »."""
+    def _proc_make(self, b):
+        """Crée le processeur d'une banque dans un autre fil (le calcul des filtres prend quelques dizaines de ms : pas de
+        trou dans l'antenne). En attendant, ce flux reçoit le son de la banque principale, ou le son brut."""
+        if b in self.proc_making or not self.proc_ok:
+            return
+        self.proc_making.add(b)
+
+        def work():
+            try:
+                pr = AirProcessor((FX.get("banks") or {}).get(b) or proc_params(), bool(FX.get("bypass")))
+                self.procs[b] = pr
+            except Exception as ex:
+                self.proc_ok = False
+                self.log(f"Processeur d'antenne indisponible ({ex}) : le son part sans traitement.")
+            finally:
+                self.proc_making.discard(b)
+        threading.Thread(target=work, daemon=True).start()
+
+    def banks_needed(self, air):
+        """Banques à faire tourner : celles des flux actifs (à l'antenne) et celle affichée dans l'onglet."""
+        need = []
+        if air:
+            for o in self.outputs:
+                b = out_bank(o.cfg)
+                if b != RAW and o.cfg.get("enabled", True) and b not in need:
+                    need.append(b)
+        main = need[0] if need else None
+        ed = FX.get("edit") if FX.get("edit") in BANKS else "A"
+        if ed not in need:
+            need.append(ed)
+        return need, main or ed
+
+    def distribute(self, outs, raw):
+        """Bloc de 20 ms vers les sorties : le son de leur banque, ou le son brut."""
         for o in self.outputs:
-            o.push(out if out_processed(o.cfg) else raw)
+            b = out_bank(o.cfg)
+            o.push(raw if b == RAW else outs.get(b, outs.get(self.main_bank, raw)))
 
     def set_out_fx(self, modes):
-        """Traité / brut choisi flux par flux : pris en compte au bloc suivant, sans redémarrer l'encodeur."""
+        """Banque (ou son brut) choisie flux par flux : prise en compte au bloc suivant, sans redémarrer l'encodeur."""
         for o in list(self.outputs):
             m = modes.get(o.cfg.get("id"))
             if m is not None:
-                o.cfg["fxmode"] = m
+                o.cfg["fx"] = m if (m in BANKS or m == RAW) else out_bank({"fxmode": m})
 
     def remove_output(self, oid):
         """Retire une sortie de l'antenne en cours (elle s'arrête en arrière-plan)."""
@@ -2197,6 +2324,7 @@ class Engine:
         was_air = False
         empty_warned = False
         nxt = time.perf_counter()
+        tick = 0
         while not self.ev.is_set():
             nxt += 0.02
             wait = nxt - time.perf_counter()
@@ -2241,6 +2369,13 @@ class Engine:
                         starved = True  # attend 200 ms d'avance avant de reprendre
             if self.tone and air:
                 live, phase = tone_block(phase)
+            if air and self.backup and g >= 0.99 and not self.pl_pause:     # playlist de secours seule à l'antenne
+                if max(peak_db(pl)) > p["thr"]:
+                    self.pl_silent_ms = 0
+                else:
+                    self.pl_silent_ms += 20
+            else:
+                self.pl_silent_ms = 0
             # --- détection du signal (seulement quand l'entrée est ouverte)
             if cap:
                 lv = peak_db(live)
@@ -2287,9 +2422,7 @@ class Engine:
                         self.backup = False
                 elif (p["enabled"] and has and not self.manual and not self.backup and self.silent_ms >= p["delay"]):
                     self.backup = True
-                    msg = f"Aucun signal depuis {p['delay'] / 1000:g} s : la playlist de secours prend le relais."
-                    self.log(msg)
-                    self.alert(msg, "fallback")
+                    self.log(f"Aucun signal depuis {p['delay'] / 1000:g} s : la playlist de secours prend le relais.")
                 elif self.backup and not self.manual and (self.loud_ms >= p["rec"] or not p["enabled"] or not has):
                     self.backup = False
                     if not has:
@@ -2298,7 +2431,6 @@ class Engine:
                         self.log("Playlist de secours désactivée : retour au direct.")
                     else:
                         self.log("Signal retrouvé : retour au direct (fondu).")
-                        self.alert("Signal retrouvé : retour au direct.", "fallback-back")
                 if p["enabled"] and not has and self.silent_ms >= p["delay"] and not empty_warned:
                     empty_warned = True
                     self.log("⚠ Silence à l'antenne, mais la playlist de secours est vide : rien ne peut prendre le relais.")
@@ -2334,25 +2466,39 @@ class Engine:
             else:
                 out = prog
             raw = out
-            pr = self.proc
-            if pr is not None and (air or cap):         # processeur d'antenne (hors antenne : mesures sur l'entrée seulement)
-                try:
-                    po = pr.process(out if air else live)
-                    if air:
-                        out = po
-                    self.pm = pr.meter
-                except Exception as ex:
-                    self.proc = None
-                    self.log(f"Processeur d'antenne arrêté ({ex}) : le son part sans traitement.")
-            elif self.pm:
-                self.pm = {}
+            outs = {}
+            if self.proc_ok and (air or cap):           # processeur d'antenne (hors antenne : mesures sur l'entrée seulement)
+                need, main = self.banks_needed(air)
+                self.main_bank = main
+                now_ = time.time()
+                src = out if air else live
+                for b in need:
+                    pr = self.procs.get(b)
+                    if pr is None:
+                        self._proc_make(b)
+                        continue
+                    self.proc_used[b] = now_
+                    try:
+                        outs[b] = pr.process(src)
+                    except Exception as ex:
+                        self.procs.pop(b, None)
+                        self.log(f"Processeur d'antenne (banque {b}) arrêté ({ex}) : son de la banque principale ou brut.")
+                for b in [b for b in self.procs if now_ - self.proc_used.get(b, 0) > 10 and b not in need]:
+                    self.procs.pop(b, None)             # banque plus utilisée depuis 10 s : libérée
+                ed = FX.get("edit") if FX.get("edit") in BANKS else "A"
+                self.pm = self.procs[ed].meter if ed in self.procs and ed in outs else {}
+                self.pm_main = self.procs[main].meter if main in self.procs and main in outs else {}
+                if air and main in outs:
+                    out = outs[main]                    # (antenne écoutée, crêtes, voyant : la banque principale)
+            elif self.pm or self.pm_main:
+                self.pm, self.pm_main = {}, {}
             lv = peak_db(out)
             if max(lv) > -0.3:
                 self.clip_t = time.time()
             for ch in (0, 1):
                 self.peak[ch] = max(self.peak[ch], lv[ch])
             if air:
-                self.distribute(out, raw)
+                self.distribute(outs, raw)
             if self.cmon.stream:                   # casque : antenne écoutée (si demandé) + pré-écoute des cartouches
                 parts = []
                 if self.listen and air:
@@ -2361,6 +2507,12 @@ class Engine:
                 if parts:
                     self.cmon.push(self.clip_mix(parts))
             self.proc_ms += ((time.perf_counter() - t0) * 1000 - self.proc_ms) * 0.05
+            tick += 1
+            if tick % 25 == 0:                       # toutes les 0,5 s : pannes à signaler
+                try:
+                    self.watch_incidents(p, air, cap)
+                except Exception as ex:
+                    self.log(f"Surveillance des pannes : {ex}")
 
     @staticmethod
     def clip_mix(parts):
@@ -2520,16 +2672,12 @@ class Output:
             self.t_live = time.time()
         if old == state:
             return
-        key = "out-" + self.cfg["id"]
         if state == "error":
             self.had_error = True
-            self.eng.log(f"[{self.name}] erreur : {detail}")
-            self.eng.alert(f"Sortie « {self.name} » en erreur : {detail}", key)
+            self.eng.log(f"[{self.name}] erreur : {detail}")      # (l'alerte est envoyée par Engine.watch_incidents)
         elif state == "live":
             self.eng.log(f"[{self.name}] en direct")
-            if self.had_error:
-                self.had_error = False
-                self.eng.alert(f"Sortie « {self.name} » rétablie.", key + "-ok")
+            self.had_error = False
             threading.Thread(target=self.send_meta, args=(self.eng.meta,), daemon=True).start()
 
     def supervise(self):
@@ -2583,7 +2731,7 @@ class Output:
 
     def filters(self):
         # son traité par le processeur d'antenne : pas de second traitement dans l'encodeur (il recompresserait)
-        if getattr(self.eng, "proc", None) is not None and out_processed(self.cfg):
+        if getattr(self.eng, "proc_ok", False) and out_processed(self.cfg):
             return []
         f = PROCESSING.get(self.cfg.get("processing", "Aucun"), "")
         return ["-af", f] if f else []
@@ -3199,6 +3347,294 @@ def public_info(ip):
     except Exception:
         return {}
 
+# ------------------------------------------------- métadonnées d'un automate de diffusion (Radiologik, RadioDJ, Rivendell…)
+AUTO_PORT = 8765
+AUTO_KEYS = {"title": ("title", "titre", "song", "track", "name"), "artist": ("artist", "artiste", "interprete", "performer"),
+             "album": ("album",), "cover": ("cover", "artwork", "art", "image", "picture", "pochette", "coverurl", "cover_url")}
+
+
+def auto_parse(raw, ctype=""):
+    """Titre en cours envoyé ou écrit par un automate -> {"artist", "title", "album", "cover"} (valeurs vides si absentes).
+    Accepte : JSON, XML (balises ou attributs), formulaire / adresse « artist=…&title=… », ou texte « Artiste - Titre »."""
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                raw = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    t = (raw or "").strip().lstrip("﻿")
+    out = {"artist": "", "title": "", "album": "", "cover": ""}
+
+    def take(d):
+        low = {str(k).lower().replace("-", "_"): v for k, v in d.items()}
+        for field, names in AUTO_KEYS.items():
+            for n in names:
+                v = low.get(n)
+                if isinstance(v, list):
+                    v = v[0] if v else ""
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    out[field] = str(v).strip()
+                    break
+    if not t:
+        return out
+    if t[:1] in "{[":
+        try:
+            js = json.loads(t)
+            if isinstance(js, list):
+                js = js[0] if js else {}
+            if isinstance(js, dict):
+                for k in ("now", "nowplaying", "now_playing", "current", "track", "song"):  # {"now": {...}}
+                    if isinstance(js.get(k), dict):
+                        js = {**js, **js[k]}
+                take(js)
+                return out
+        except ValueError:
+            pass
+    if t.startswith("<"):
+        # XML lu sans bibliothèque XML (absente du socle des versions déjà installées : la mise à jour express reste
+        # possible) : balises <title>…</title> et attributs title="…", premières occurrences
+        import html as _html
+        d = {}
+        for tag, txt in re.findall(r"<(?:[\w.-]+:)?([\w.-]+)[^>]*>([^<]+)</", t):
+            if txt.strip():
+                d.setdefault(tag.lower(), _html.unescape(txt.strip()))
+        for k, v in re.findall(r"([\w.-]+)\s*=\s*\"([^\"]*)\"", t):
+            d.setdefault(k.lower(), _html.unescape(v))
+        if d:
+            take(d)
+            return out
+    if "=" in t and ("&" in t or t.split("=", 1)[0].lower() in sum(AUTO_KEYS.values(), ())) and "\n" not in t:
+        take(urllib.parse.parse_qs(t.lstrip("?"), keep_blank_values=False))
+        if out["title"] or out["artist"]:
+            return out
+    line = next((ln.strip() for ln in t.splitlines() if ln.strip()), "")
+    if " - " in line:
+        out["artist"], out["title"] = [x.strip() for x in line.split(" - ", 1)]
+    elif " – " in line:
+        out["artist"], out["title"] = [x.strip() for x in line.split(" – ", 1)]
+    else:
+        out["title"] = line
+    return out
+
+
+def auto_text(info):
+    a, t = (info.get("artist") or "").strip(), (info.get("title") or "").strip()
+    return f"{a} - {t}" if a and t else (t or a)
+
+
+class AutomateMeta:
+    """Reçoit le titre en cours d'un automate de deux façons (au choix, ou les deux) :
+      - FICHIER : l'automate écrit le titre dans un fichier (texte, XML ou JSON) ; Bev le relit dès qu'il change ;
+      - RÉSEAU : l'automate appelle une adresse de Bev à chaque titre, par ex.
+        http://127.0.0.1:8765/?artist=…&title=…&cover=… (GET), ou envoie du JSON / un formulaire / du texte (POST).
+    La pochette peut être une adresse web (téléchargée) ou un fichier image. on_change(info) est appelé à chaque nouveau titre,
+    info = {"artist", "title", "album", "cover" (fichier local ou ""), "text", "source", "t"}."""
+
+    def __init__(self, on_change, log=lambda m: None):
+        self.on_change, self.log = on_change, log
+        self.cfg = {}
+        self.last, self.last_sig = None, None
+        self.srv = None
+        self.port_err = ""
+        self.stop_ev = threading.Event()
+        self.cover_dir = os.path.join(os.path.expanduser("~"), ".broadcast_tool_covers", "automate")
+        threading.Thread(target=self._watch_file, daemon=True).start()
+
+    # --- réglages : {"on": bool, "file": chemin, "net": bool, "port": int, "lan": bool}
+    def configure(self, cfg):
+        cfg = dict(cfg or {})
+        old = self.cfg
+        self.cfg = cfg
+        want = bool(cfg.get("on") and cfg.get("net"))
+        key = (want, int(cfg.get("port") or AUTO_PORT), bool(cfg.get("lan")))
+        if key != getattr(self, "_srv_key", None):
+            self._srv_key = key
+            self._stop_server()
+            if want:
+                self._start_server(key[1], key[2])
+        if cfg.get("file") != old.get("file"):
+            self._fsig = None
+
+    def stop(self):
+        self.stop_ev.set()
+        self._stop_server()
+
+    def url(self, host="127.0.0.1"):
+        return f"http://{host}:{int(self.cfg.get('port') or AUTO_PORT)}/"
+
+    # --- fichier
+    def _watch_file(self):
+        self._fsig = None
+        while not self.stop_ev.wait(1.0):
+            f = (self.cfg.get("file") or "").strip()
+            if not (self.cfg.get("on") and f):
+                continue
+            try:
+                stt = os.stat(f)
+                sig = (stt.st_mtime_ns, stt.st_size)
+                if sig == self._fsig:
+                    continue
+                self._fsig = sig
+                time.sleep(0.15)                          # l'automate finit d'écrire
+                with open(f, "rb") as fh:
+                    raw = fh.read(65536)
+                self.receive(auto_parse(raw), "fichier", base=os.path.dirname(f))
+            except OSError:
+                continue
+
+    # --- réseau
+    @staticmethod
+    def _local_ip(ip, lan):
+        """Adresse autorisée : cet ordinateur, et (option) le réseau local (10/8, 172.16/12, 192.168/16, fe80::, fc00::/7)."""
+        ip = ip.split("%")[0].lower()
+        if ip in ("127.0.0.1", "::1") or ip.startswith("127.") or ip.startswith("::ffff:127."):
+            return True
+        if not lan:
+            return False
+        ip = ip[7:] if ip.startswith("::ffff:") else ip
+        if ip.startswith(("10.", "192.168.", "fe80:", "fc", "fd")):
+            return True
+        m = re.match(r"^172\.(\d+)\.", ip)
+        return bool(m and 16 <= int(m.group(1)) <= 31)
+
+    def _start_server(self, port, lan):
+        """Petit serveur HTTP (socket seulement, sans http.server : absent du socle des versions déjà installées, ce qui
+        aurait imposé l'installateur complet au lieu de la mise à jour express)."""
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0" if lan else "127.0.0.1", port))
+            srv.listen(16)
+            srv.settimeout(0.5)
+        except OSError as ex:
+            self.srv, self.port_err = None, f"port {port} indisponible ({ex.strerror or ex})"
+            self.log(f"Automate : {self.port_err}.")
+            return
+        self.srv, self.port_err = srv, ""
+
+        def serve():
+            while self.srv is srv and not self.stop_ev.is_set():
+                try:
+                    c, addr = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=self._client, args=(c, addr[0], lan), daemon=True).start()
+            try:
+                srv.close()
+            except OSError:
+                pass
+        threading.Thread(target=serve, daemon=True).start()
+        self.log(f"Automate : réception des titres sur le port {port}" + (" (réseau local)." if lan else " (cet ordinateur)."))
+
+    def _client(self, c, ip, lan):
+        def answer(code, text):
+            body = (text + "\n").encode("utf-8")
+            head = (f"HTTP/1.0 {code} {'OK' if code == 200 else 'Refus'}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("ascii")
+            try:
+                c.sendall(head + body)
+            except OSError:
+                pass
+        try:
+            c.settimeout(5)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 16384:
+                part = c.recv(4096)
+                if not part:
+                    break
+                data += part
+            head, _, body = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            meth, path = (lines[0].split(" ") + ["", ""])[:2]
+            hdr = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+            n = min(int(hdr.get("content-length") or 0), 65536)
+            while len(body) < n:
+                part = c.recv(4096)
+                if not part:
+                    break
+                body += part
+            if not self._local_ip(ip, lan):
+                return answer(403, "refusé : adresse hors du réseau local")
+            q = urllib.parse.urlsplit(path).query
+            raw = body[:n] if (meth.upper() == "POST" and body[:n].strip()) else q.encode()
+            if not raw.strip():
+                return answer(200, "Bev : prêt à recevoir le titre en cours (?artist=…&title=…&cover=…)")
+            info = auto_parse(raw, hdr.get("content-type", ""))
+            if not (info["title"] or info["artist"]):
+                return answer(400, "aucun titre reçu (paramètres attendus : artist, title, cover)")
+            self.receive(info, "réseau")
+            answer(200, "ok : " + auto_text(info))
+        except (OSError, ValueError, IndexError):
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    def _stop_server(self):
+        srv, self.srv = self.srv, None             # (la boucle d'accueil s'arrête d'elle-même et ferme la prise)
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    # --- titre reçu
+    def receive(self, info, source, base=""):
+        if not (info.get("title") or info.get("artist")):
+            return
+        sig = (info.get("artist"), info.get("title"), info.get("album"), info.get("cover"))
+        if sig == self.last_sig:
+            return
+        self.last_sig = sig
+        cov = self.fetch_cover(info.get("cover") or "", base)
+        res = {**info, "cover": cov, "text": auto_text(info), "source": source, "t": time.time()}
+        self.last = res
+        try:
+            self.on_change(res)
+        except Exception as ex:
+            self.log(f"Automate : titre non affiché ({ex})")
+
+    def fetch_cover(self, ref, base=""):
+        """Pochette : fichier local (chemin, éventuellement relatif au fichier de l'automate, ou file://), ou adresse web
+        téléchargée (2 Mo au plus) dans un petit cache. Renvoie un chemin de fichier, ou ""."""
+        ref = (ref or "").strip()
+        if not ref:
+            return ""
+        if ref.lower().startswith("file://"):
+            ref = urllib.parse.unquote(urllib.parse.urlsplit(ref).path)
+            if SYS == "Windows" and re.match(r"^/[A-Za-z]:", ref):
+                ref = ref[1:]
+        if not ref.lower().startswith(("http://", "https://")):
+            p = ref if os.path.isabs(ref) else os.path.join(base or "", ref)
+            return p if os.path.isfile(p) else ""
+        try:
+            os.makedirs(self.cover_dir, exist_ok=True)
+            fn = os.path.join(self.cover_dir, hashlib.sha1(ref.encode("utf-8")).hexdigest()[:16] + ".img")
+            if not os.path.isfile(fn):
+                rq = urllib.request.Request(ref, headers={"User-Agent": "Bev"})
+                with urllib.request.urlopen(rq, timeout=6) as r:
+                    data = r.read(2_000_001)
+                if len(data) > 2_000_000 or not data:
+                    return ""
+                with open(fn + ".tmp", "wb") as fh:
+                    fh.write(data)
+                os.replace(fn + ".tmp", fn)
+                for old in sorted(os.listdir(self.cover_dir), key=lambda n: os.path.getmtime(os.path.join(self.cover_dir, n)))[:-60]:
+                    try:
+                        os.remove(os.path.join(self.cover_dir, old))       # cache borné aux 60 dernières pochettes
+                    except OSError:
+                        pass
+            return fn
+        except Exception as ex:
+            self.log(f"Automate : pochette non récupérée ({redact(ex)})")
+            return ""
+
+
 # ============================================================ INTERFACE Qt (PySide6)
 # ------------------------------------------------------------------ moteur audio dans un processus séparé
 # Le moteur (capture, mixage, cartouches, encodeurs) tourne dans son propre processus Python : il a son propre cœur de
@@ -3260,7 +3696,7 @@ class EngineWorker:
                 "slow": e.slow_now(), "mix_g": e.mix_g, "carts": st, "loading": set(loading),
                 "voices": [(v["id"], bool(v["stopping"])) for v in list(e.voices)],
                 "outs": [(o.cfg.get("id"), o.state, o.detail, o.t_live) for o in outs], "cmon": e.cmon.label,
-                "pm": dict(e.pm) if e.pm else {}}
+                "pm": dict(e.pm) if e.pm else {}, "pm_main": dict(e.pm_main) if e.pm_main else {}}
 
     def sender(self):
         """Seul fil qui écrit vers l'interface (une connexion ne supporte pas deux écritures simultanées)."""
@@ -3305,7 +3741,7 @@ class EngineWorker:
             return
         elif k == "fx":
             FX.update(m[1])
-            e.set_processor(FX.get("proc"), FX.get("bypass"))
+            e.apply_fx()
         elif k == "call":
             getattr(e, m[1])(*m[2], **m[3])
         elif k == "set":
@@ -3609,7 +4045,7 @@ class EngineProxy:
                    "meta_manual": prof.get("meta", {}).get("text", ""), "pl_cur": None, "pl_out": 0, "clip_t": 0.0,
                    "proc_ms": 0.0, "late": 0, "slow": False, "mix_g": 0.0, "carts": {}, "loading": set(), "voices": [],
                    "air": False, "monitor": False, "listen": False, "cap_state": "off", "cap_err": "",
-                   "src_dev": (prof.get("source") or {}).get("device", ""), "pm": {}}
+                   "src_dev": (prof.get("source") or {}).get("device", ""), "pm": {}, "pm_main": {}}
         d["in_peak"], d["peak"] = [-90.0, -90.0], [-90.0, -90.0]
         d["pid"] = slot.pid
 
@@ -3885,10 +4321,13 @@ class EngineProxy:
     def set_cart_live(self, cid, **kw):
         self._call("set_cart_live", cid, **kw)
 
-    def set_processor(self, params=None, bypass=None):
-        """Réglages du processeur d'antenne / bypass : envoyés tout de suite au moteur (appliqués au bloc suivant)."""
+    def apply_fx(self):
+        """Banques du processeur / bypass modifiés (FX) : envoyés tout de suite au moteur (appliqués au bloc suivant)."""
+        self._send(("noop",))
+
+    def set_processor(self, params=None, bypass=None, bank=None):
         if params is not None:
-            FX["proc"] = params
+            FX.setdefault("banks", {})[bank or FX.get("edit") or "A"] = params
         if bypass is not None:
             FX["bypass"] = bool(bypass)
         self._send(("noop",))
@@ -3897,7 +4336,7 @@ class EngineProxy:
         for o in self.outputs:
             m = modes.get(o.cfg.get("id"))
             if m is not None:
-                o.cfg["fxmode"] = m
+                o.cfg["fx"] = m
         self._call("set_out_fx", modes)
 
     def set_manual(self, on):

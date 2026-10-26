@@ -10,6 +10,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      captures_seules:
+        description: "Seulement les captures d'écran de l'interface (sans construire Windows / Mac)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,6 +31,7 @@ env:
 jobs:
   # Tests automatiques (tests/) et vérification de l'interface depuis le code source, avant toute publication.
   tests:
+    if: ${{ !inputs.captures_seules }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +41,7 @@ jobs:
           python-version: "3.12"
 
       - name: ffmpeg et bibliothèques système de Qt
+        timeout-minutes: 10
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libportaudio2
@@ -54,7 +61,47 @@ jobs:
           python broadcast_tool_qt.py --selftest || { cat selftest.txt; exit 1; }
           cat selftest.txt
 
+  # Captures d'écran de l'interface (artefact « captures ») : à chaque envoi de code, pour voir l'effet d'une modification.
+  captures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bibliothèques système
+        timeout-minutes: 4                   # (un miroir apt lent ne doit pas bloquer les captures : Qt est presque toujours là)
+        continue-on-error: true
+        run: sudo apt-get install -y -qq --no-install-recommends libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - name: Modules Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Captures
+        timeout-minutes: 8
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/captures.py captures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captures
+          path: |
+            captures/*.png
+            captures/rapport.txt
+      # À la demande seulement : captures aussi publiées sur la branche « captures » (consultables sans télécharger d'artefact)
+      - name: Branche « captures »
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cd captures
+          git init -q -b captures
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Captures de ${GITHUB_REF_NAME} (${GITHUB_SHA::7})"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" captures
+
   windows:
+    if: ${{ !inputs.captures_seules }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -173,6 +220,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   mac:
+    if: ${{ !inputs.captures_seules }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -251,6 +299,7 @@ jobs:
   # partait en parallèle : une version qui ne démarrait pas était quand même proposée en express à tous les Bev installés.
   express:
     needs: [tests, windows, mac]
+    if: ${{ !inputs.captures_seules }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
