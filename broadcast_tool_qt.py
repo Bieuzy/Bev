@@ -7114,7 +7114,10 @@ class FitScroll(QScrollArea):
             # hauteur MINIMALE à cette largeur (Qt 6.?+) ; totalHeightForWidth donne la hauteur PRÉFÉRÉE : la page défilait
             # dès que ses cartes auraient aimé être plus hautes, alors que leur minimum tenait (Diffusion, À propos)
             f = getattr(lay, "totalMinimumHeightForWidth", None)
-            need = max(need, f(max(100, vp.width())) if f is not None else lay.totalHeightForWidth(max(100, vp.width())))
+            if f is not None:
+                need = max(need, f(max(100, vp.width())))
+            else:                                           # (préférée, mais sans dépasser l'écran : on ne défile que si
+                need = max(need, min(lay.totalHeightForWidth(max(100, vp.width())), vp.height()))  # le minimum déborde)
         sz = (max(100, vp.width()), max(vp.height(), need))
         if (w.width(), w.height()) != sz:
             w.resize(*sz)
