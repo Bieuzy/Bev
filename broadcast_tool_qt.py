@@ -7111,7 +7111,10 @@ class FitScroll(QScrollArea):
         need = w.minimumSizeHint().height()
         lay = w.layout()
         if lay is not None and lay.hasHeightForWidth():      # textes qui passent à la ligne : leur vraie hauteur à cette largeur
-            need = max(need, lay.totalHeightForWidth(max(100, vp.width())))
+            # hauteur MINIMALE à cette largeur (Qt 6.?+) ; totalHeightForWidth donne la hauteur PRÉFÉRÉE : la page défilait
+            # dès que ses cartes auraient aimé être plus hautes, alors que leur minimum tenait (Diffusion, À propos)
+            f = getattr(lay, "totalMinimumHeightForWidth", None)
+            need = max(need, f(max(100, vp.width())) if f is not None else lay.totalHeightForWidth(max(100, vp.width())))
         sz = (max(100, vp.width()), max(vp.height(), need))
         if (w.width(), w.height()) != sz:
             w.resize(*sz)
@@ -9826,12 +9829,8 @@ class PagesMixin1:
     def _page_about(self):
         pg = Page()
         g = pg.grid
-        hero = Card()
-        if OCEAN:
-            hero.lay.addWidget(SeaScene(440, 96, bg=PANEL, light_x=.86), 0, Qt.AlignmentFlag.AlignLeft)
-        else:
-            hero.lay.addWidget(Hero(), 0, Qt.AlignmentFlag.AlignLeft)
-        hero.lay.addWidget(lab("« Bev » signifie « direct » en breton.", "", True))
+        hero = Card("Bev", "« Bev » signifie « direct » en breton.")
+        hero.lay.setSpacing(6)
         hero.lay.addWidget(lab("Bev est un logiciel de diffusion radiophonique destiné aux radios associatives : diffusion vers Internet, "
                                "la FM et le DAB+, enregistrement de l'antenne, playlist de secours, cartoucheur, processeur d'antenne "
                                "et surveillance des flux, avec alerte en cas de panne.", "", True))
@@ -9867,15 +9866,18 @@ class PagesMixin1:
                            ("Système", platform.platform()[:52]), ("ffmpeg", ff or "introuvable"),
                            ("numpy (calcul rapide)", "oui" if np is not None else "non"),
                            ("sounddevice (cartes son)", "oui" if have_module("sounddevice") else "non"),
-                           ("Glisser-déposer", "oui"), ("Réglages", CONF)]
-        for a, b in self.about_info:
-            h = QHBoxLayout()
+                           ("Réglages", CONF)]
+        sg = QGridLayout()
+        sg.setVerticalSpacing(3)
+        sg.setHorizontalSpacing(12)
+        for i, (a, b) in enumerate(self.about_info):
             l = lab(a, "mut")
-            l.setFixedWidth(180)
             v = lab(b, "", True)
-            h.addWidget(l)
-            h.addWidget(v, 1)
-            sy.lay.addLayout(h)
+            v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            sg.addWidget(l, i, 0)
+            sg.addWidget(v, i, 1)
+        sg.setColumnStretch(1, 1)
+        sy.lay.addLayout(sg)
         h = QHBoxLayout()
         h.addWidget(btn("Copier les infos", "", lambda: self.copy_text("\n".join(f"{a} : {b}" for a, b in self.about_info), "Infos")))
         h.addWidget(btn("Vérifier les mises à jour", "", lambda: self.update_start(True)))
@@ -9893,8 +9895,7 @@ class PagesMixin1:
         sc.setWidgetResizable(True)
         sc.setFrameShape(QFrame.Shape.NoFrame)
         sc.setWidget(tx)
-        sc.setMinimumHeight(170)
-        sc.setMaximumHeight(300)
+        sc.setMinimumHeight(80)
         sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
         nw.lay.addWidget(sc, 1)
         h = QHBoxLayout()
@@ -9903,7 +9904,7 @@ class PagesMixin1:
             f"https://github.com/{self.data.get('settings', {}).get('update_repo') or UPDATE_REPO or 'Bieuzy/bev'}/releases")))
         h.addStretch(1)
         nw.lay.addLayout(h)
-        g.addWidget(nw, 1, 0, 1, 2)
+        g.addWidget(nw, 1, 0)
         sk = Card("Raccourcis", "Commandes clavier et souris")
         grid = QGridLayout()
         for i, (k, v) in enumerate((("F1 à F12", "jouer la touche du cartoucheur"), ("Maj + clic sur une touche", "jouer sur la sortie audio seule (sans antenne)"),
@@ -9912,12 +9913,13 @@ class PagesMixin1:
                                     ("Glisser des fichiers sur la liste", "les ajouter à la playlist de secours"), ("Ctrl + Z  /  Ctrl + Y", "annuler / rétablir la dernière modification"))):
             l = QLabel(f"<b style='color:{ACCT}'>{k}</b>  {v}")
             l.setWordWrap(True)
-            grid.addWidget(l, i // 2, i % 2)
-        grid.setHorizontalSpacing(18)
+            grid.addWidget(l, i, 0)
+        grid.setVerticalSpacing(4)
         self._sk = (grid, [grid.itemAt(i).widget() for i in range(grid.count())])
         sk.lay.addLayout(grid)
-        g.addWidget(sk, 2, 0, 1, 2)
-        g.setRowStretch(3, 1)
+        sk.lay.addStretch(1)
+        g.addWidget(sk, 1, 1)
+        g.setRowStretch(1, 1)
         return pg
 
 # ------------------------------------------------------------------ Traitement du son
@@ -15233,7 +15235,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             for l in labels:
                 grid.removeWidget(l)
             for i, l in enumerate(labels):
-                grid.addWidget(l, i, 0) if on else grid.addWidget(l, i // 2, i % 2)
+                grid.addWidget(l, i, 0)                  # (une colonne : la carte est à côté des nouveautés)
         sl = getattr(self, "_sos_lay", None)
         if sl:                                           # SOS : téléphone replié, boutons sous le texte, interrupteurs empilés
             h, bt, trg = sl
@@ -15245,6 +15247,15 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             h.setSpacing(10 if on else 22)
             self.al_phone.setVisible(not on and not MINI)
         self.compact_header()
+
+    def air_min(self):
+        """Hauteur minimale de « 4 · À l'antenne » recalculée à chaque changement de compacité (elle restait figée à sa
+        taille d'origine : la page Diffusion défilait sur les écrans de portable)."""
+        d = getattr(self, "_diff", None)
+        if d:
+            air = d[6]
+            air.setMinimumHeight(0)
+            air.setMinimumHeight(air.minimumSizeHint().height())
 
     def apply_compact(self):
         """Adapte toutes les pages à la hauteur disponible : en dessous de 720 px de page, cartes plus serrées et
@@ -15274,6 +15285,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.eqc.setMaximumHeight(84 if lvl < 1 else 56)
         if hasattr(self, "proc_meters"):
             self.proc_meters.setMinimumHeight(150 if lvl < 1 else 112)
+        QTimer.singleShot(0, self.air_min)
 
     def compact_header(self):
         """Fenêtre étroite : on replie l'antenne décorative et « Plein écran » (F11 reste dispo) pour que l'en-tête ne se chevauche jamais."""
@@ -15689,7 +15701,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.facts = FactCard()
         right.addWidget(self.facts)
         self._diff = (h, left, right, src, fb, outf, air, self.facts)
-        QTimer.singleShot(0, lambda: air.setMinimumHeight(air.minimumSizeHint().height()))   # jamais écrasée par la carte « Flux »
+        QTimer.singleShot(0, self.air_min)               # jamais écrasée par la carte « Flux »
         self.cur_device = ""
         self.show_cover(None)
         sa = FitScroll()                         # fenêtre basse : la page défile au lieu de se chevaucher
