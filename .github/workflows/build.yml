@@ -41,6 +41,7 @@ jobs:
           python-version: "3.12"
 
       - name: ffmpeg et bibliothèques système de Qt
+        timeout-minutes: 10
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libportaudio2
@@ -69,21 +70,24 @@ jobs:
         with:
           python-version: "3.12"
       - name: Bibliothèques système
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libportaudio2
+        timeout-minutes: 4                   # (un miroir apt lent ne doit pas bloquer les captures : Qt est presque toujours là)
+        continue-on-error: true
+        run: sudo apt-get install -y -qq --no-install-recommends libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
       - name: Modules Python
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Captures
+        timeout-minutes: 8
         env:
           QT_QPA_PLATFORM: offscreen
         run: python tools/captures.py captures
       - uses: actions/upload-artifact@v4
         with:
           name: captures
-          path: captures/*.png
+          path: |
+            captures/*.png
+            captures/rapport.txt
       # À la demande seulement : captures aussi publiées sur la branche « captures » (consultables sans télécharger d'artefact)
       - name: Branche « captures »
         if: github.event_name == 'workflow_dispatch'

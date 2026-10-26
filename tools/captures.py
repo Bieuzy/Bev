@@ -18,9 +18,10 @@ from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 OUT = os.path.abspath(_ARGS[0] if _ARGS else "captures")
-SIZES = [(1440, 900), (1180, 760)]
+SIZES = [(1440, 860), (1366, 728)]        # écran 1440x900 et portable 1366x768, fenêtre agrandie
 PAGES = [k for k in bev.PAGE_KEYS]
 STATES = ("air", "partial", "secours", "bad")
+REPORT = []
 
 
 def main():
@@ -41,6 +42,9 @@ def main():
 
     def step(i=0):
         if i >= len(jobs):
+            with open(os.path.join(out, "rapport.txt"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(REPORT) + "\n")
+            print("\n".join(REPORT), flush=True)
             w._closing = True
             app.exit(0)
             return
@@ -59,6 +63,14 @@ def main():
             w.loud.set(-16.4, -14.9, True, "ANTENNE")
         name = f"{W}x{H}-{PAGE_KEYS_IDX[k]:02d}-{k}" + (f"-{state}" if state else "") + ".png"
         w.grab().save(os.path.join(out, name))
+        if state is None:                          # la page tient-elle sans défilement ?
+            pgw = w.stack.currentWidget()
+            sc = pgw if isinstance(pgw, bev.QScrollArea) else (pgw.findChildren(bev.QScrollArea) or [None])[0]
+            over = 0
+            if sc is not None and sc.widget() is not None:
+                over = sc.widget().height() - sc.viewport().height()
+            line = f"{W}x{H}  {k:6s}  " + (f"DÉFILE ({over} px de trop)" if over > 2 else "tient sur l'écran")
+            REPORT.append(line)
         print("capture", name, flush=True)
         QTimer.singleShot(50, lambda: step(i + 1))
 
