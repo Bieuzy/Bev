@@ -40,6 +40,9 @@ def main():
             jobs.append((W, H, k, None))
         for state in STATES:
             jobs.append((W, H, "diff", state))
+        if (W, H) == SIZES[0]:                    # processeur : mesures en direct et chaque onglet de réglages
+            for state in ("live", "tab1", "tab2", "tab3"):
+                jobs.append((W, H, "son", state))
 
     def step(i=0):
         if i >= len(jobs):
@@ -62,7 +65,15 @@ def main():
 
     def shoot(i):
         W, H, k, state = jobs[i]
-        if state is not None:                      # état simulé, dessiné juste avant la capture
+        if k == "son" and state is not None:      # processeur : onglet de réglages, ou mesures simulées
+            w.proc_tab(int(state[3:]) if state.startswith("tab") else 0)
+            if state == "live":
+                w.proc_meters.set({"agc": 3.4, "bagc": 1.0, "gr": [4.2, 2.8, 3.5, 5.1, 2.2], "lim": 1.6, "clip": 0.9,
+                                   "lufs": -15.8, "lufs_m": -14.6, "out": -1.1}, "air")
+                w.proc_meters.set = lambda *_a: None          # (le moteur absent ne l'efface plus)
+        elif k == "son":
+            w.proc_tab(0)
+        elif state is not None:                    # état simulé, dessiné juste avant la capture
             text = {"air": "EN ANTENNE  01:12:09", "partial": "1 FLUX HS  01:12:09", "secours": "SECOURS  01:12:09",
                     "bad": "Aucun flux en ligne", "wait": "Connexion des flux…"}[state]
             w.l_air.set_mode(state)

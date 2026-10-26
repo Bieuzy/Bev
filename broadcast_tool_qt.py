@@ -10123,7 +10123,7 @@ class ProcMeters(QWidget):
         # --- lignes : nom | barre | valeur
         top = 24
         n = len(self.ROWS)
-        rh = max(12.0, min(22.0, (H - top) / n))
+        rh = max(12.0, min(30.0, (H - top) / n))
         lw, vw = 92, 58
         x0, x1 = lw, W - 160 - vw
         p.setFont(f)
@@ -10136,7 +10136,7 @@ class ProcMeters(QWidget):
             p.setFont(f)
             p.setPen(mut)
             p.drawText(QRectF(0, y, lw - 8, rh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-            bh = max(5.0, min(9.0, rh - 8))
+            bh = max(5.0, min(10.0, rh - 10))
             tr = QRectF(x0, cy - bh / 2, x1 - x0, bh)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(TRACK))
@@ -10377,14 +10377,12 @@ class PagesMixin2:
         top.lay.setContentsMargins(18, 12, 18, 12)
         h = QHBoxLayout()
         h.setSpacing(10)
-        t = lab("Processeur d'antenne", "")
-        t.setStyleSheet("font-size:17px;font-weight:800;")
-        h.addWidget(t)
+        # (le titre « Processeur » est déjà en haut de la fenêtre : la carte commence directement par la banque)
         beta = lab("BÊTA", "")
         beta.setStyleSheet(f"background:{ACC};color:{ONACC};font-size:10px;font-weight:800;border-radius:8px;padding:2px 8px;")
         beta.setToolTip("Fonction en cours de mise au point : écoutez le résultat avant de l'utiliser à l'antenne.")
         h.addWidget(beta, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addSpacing(14)
+        h.addSpacing(8)
         h.addWidget(lab("Banque", "mut"))
         self.seg_bank = Segmented(list(BANKS), w=40, h=28)
         self.seg_bank.setValue(BANKS.index(self.proc["edit"]))
