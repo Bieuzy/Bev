@@ -155,7 +155,7 @@ for _d in (os.path.join(_EXE_DIR, "bin"), _EXE_DIR, os.path.join(APP_DIR, "bin")
 if SYS == "Windows":
     try:  # icône propre dans la barre des tâches (et non celle de Python)
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("studio.radio.diffusion")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fr.radio.bev")   # (même identifiant que main())
     except Exception:
         pass
 SR = 44100
@@ -648,6 +648,20 @@ def run(cmd, timeout=15):
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **kw)
     return r.stdout + "\n" + r.stderr
+
+
+_SECRET_RE = re.compile(r"((?:icecast|https?|rtmps?|srt|udp|tcp|ftp)://[^:/@\s]*:)[^@\s]+@", re.I)
+_SECRET_Q_RE = re.compile(r"\b((?:pass|password|passwd|pwd|key|token)=)[^&\s]+", re.I)
+
+
+def redact(text):
+    """Masque les mots de passe d'une ligne avant de l'afficher, de l'écrire ou de l'envoyer : ffmpeg recopie l'adresse
+    complète du serveur (icecast://source:MOTDEPASSE@hôte…) dans ses messages d'erreur, qui finissaient dans le journal,
+    les alertes Discord / mail / SMS et la conversation avec Gaël."""
+    t = str(text)
+    if "://" in t or "=" in t:
+        t = _SECRET_Q_RE.sub(r"\1***", _SECRET_RE.sub(r"\1***@", t))
+    return t
 
 
 def have_module(name):
@@ -1336,15 +1350,33 @@ def load_data():
         if d.get("last") not in d["profiles"]:
             d["last"] = next(iter(d["profiles"]))
         return d
-    except Exception:
+    except Exception as ex:
+        # Réglages illisibles (fichier abîmé par une coupure de courant, modifié à la main…) : on les met de côté AVANT de
+        # repartir des réglages par défaut. Sans cela, le premier enregistrement écrasait tous les profils, flux et
+        # playlists de la radio, sans retour possible.
+        if os.path.exists(CONF) and not isinstance(ex, FileNotFoundError):
+            try:
+                shutil.copy2(CONF, CONF + time.strftime(".illisible-%Y%m%d-%H%M%S.bak"))
+            except OSError:
+                pass
         return {"last": "Défaut", "profiles": {"Défaut": default_profile()},
-                "monitor": {}, "alerts": {}}
+                "monitor": {}, "alerts": {}, "counts": {}}
 
 
 def save_data(d):
     tmp = CONF + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())                # coupure de courant juste après : le fichier n'est pas vide
+        except OSError:
+            pass
+    if SYS != "Windows":
+        try:
+            os.chmod(tmp, 0o600)                # mots de passe des serveurs, clés : lisibles par cet utilisateur seulement
+        except OSError:
+            pass
     os.replace(tmp, CONF)
 
 # ------------------------------------------------------------------ moteur
@@ -1450,6 +1482,7 @@ class Engine:
         self.delay_q = deque()
         self.voices, self.loading, self.duck_g = [], set(), 1.0
         self.pcm_cache = {}
+        self.pcm_lk = threading.Lock()         # le cache est rempli par plusieurs fils (préchargement, tuiles lancées)
         self.in_peak, self.clip_t, self.pl_cur = [-90.0, -90.0], 0.0, None
         self.proc_ms, self.late, self.late_t = 0.0, 0, 0.0
         self.late_hist = []
@@ -1814,8 +1847,10 @@ class Engine:
             key = (path, os.path.getmtime(path), trim, maxi)
         except OSError:
             return None
-        if key in self.pcm_cache:
-            return self.pcm_cache[key]
+        with self.pcm_lk:
+            hit = self.pcm_cache.get(key)
+        if hit is not None:
+            return hit
         try:
             pcm = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
@@ -1828,11 +1863,12 @@ class Engine:
         if not pcm:
             return None
         pcm = pcm_process(pcm, trim, maxi) or pcm
-        for k in [k for k in self.pcm_cache if k[0] == path]:
-            del self.pcm_cache[k]
-        if sum(len(v) for v in self.pcm_cache.values()) + len(pcm) > 400e6:
-            self.pcm_cache.clear()  # garde la mémoire raisonnable
-        self.pcm_cache[key] = pcm
+        with self.pcm_lk:   # (sans verrou : « dictionary changed size during iteration » et la tuile ne partait pas)
+            for k in [k for k in self.pcm_cache if k[0] == path]:
+                del self.pcm_cache[k]
+            if sum(len(v) for v in self.pcm_cache.values()) + len(pcm) > 400e6:
+                self.pcm_cache.clear()  # garde la mémoire raisonnable
+            self.pcm_cache[key] = pcm
         return pcm
 
     def preload_carts(self):
@@ -2612,7 +2648,7 @@ class Output:
             try:
                 self.run_once()
             except Exception as e:
-                self.err.append(str(e))
+                self.err.append(redact(e))
             self.kill()
             if stop.is_set():
                 break
@@ -2689,7 +2725,7 @@ class Output:
                     if self.state == "connecting":
                         self.set_state("live")
                 else:
-                    self.err.append(line)
+                    self.err.append(redact(line))
 
     def feed(self, p):
         stop = self.stop_ev
@@ -2971,7 +3007,7 @@ class RecordOutput(Output):
               "FLAC": (["-c:a", "flac"], ".flac", False),
               "Ogg Opus": (["-c:a", "libopus"], ".ogg", True),
               "WAV": (["-c:a", "pcm_s16le"], ".wav", False)}
-    NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}h\d{2}\.\w+$")
+    STAMPS = ("%Y-%m-%d_%Hh%M", "%Y-%m-%d_%Hh", "%d-%m-%Y %Hh%M", "%Y%m%d-%H%M%S")     # tous les noms datés que Bev crée
 
     def __init__(self, cfg, eng):
         super().__init__(cfg, eng)
@@ -2980,19 +3016,34 @@ class RecordOutput(Output):
     def describe(self):
         return self.cfg.get("folder", "")
 
+    def name_re(self):
+        """Fichiers créés par Bev dans ce dossier : [préfixe] + date (un des formats proposés) + [_2, _3…] + extension
+        d'enregistrement. Avant, seul « 2026-10-23_16h30.mp3 » (sans préfixe) était reconnu : la pige (préfixe « Pige_ »,
+        fichiers « …_16h.mp3 ») n'était jamais purgée et finissait par remplir le disque. Tout autre fichier du dossier
+        (interview, montage…) n'est jamais touché."""
+        conv = {"%Y": r"\d{4}", "%m": r"\d{2}", "%d": r"\d{2}", "%H": r"\d{2}", "%M": r"\d{2}", "%S": r"\d{2}"}
+        stamps = "|".join(re.sub(r"%[YmdHMS]", lambda m: conv[m.group(0)], re.escape(s).replace(r"\%", "%"))
+                          for s in self.STAMPS)
+        pre = re.sub(r'[\\/:*?"<>|]', "_", self.cfg.get("prefix", "") or "")
+        pres = {"", pre, pre.strip("_- ")} | ({pre + "_"} if pre and pre[-1] not in "_- " else set())
+        pres = "|".join(re.escape(p) for p in sorted(pres, key=len, reverse=True))
+        exts = "|".join(re.escape(v[1]) for v in self.CODECS.values())
+        return re.compile(rf"^(?:{pres})(?:{stamps})(?:_\d+)?(?:{exts})$", re.I)
+
     def cleanup(self):
         self.last_clean = time.time()
         try:
-            days = float(self.cfg.get("keep_days") or 0)
+            days = float(str(self.cfg.get("keep_days") or 0).replace(",", "."))
         except ValueError:
             days = 0
         if days <= 0:
             return
         folder = self.cfg["folder"]
+        name_re = self.name_re()
         for n in os.listdir(folder) if os.path.isdir(folder) else []:
             p = os.path.join(folder, n)
             try:
-                if self.NAME_RE.match(n) and os.path.getmtime(p) < time.time() - days * 86400:
+                if name_re.match(n) and os.path.isfile(p) and os.path.getmtime(p) < time.time() - days * 86400:
                     os.remove(p)
                     self.eng.log(f"[{self.name}] ancien fichier supprimé : {n}")
             except OSError:
@@ -3534,12 +3585,22 @@ class WorkerSlot:
             key = os.urandom(16)
             lst = Listener(authkey=key)
             env = clean_env(splash=False, reset=False)   # pas d'écran de démarrage pour le moteur (processus invisible)
+            lp = os.path.join(os.path.expanduser("~"), ".bev_moteur.log")
             try:
-                log = open(os.path.join(os.path.expanduser("~"), ".bev_moteur.log"), "ab")
+                if os.path.getsize(lp) > 5e6:           # journal d'erreurs du moteur : gardé sous 5 Mo (il grossissait sans fin)
+                    os.replace(lp, lp + ".1")
+            except OSError:
+                pass
+            try:
+                log = open(lp, "ab")
             except OSError:
                 log = subprocess.DEVNULL
-            self.proc = popen(worker_cmd() + [WORKER_ARG, lst.address, key.hex()], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=log, env=env)
+            try:
+                self.proc = popen(worker_cmd() + [WORKER_ARG, lst.address, key.hex()], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=log, env=env)
+            finally:
+                if log is not subprocess.DEVNULL:
+                    log.close()                         # (le moteur a sa propre copie ; celle-ci restait ouverte à chaque relance)
             box = {}
 
             def acc():
@@ -3964,14 +4025,14 @@ class EngineProxy:
 
 
 from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal, QElapsedTimer)
-from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QFontMetricsF, QIcon, QImage, QKeySequence,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QFontMetricsF, QIcon, QImage, QKeySequence,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QWidgetAction
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLayout, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                               QLayout, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QStyledItemDelegate, QWidgetItem as _WItem,
-                               QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+                               QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
 
 def _early_settings():
@@ -8223,7 +8284,7 @@ def probe_stream(url, thr=-50.0, secs=5):
     m = re.search(r"max_volume:\s*(-inf|-?[\d.]+)\s*dB", r.stderr)
     if not m:
         lines = [ln.strip() for ln in r.stderr.splitlines() if ln.strip()]
-        why = lines[-1][:90] if lines else "aucune réponse"
+        why = redact(lines[-1])[:90] if lines else "aucune réponse"
         return "down", f"Flux inactif : {why}"
     level = -99.0 if m.group(1) == "-inf" else float(m.group(1))
     if level > thr:
@@ -8252,7 +8313,6 @@ def fetch_listeners(url):
 
 
 import smtplib
-import unicodedata
 from email.message import EmailMessage
 
 
@@ -8289,6 +8349,7 @@ class Alerts:
         """Alerte : journal + message / mail / SMS selon les réglages. Le bip est réservé aux vraies pannes (sound=True) :
         une reconnexion, une bascule automatique sur le secours ou un retour à la normale ne bipent pas."""
         c = self.cfg()
+        text = redact(text)
         if key and not force:
             if time.time() - self.last.get(key, 0) < 120:
                 return
@@ -9082,8 +9143,8 @@ class AssistantKB:
 # ------------------------------------------------------------------ Gaël : la mascotte articulée et ses animations
 # Gaël est dessiné en vectoriel à chaque image (aucune image chargée). Les animations sont pilotées par le temps réel
 # (QElapsedTimer) : elles restent fluides même si une image saute. Le minuteur s'arrête dès que Gaël n'est pas visible.
-from PySide6.QtCore import QElapsedTimer, QThread
-from PySide6.QtGui import QTransform, QPolygonF
+from PySide6.QtCore import QThread
+from PySide6.QtGui import QTransform
 
 # Gaël « le Marin » : marinière, béret à pompon, antenne qui capte. Quatre couleurs : marine, blanc, rouge, ambre.
 G_NAVY, G_WHITE, G_RED, G_AMBER = "#12294a", "#ffffff", "#d9263d", "#f2a33a"
@@ -17017,10 +17078,13 @@ class GaelLLM:
         key, model, _ = self.llm_cfg()
         if self.history is None:
             self.history = []
-        self.history.append({"role": "user", "content": q})
-        self.history = self.history[-24:]
-        while self.history and self.history[0]["role"] != "user":
+        self.history = self.history[-23:]
+        # l'historique doit commencer par une vraie question : un message « résultats d'outils » en tête (son appel d'outil
+        # ayant été coupé par la limite) fait refuser toutes les demandes suivantes par l'API (erreur 400)
+        while self.history and not (self.history[0]["role"] == "user" and isinstance(self.history[0]["content"], str)):
             self.history.pop(0)
+        mark = len(self.history)
+        self.history.append({"role": "user", "content": q})
         state = self.llm_state()
         sysmsg = GAEL_SYSTEM.format(app=APP, state=state)
         box = {"b": self.stream_bubble()}
@@ -17042,6 +17106,9 @@ class GaelLLM:
                 self.app.bridge.call.emit(lambda: self.llm_done(box["b"]))
             except Exception as ex:
                 msg = str(ex)
+                # échec en plein échange (appel d'outil sans son résultat…) : on revient à l'historique d'avant la question,
+                # sinon chaque question suivante était refusée par l'API et Gaël restait en « IA indisponible »
+                del self.history[mark:]
                 self.app.bridge.call.emit(lambda: self.llm_fail(q, msg, box["b"]))
         threading.Thread(target=work, daemon=True).start()
 
@@ -17112,8 +17179,6 @@ class GaelLLM:
         self.bot.think = False
         if bubble is not None and not bubble.property("txt"):
             bubble.parentWidget().hide()
-        if self.history and self.history[-1].get("role") == "user":
-            self.history.pop()
         self.l_st.setText("en local (IA indisponible)")
         r = self.answer(q)
         text, acts = r if isinstance(r, tuple) else (r, None)
@@ -19694,6 +19759,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.bridge.call.emit(lambda: fn(*args))
 
     def add_log(self, msg):
+        msg = redact(msg)
         line = f"{time.strftime('%H:%M:%S')}  {msg}"
         if self.data.get("settings", {}).get("daily_log"):
             self.daily_log(line)
@@ -22053,8 +22119,12 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 os.replace(dst + ".part", dst)
                 express_state({"version": ex["version"], "runtime": RUNTIME, "file": ex["file"], "sha256": ex["sha256"],
                                "fails": 0, "from": VERSION, "notes": (r.get("notes") or "")[:20000]})
-                for f in os.listdir(UPD_DIR):              # anciens codes express : supprimés
-                    if f.startswith("bev-") and f.endswith(".py") and f != ex["file"]:
+                # anciens codes express : supprimés, SAUF celui qui tourne en ce moment. Le moteur audio est relancé avec ce
+                # même fichier (BEV_CODE) s'il redémarre avant Bev : effacé, il repartait sur la version installée, plus
+                # ancienne, différente de l'interface (antenne en panne jusqu'au redémarrage de Bev).
+                busy = os.path.basename(os.environ.get("BEV_CODE") or "")
+                for f in os.listdir(UPD_DIR):
+                    if f.startswith("bev-") and f.endswith(".py") and f not in (ex["file"], busy):
                         try:
                             os.remove(os.path.join(UPD_DIR, f))
                         except OSError:
@@ -22446,7 +22516,7 @@ def main():
                     fh.write("\n".join(rep) + "\n")
             except OSError:
                 pass
-            bad = bool(errs) or (SYS == "Windows" and not shutil.which("ffmpeg"))
+            bad = bool(errs) or ((SYS == "Windows" or getattr(sys, "frozen", False)) and not shutil.which("ffmpeg"))   # (Mac aussi : ffmpeg est fourni)
             w._closing = True
             app.exit(1 if bad else 0)
         QTimer.singleShot(1500 + len(PAGE_KEYS) * 500 + 2500, done)
