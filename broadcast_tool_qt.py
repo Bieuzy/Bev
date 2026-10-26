@@ -2364,6 +2364,10 @@ class Segmented(QWidget):
 
     def __init__(self, labels, w=56, h=32, parent=None):
         super().__init__(parent)
+        f = QFont(self.font())                       # chaque segment est assez large pour son texte (« Problèmes »
+        f.setBold(True)                              # dépassait de sa pastille)
+        f.setPointSizeF(9.5)
+        w = max(w, max(QFontMetrics(f).horizontalAdvance(t) for t in labels) + 20) if labels else w
         self.labels, self.w, self.h, self.val, self.pos = list(labels), w, h, 0, 0.0
         self.setFixedSize(w * len(labels) + 6, h + 6)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3706,7 +3710,7 @@ NEWS = {
 
 - **Quatre banques A, B, C, D** de réglages, et **un traitement par flux** : par exemple Internet sur A, FM sur B (filtre 15 kHz), enregistrement en son brut. Tous tournent en même temps.
 - **À zéro** (réglage neutre) et **Réinitialiser** (retour au préréglage de la banque).
-- Page épurée, sur un seul écran : multibande en 3 réglages (force, vitesse, graves / médiums / aigus), AGC, mesures et densité réunis.
+- **Page repensée, sur un seul écran** : en haut la banque, le préréglage et le bypass ; au milieu ce que fait le processeur (une ligne par étape, dans l'ordre où passe le son) et la banque de chaque flux ; en bas les réglages fins, rangés en 4 onglets (Niveau, Couleur, Compression, Stéréo et sortie).
 
 ## Antenne
 
@@ -3722,7 +3726,8 @@ NEWS = {
 ## Divers
 
 - Pas de réglage de débit pour FLAC et WAV (qualité maximale d'office).
-- Nouvelle présentation dans « À propos ».""",
+- Nouvelle présentation dans « À propos ».
+- Affichage : plus aucun chevauchement sur les écrans de portable (1920 × 1080 à 125 %) : l'anecdote « Le saviez-vous ? » ne passe plus sur « À l'antenne », la cartouche en cours ne passe plus sur la sonie dans le bandeau.""",
     "1.1.1": """## Des mises à jour qui passent toutes seules
 
 - **Mise à jour express** : la plupart des versions ne pèsent plus que ~1 Mo. Bev récupère son nouveau code, vérifie son empreinte, et redémarre en quelques secondes. Pas d'installateur à lancer, pas de droits administrateur : Smart App Control, SmartScreen, l'antivirus et le pare-feu n'ont plus rien à bloquer.
@@ -7130,6 +7135,8 @@ class FitScroll(QScrollArea):
                 need = max(need, f(max(100, vp.width())))
             else:                                           # (préférée, mais sans dépasser l'écran : on ne défile que si
                 need = max(need, min(lay.totalHeightForWidth(max(100, vp.width())), vp.height()))  # le minimum déborde)
+        if 0 < need - vp.height() <= 6:                    # quelques pixels de trop : on serre plutôt que d'afficher
+            need = vp.height()                               # une barre de défilement pour rien
         sz = (max(100, vp.width()), max(vp.height(), need))
         if (w.width(), w.height()) != sz:
             w.resize(*sz)
