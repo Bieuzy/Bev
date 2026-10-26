@@ -3045,7 +3045,7 @@ class LoudChip(QWidget):
     def __init__(self):
         super().__init__()
         self.st, self.mo, self.on, self.what = None, None, False, ""
-        self.setFixedSize(232, 38)
+        self.setFixedSize(262, 38)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Sonie de sortie (norme EBU R128) : court terme sur 3 s, et point = instantanée (400 ms).\n"
                         "Repères : −23 LUFS télévision, −16 LUFS flux Internet, −10 à −8 LUFS FM très traitée.\n"
@@ -3071,7 +3071,7 @@ class LoudChip(QWidget):
         f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
         p.setFont(f)
         p.setPen(QColor(MUT))
-        p.drawText(QRectF(12, 3, 90, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SONIE" + (f" · {self.what}" if self.what else ""))
+        p.drawText(QRectF(12, 3, 128, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SONIE" + (f" · {self.what}" if self.what else ""))
         f2 = QFont(self.font())
         f2.setPixelSize(15)
         f2.setBold(True)
@@ -3084,7 +3084,7 @@ class LoudChip(QWidget):
         txt = (f"{self.st:+.1f}".replace(".", ",").replace("+", "") + " LUFS") if live else "— LUFS"
         p.drawText(QRectF(12, 17, 100, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt.replace("-", "−"))
         # échelle
-        x0, x1, y = 118.0, r.right() - 12, r.center().y()
+        x0, x1, y = 136.0, r.right() - 12, r.center().y() + 5
         p.setBrush(QColor(TRACK))
         p.drawRoundedRect(QRectF(x0, y - 3, x1 - x0, 6), 3, 3)
         k = lambda v: x0 + (x1 - x0) * max(0.0, min(1.0, (v - self.LO) / (self.HI - self.LO)))
@@ -10032,8 +10032,8 @@ class ProcMeters(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(190)
-        self.setMinimumWidth(420)
+        self.setMinimumHeight(110)
+        self.setMinimumWidth(380)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.m, self.state = {}, "idle"
         self.disp = {"agc": 0.0, "bagc": 0.0, "gr": [0.0] * 5, "lim": 0.0, "clip": 0.0}
@@ -10401,7 +10401,7 @@ class PagesMixin2:
         hh = QHBoxLayout()
         hh.setSpacing(18)
         self.proc_meters = ProcMeters()
-        self.proc_meters.setMinimumHeight(170)
+        self.proc_meters.setMinimumHeight(150)
         hh.addWidget(self.proc_meters, 3)
         col = QVBoxLayout()
         col.setSpacing(6)
@@ -10426,6 +10426,7 @@ class PagesMixin2:
         g.addWidget(pf, 1, 2)
         # --- égalisation
         eq = Card("Égalisation", "")
+        eq.lay.setSpacing(3)
         self.eqc = EQCurve()
         self.eqc.setMinimumHeight(64)
         self.eqc.setMaximumHeight(84)
@@ -10440,6 +10441,7 @@ class PagesMixin2:
         g.addWidget(eq, 2, 0)
         # --- multibande, épuré : force, vitesse, équilibre graves / médiums / aigus
         mb = Card("Multibande", "Le « son » de l'antenne, en 3 réglages")
+        mb.lay.setSpacing(3)
         self.proc_switch(mb, "Compresseur multibande", "mb_on")
         self.proc_slider(mb, "Force", "mb_drive", 0, 15, lambda v: ("légère" if v < 4 else "forte" if v > 9 else "moyenne") + f"  {v:.0f}",
                          tip="Quantité de compression : plus fort = son plus dense et plus égal")
@@ -10454,6 +10456,7 @@ class PagesMixin2:
         g.addWidget(mb, 2, 1)
         # --- stéréo et sortie
         so = Card("Stéréo et sortie", "")
+        so.lay.setSpacing(3)
         self.proc_slider(so, "Élargisseur", "width", 0, 100, "%.0f %%", scale=1,
                          tip="Élargit l'image stéréo ; le mono reste intact")
         self.proc_switch(so, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles FM et enceintes mono")
@@ -14277,7 +14280,7 @@ class UndoMixin:
 
 # ------------------------------------------------------------------ fenêtre principale
 PAGE_KEYS = ["diff", "son", "cart", "rec", "mon", "net", "sos", "set", "about"]
-PAGE_TITLES = {"diff": "Diffusion", "son": "Processeur d'antenne", "cart": "Cartoucheur", "rec": "Enregistrement", "mon": "Monitoring",
+PAGE_TITLES = {"diff": "Diffusion", "son": "Processeur", "cart": "Cartoucheur", "rec": "Enregistrement", "mon": "Monitoring",
                "net": "Réseau", "sos": "SOS", "set": "Réglages", "about": "À propos"}
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac")
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -15266,9 +15269,11 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.al_sub.setVisible(lvl < 1)
         if hasattr(self, "assistant"):
             self.assistant.chips_compact(lvl >= 1)
-        if hasattr(self, "eqc"):
-            self.eqc.setMinimumHeight(110 if lvl < 1 else 76)
-            self.eqc.setMaximumHeight(16777215 if lvl < 1 else 96)
+        if hasattr(self, "eqc"):                        # (onglet Processeur : tout tient sur un écran)
+            self.eqc.setMinimumHeight(60 if lvl < 1 else 44)
+            self.eqc.setMaximumHeight(84 if lvl < 1 else 56)
+        if hasattr(self, "proc_meters"):
+            self.proc_meters.setMinimumHeight(150 if lvl < 1 else 112)
 
     def compact_header(self):
         """Fenêtre étroite : on replie l'antenne décorative et « Plein écran » (F11 reste dispo) pour que l'en-tête ne se chevauche jamais."""

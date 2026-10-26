@@ -71,6 +71,13 @@ def main():
                 over = sc.widget().height() - sc.viewport().height()
             line = f"{W}x{H}  {k:6s}  " + (f"DÉFILE ({over} px de trop)" if over > 2 else "tient sur l'écran")
             REPORT.append(line)
+            if over > 2:                           # diagnostic : page entière, et hauteur minimale de chaque carte
+                sc.widget().grab().save(os.path.join(out, name.replace(".png", "-page.png")))
+                for c in sc.widget().findChildren(bev.Card):
+                    if c.isVisible():
+                        t = (c.findChildren(bev.QLabel) or [None])[0]
+                        REPORT.append(f"      carte « {t.text()[:28] if t else '?'} » : hauteur {c.height()}, minimum "
+                                      f"{c.minimumSizeHint().height()}")
         print("capture", name, flush=True)
         QTimer.singleShot(50, lambda: step(i + 1))
 
