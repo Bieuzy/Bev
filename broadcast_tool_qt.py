@@ -14,6 +14,7 @@ import math
 import os
 import platform
 import random
+import queue
 import re
 import shutil
 import socket
@@ -3289,39 +3290,88 @@ class Alerts:
     SMS = ["Free Mobile", "Twilio"]
     OUTAGE_S = 60
 
+    # Pannes suivies par le moteur (une alerte au début, une à la fin de CHAQUE panne) : jamais filtrées par le délai
+    # anti-répétition, et envoyées aussi par mail / SMS. Les autres alertes gardent ce délai (reconnexions répétées…).
+    INCIDENT_RE = re.compile(r"^(silence|fallback-silent|out-[0-9a-f]{8})(-ok)?$")
+    URGENT_RE = re.compile(r"^(silence|fallback-silent)(-ok)?$|^engine-crash$")
+    RETRY_S, RETRY_FOR_S = 30, 1800       # un envoi raté est retenté toutes les 30 s pendant 30 min
+
     def __init__(self, app):
         self.app = app
         self.last = {}
+        self.q = queue.Queue()
+        self.sent = []                     # (heure, canal, texte, ok) : historique des envois, pour les tests et le journal
+        threading.Thread(target=self._sender, daemon=True).start()
 
     def cfg(self):
         return self.app.data["alerts"]
+
+    def wanted(self, key, c):
+        return not ((key.startswith("out-") and not c.get("on_output", True)) or
+                    (key.startswith(("fallback", "silence")) and not c.get("on_fallback", True)) or
+                    (key.startswith("mon-") and not c.get("on_monitor", True)))
 
     def send(self, text, key=None, force=False, urgent=False, sound=False):
         """Alerte : journal + message / mail / SMS selon les réglages. Le bip est réservé aux vraies pannes (sound=True) :
         une reconnexion, une bascule automatique sur le secours ou un retour à la normale ne bipent pas."""
         c = self.cfg()
         text = redact(text)
+        incident = bool(key and self.INCIDENT_RE.match(key))
         if key and not force:
-            if time.time() - self.last.get(key, 0) < 120:
+            if not incident and time.time() - self.last.get(key, 0) < 120:
                 return
-            if ((key.startswith("out-") and not c.get("on_output", True)) or
-                    (key.startswith("fallback") and not c.get("on_fallback", True)) or
-                    (key.startswith("mon-") and not c.get("on_monitor", True))):
+            if not self.wanted(key, c):
                 return
         if key:
             self.last[key] = time.time()
+            if self.URGENT_RE.match(key):
+                urgent = True
+                sound = sound or not key.endswith("-ok")
         self.app.log("" + text)
         if sound and c.get("sound", True):
             self.app.ui(self.beep)
-        url = (c.get("url") or "").strip()
-        if url:
-            threading.Thread(target=self.post, args=(c.get("kind", "Discord"), url, text),
-                             daemon=True).start()
+        if (c.get("url") or "").strip():
+            self.q.put(("msg", text, time.time()))
         if urgent:
             if c.get("mail_on"):
-                threading.Thread(target=self.mail, args=(text,), daemon=True).start()
+                self.q.put(("mail", text, time.time()))
             if c.get("sms_on"):
-                threading.Thread(target=self.sms, args=(text,), daemon=True).start()
+                self.q.put(("sms", text, time.time()))
+
+    def _sender(self):
+        """Envois dans l'ordre, un par un. Un envoi raté (souvent : la panne, c'est justement Internet) est gardé et retenté
+        toutes les 30 s pendant 30 min, au lieu d'être perdu. Les SMS sont espacés (Free Mobile refuse les rafales)."""
+        waiting, last_sms = [], 0.0
+        while True:
+            try:
+                item = self.q.get(timeout=1.0)
+                waiting.append([item[0], item[1], item[2], 0.0])
+            except queue.Empty:
+                pass
+            now = time.time()
+            for it in list(waiting):
+                kind, text, t0, nxt = it
+                if now < nxt:
+                    continue
+                if kind == "sms" and now - last_sms < 3.0:
+                    continue
+                stamp = time.strftime("%H:%M", time.localtime(t0))
+                body = text if now - t0 < 90 else f"[{stamp}] {text}"       # message retardé : l'heure de la panne
+                try:
+                    ok = {"msg": lambda: self.post(self.cfg().get("kind", "Discord"), (self.cfg().get("url") or "").strip(), body),
+                          "mail": lambda: self.mail(body), "sms": lambda: self.sms(body)}[kind]()
+                except Exception:
+                    ok = False
+                if kind == "sms":
+                    last_sms = time.time()
+                self.sent.append((time.time(), kind, body, bool(ok)))
+                del self.sent[:-200]
+                if ok or now - t0 > self.RETRY_FOR_S:
+                    waiting.remove(it)
+                    if not ok:
+                        self.app.log(f"Alerte abandonnée après 30 min d'essais ({kind}) : {text[:80]}")
+                else:
+                    it[3] = now + self.RETRY_S
 
     def channels(self):
         c = self.cfg()
@@ -3365,8 +3415,10 @@ class Alerts:
             else:
                 body = json.dumps({"message": text, "source": APP}).encode()
             urllib.request.urlopen(urllib.request.Request(url, body, hdr), timeout=8).read()
+            return True
         except Exception as e:
-            self.app.log(f"Alerte non envoyée ({kind}) : {e}")
+            self.app.log(f"Alerte non envoyée ({kind}) : {e} · nouvel essai dans 30 s")
+            return False
 
     def mail(self, text):
         c = self.cfg()
@@ -3388,8 +3440,10 @@ class Alerts:
             s.send_message(msg)
             s.quit()
             self.app.log("Mail d'alerte envoyé à " + c["mail_to"])
+            return True
         except Exception as e:
-            self.app.log(f"Mail non envoyé : {e}")
+            self.app.log(f"Mail non envoyé : {e} · nouvel essai dans 30 s")
+            return False
 
     def sms(self, text):
         c = self.cfg()
@@ -3406,8 +3460,10 @@ class Alerts:
                 req = urllib.request.Request(c.get("sms_url") or "https://smsapi.free-mobile.fr/sendmsg?" + q)
             urllib.request.urlopen(req, timeout=15).read()
             self.app.log("SMS d'alerte envoyé à " + c["sms_to"])
+            return True
         except Exception as e:
-            self.app.log(f"SMS non envoyé : {e}")
+            self.app.log(f"SMS non envoyé : {e} · nouvel essai dans 30 s")
+            return False
 
 DAB_BITRATES = ["32", "48", "64", "72", "80", "88", "96", "104", "112", "120", "128", "160", "192"]
 REC_FORMATS = list(RecordOutput.CODECS)
@@ -3663,6 +3719,21 @@ def download(url, dst, prog=None, size=0, timeout=30):
 
 
 AV_GONE = "Windows Defender (ou l'antivirus) a supprimé l'installateur en le prenant à tort pour un virus"
+
+
+def lossless(fmt):
+    """FLAC (sans perte) et WAV (non compressé) : qualité maximale d'office, aucun débit à choisir."""
+    return str(fmt or "").upper() in ("FLAC", "WAV")
+
+
+def fmt_quality(fmt, bitrate):
+    """« MP3 128 kbit/s », ou « FLAC · sans perte » : jamais de débit affiché pour un format qui n'en a pas."""
+    f = str(fmt or "")
+    if f.upper() == "FLAC":
+        return "FLAC · sans perte"
+    if f.upper() == "WAV":
+        return "WAV · non compressé"
+    return f"{f} {bitrate} kbit/s".strip()
 
 
 def friendly_dl_error(ex):
@@ -7179,6 +7250,22 @@ class OutputDialog(QDialog):
         if w is not None:
             w.setEnabled(bool(on))
 
+    def show_row(self, key, on):
+        """Affiche ou masque toute la ligne d'un réglage (libellé compris)."""
+        w = self.w.get(key)
+        if w is None:
+            return
+        for f in self.findChildren(QFormLayout):
+            if f.indexOf(w) >= 0:
+                try:
+                    f.setRowVisible(w, bool(on))
+                except AttributeError:                     # Qt < 6.4
+                    w.setVisible(bool(on))
+                    lb = f.labelForField(w)
+                    if lb is not None:
+                        lb.setVisible(bool(on))
+                return
+
     def update_state(self, *_):
         if not hasattr(self, "testmsg"):
             return
@@ -7202,7 +7289,7 @@ class OutputDialog(QDialog):
                 w.addItems(list(fm))
                 w.setCurrentText(cur if cur in fm else "MP3")
                 w.blockSignals(False)
-            self.enable("bitrate", g("format") != "FLAC")
+            self.show_row("bitrate", not lossless(g("format")))     # sans perte : pas de débit à choisir
         elif kind == "fm":
             for k in ("ps", "rds_mode", "rds_target", "rds_template"):
                 self.enable(k, bool(g("rds")))
@@ -7213,7 +7300,7 @@ class OutputDialog(QDialog):
             for k in ("net_url", "net_format"):
                 self.enable(k, not odr)
         elif kind == "record":
-            self.enable("bitrate", RecordOutput.CODECS.get(g("format"), (0, 0, True))[2])
+            self.show_row("bitrate", not lossless(g("format")))
 
     def collect(self):
         out = dict(self.cfg)
@@ -7232,7 +7319,7 @@ class OutputDialog(QDialog):
                 int(c["port"])
                 if c["sc_port"]:
                     int(c["sc_port"])
-            if kind in ("dab", "record"):
+            if kind == "dab" or (kind == "record" and not lossless(c.get("format"))):
                 int(c["bitrate"] or 0)
             if kind == "record":
                 if not c["folder"]:
@@ -9224,7 +9311,13 @@ class PagesMixin1:
         self.rw["bitrate"].addItems([str(b) for b in BITRATES])
         for t, k in (("Présentation de la date", "stamp"), ("Format", "format"), ("Débit (kb/s)", "bitrate")):
             self.rw[k].setMaximumWidth(260)
-            av.addLayout(row(t, self.rw[k], 150))
+            rw_ = QWidget()                                # (une ligne = un widget : on peut la masquer d'un coup)
+            hl = row(t, self.rw[k], 150)
+            hl.setContentsMargins(0, 0, 0, 0)
+            rw_.setLayout(hl)
+            av.addWidget(rw_)
+            if k == "bitrate":
+                self.rec_br_row = rw_
         self.rec_adv.hide()
         cf.lay.addWidget(self.rec_adv)
         self.rec_saved = lab("", "mut")
@@ -9348,6 +9441,8 @@ class PagesMixin1:
         self.rec_saved.setText("✓ Enregistré")
 
     def rec_example(self):
+        if hasattr(self, "rec_br_row"):                    # FLAC / WAV : qualité maximale, pas de débit à choisir
+            self.rec_br_row.setVisible(not lossless(self.rv_get("format")))
         try:
             ext = RecordOutput.CODECS.get(self.rv_get("format") or "MP3", RecordOutput.CODECS["MP3"])[1]
             pre = re.sub(r'[\\/:*?"<>|]', "_", self.rv_get("prefix"))
@@ -11475,12 +11570,13 @@ class GaelBrain:
             c["name"] = "Internet · " + short[:22]
         if k == "internet" and c["format"] == "FLAC":
             c["bitrate"] = c.get("bitrate") or "0"
+            fq = fmt_quality(c.get("format", ""), c["bitrate"])
         rows = {"internet": lambda: [("Serveur", f"{c['protocol']} {c['host']}:{c['port']}" + (c["mount"] if c["protocol"] == "Icecast" else "")),
-                                     ("Mot de passe", "•" * min(10, len(c["password"]))), ("Format", f"{c['format']} {c['bitrate']} kbit/s"),
+                                     ("Mot de passe", "•" * min(10, len(c["password"]))), ("Format", fq),
                                      ("Nom", c["name"])],
                 "fm": lambda: [("Carte son", c.get("device") or "à choisir"), ("Traitement", c["processing"])],
                 "dab": lambda: [("Mode", c["mode"]), ("Destination", c["dest"]), ("Débit", c["bitrate"] + " kbit/s")],
-                "record": lambda: [("Dossier", c["folder"]), ("Format", f"{c['format']} {c['bitrate']} kbit/s"), ("Découpage", c["rotate"] + " min")]}[k]()
+                "record": lambda: [("Dossier", c["folder"]), ("Format", fq), ("Découpage", c["rotate"] + " min")]}[k]()
         a = self.app
 
         def apply():
@@ -11931,7 +12027,7 @@ class GaelLLM:
             o = e.output(c["id"]) if (e and not a.preview) else None
             d = a.describe(c)
             L.append(f"Flux « {c['name']} » ({KINDS[c['type']][1]}, {d}, {'actif' if c.get('enabled', True) else 'désactivé'}"
-                     + (f", {c.get('format', '')} {c.get('bitrate', '')} kbit/s" if c["type"] == "internet" else "")
+                     + (f", {fmt_quality(c.get('format', ''), c.get('bitrate', ''))}" if c["type"] == "internet" else "")
                      + (f", état : {o.status_text()}" if o else "") + ")")
         if not a.outputs_cfg:
             L.append("Aucun flux configuré.")
@@ -13011,7 +13107,7 @@ class PagesMixin4:
         trg = QHBoxLayout()
         trg.setSpacing(16)
         self.al_sw = {}
-        for key, l in (("on_output", "un flux tombe"), ("on_fallback", "la playlist de secours démarre"), ("on_monitor", "un flux surveillé est inactif")):
+        for key, l in (("on_output", "un flux tombe"), ("on_fallback", "plus de son en entrée ou secours muet"), ("on_monitor", "un flux surveillé est inactif")):
             sw = Switch(l)
             sw.setChecked(bool(self.data["alerts"].get(key, True)))
             sw.toggled.connect(lambda on, k=key: self.data["alerts"].__setitem__(k, bool(on)))
@@ -13311,20 +13407,25 @@ class PagesMixin4:
                               + ("calcul rapide (numpy)" if np is not None else "calcul standard (installe numpy pour plus de fluidité)"))
         set_ss(self.l_health, f"color:{'#b0391f' if slow else MUT};")
 
+    OUT_CLEAR_S = 20.0    # un flux n'est « rétabli » qu'après 20 s sans problème
+
     def check_outages(self, e):
-        """Panne > 1 min (sortie en erreur, plus de signal sans secours) : alerte mail / SMS / message."""
+        """Flux hors service depuis plus d'une minute : alerte mail / SMS / message (une au début, une à la fin de chaque
+        panne). Un flux qui se reconnecte par intermittence (quelques secondes en ligne, puis de nouveau en panne) reste
+        UNE panne : avant, chaque reconnexion remettait le compteur à zéro et l'alerte ne partait jamais.
+        (Le silence en entrée et la playlist de secours muette sont signalés par le moteur, au délai du secours.)"""
         now = time.time()
         probs = {}
         if self.on_air and not self.preview:
-            if not e.backup and not e.mute and e.silent_ms >= 1000:
-                probs["sig"] = "plus aucun signal à l'antenne et pas de secours"
             for o in e.outputs:
                 if o.cfg.get("enabled", True) and o.state in ("error", "connecting"):
                     probs["out-" + o.cfg["id"]] = f"flux « {o.cfg['name']} » hors service"
         self.prob_since = getattr(self, "prob_since", {})
         self.prob_sent = getattr(self, "prob_sent", {})
+        self.prob_ok = getattr(self, "prob_ok", {})
         due = []
         for k, txt in probs.items():
+            self.prob_ok.pop(k, None)
             t0 = self.prob_since.setdefault(k, now)
             if now - t0 >= Alerts.OUTAGE_S and k not in self.prob_sent:
                 self.prob_sent[k] = txt
@@ -13332,11 +13433,15 @@ class PagesMixin4:
         if due:
             self.alerts.send(f"PANNE depuis {Alerts.OUTAGE_S} s : " + " ; ".join(due) + ".", force=True, urgent=True, sound=True)
         for k in list(self.prob_since):
-            if k not in probs:
-                self.prob_since.pop(k)
-                txt = self.prob_sent.pop(k, None)
-                if txt:
-                    self.alerts.send(f"Rétabli : {txt}.", force=True, urgent=True)
+            if k in probs:
+                continue
+            if self.on_air and now - self.prob_ok.setdefault(k, now) < self.OUT_CLEAR_S:
+                continue                                   # pas encore stable : la panne continue
+            self.prob_since.pop(k)
+            self.prob_ok.pop(k, None)
+            txt = self.prob_sent.pop(k, None)
+            if txt and self.on_air:
+                self.alerts.send(f"Rétabli : {txt}.", force=True, urgent=True)
 
 
 class AlertDialog(QDialog):
@@ -13355,7 +13460,8 @@ class AlertDialog(QDialog):
         t = lab("Prévenir en cas de panne", "")
         t.setStyleSheet("font-size:18px;font-weight:800;")
         v.addWidget(t)
-        v.addWidget(lab(f"Une panne = plus de {Alerts.OUTAGE_S} s sans antenne correcte (flux en erreur, ou plus de signal sans secours).", "mut", True))
+        v.addWidget(lab("Mail et SMS : plus de son en entrée (au délai de la playlist de secours), playlist de secours muette, ou flux en "
+                        f"panne depuis plus de {Alerts.OUTAGE_S} s. Un message aussi quand tout revient. Un envoi raté est retenté pendant 30 min.", "mut", True))
         mail_on = bool(c.get("mail_on") and c.get("mail_to"))
         sms_on = bool(c.get("sms_on") and c.get("sms_to"))
         msg_on = bool((c.get("url") or "").strip())
@@ -13425,7 +13531,7 @@ class AlertDialog(QDialog):
         pov.setContentsMargins(2, 6, 2, 2)
         pov.setSpacing(8)
         self.sw("sound", "Bip sonore sur cet ordinateur", c.get("sound", True), pov)
-        for k, l in (("on_output", "Prévenir quand un flux tombe"), ("on_fallback", "Prévenir quand la playlist de secours démarre"),
+        for k, l in (("on_output", "Prévenir quand un flux tombe"), ("on_fallback", "Prévenir quand il n'y a plus de son en entrée (au délai du secours) ou que la playlist de secours est muette"),
                      ("on_monitor", "Prévenir quand un flux surveillé est inactif")):
             self.sw(k, l, c.get(k, True), pov)
         pov.addWidget(lab("Les identifiants sont enregistrés en clair dans le fichier de réglages de cet ordinateur.", "mut", True))

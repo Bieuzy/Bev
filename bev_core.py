@@ -1368,6 +1368,8 @@ class Engine:
         self.pl_pause = False                 # playlist de secours en pause (reprend exactement où elle s'était arrêtée)
         self.pl_stop = False                  # playlist de secours arrêtée à la main (pas de relève auto avant le retour du son)
         self.silent_ms = self.loud_ms = 0
+        self.pl_silent_ms = 0                 # playlist de secours à l'antenne mais muette (ms)
+        self.inc = {}                         # pannes en cours déjà signalées : clé -> instant du début
         self.mix_g, self.rec_ms = 0.0, 2000.0
         self.peak = [-90.0, -90.0]
         self.track, self.meta = "", ""
@@ -1539,6 +1541,66 @@ class Engine:
 
     def output(self, oid):
         return next((o for o in self.outputs if o.cfg["id"] == oid), None)
+
+    # --- pannes : UN message quand une panne commence, UN quand elle se termine, pour chaque panne de la session.
+    # (Avant : un délai anti-répétition de 2 min par type d'alerte faisait sauter la 2e panne si elle suivait de près la 1re,
+    # et une sortie qui se reconnectait par intermittence envoyait « en erreur » sans jamais « rétablie », ou l'inverse.)
+    OUT_OK_S = 15.0                           # une sortie est « rétablie » après 15 s en ligne sans interruption
+
+    def incident(self, key, on, text):
+        """Ouvre (on=True) ou ferme une panne ; n'envoie que les changements d'état."""
+        if on and key not in self.inc:
+            self.inc[key] = time.time()
+            self.alert(text, key)
+        elif not on and key in self.inc:
+            dur = time.time() - self.inc.pop(key)
+            self.alert(f"{text} (après {fmt_dur(dur)})", key + "-ok")
+
+    def watch_incidents(self, p, air, cap):
+        if not air:
+            self.inc.clear()                      # fin d'antenne : ce n'est pas une panne, rien à « rétablir »
+            return
+        delay = p["delay"]
+        # 1) pas d'audio en entrée depuis le délai de la playlist de secours (même délai, même seuil)
+        if cap and not self.mute and self.silent_ms >= delay and "silence" not in self.inc:
+            why = f" ({self.cap_err})" if getattr(self, "cap_state", "") == "error" and self.cap_err else ""
+            if self.backup:
+                tail = "la playlist de secours a pris le relais."
+            elif p["enabled"] and not p["files"]:
+                tail = "la playlist de secours est vide : rien ne prend le relais !"
+            elif not p["enabled"]:
+                tail = "la playlist de secours est désactivée : rien ne prend le relais !"
+            else:
+                tail = "rien ne prend encore le relais."
+            self.incident("silence", True, f"Pas de son en entrée depuis {delay / 1000:g} s{why} : {tail}")
+        elif "silence" in self.inc and (self.loud_ms >= p["rec"] or not cap or self.mute):
+            self.incident("silence", False, "Le son est revenu en entrée")
+        # 2) playlist de secours à l'antenne, mais sans son (fichiers silencieux, illisibles, clé USB débranchée…)
+        if self.pl_silent_ms >= delay:
+            self.incident("fallback-silent", True, f"La playlist de secours est à l'antenne mais sans son depuis {delay / 1000:g} s "
+                          "(fichier silencieux ou illisible, dossier débranché ?) : silence à l'antenne !")
+        elif "fallback-silent" in self.inc and (self.pl_silent_ms == 0):
+            self.incident("fallback-silent", False, "La playlist de secours a retrouvé du son" if self.backup
+                          else "Fin du silence de la playlist de secours (retour au direct)")
+        # 3) sorties : en erreur / rétablies (une fois par panne, et « rétablie » après 15 s stables en ligne)
+        now = time.time()
+        ids = set()
+        for o in list(self.outputs):
+            if not o.cfg.get("enabled", True):
+                continue
+            k = "out-" + o.cfg["id"]
+            ids.add(k)
+            if o.state == "error":
+                o._ok_since = None
+                self.incident(k, True, f"Sortie « {o.name} » en erreur : {o.detail or '?'}")
+            elif o.state == "live":
+                o._ok_since = getattr(o, "_ok_since", None) or now
+                if k in self.inc and now - o._ok_since >= self.OUT_OK_S:
+                    self.incident(k, False, f"Sortie « {o.name} » rétablie")
+            else:
+                o._ok_since = None
+        for k in [k for k in self.inc if k.startswith("out-") and k not in ids]:
+            self.inc.pop(k, None)                 # sortie retirée ou désactivée
 
     # --- traitement du son : le processeur d'antenne traite chaque bloc UNE fois ; chaque flux reçoit le son traité ou,
     # s'il est réglé ainsi, le son brut. Changer un réglage ou passer en bypass ne touche jamais aux encodeurs.
@@ -2197,6 +2259,7 @@ class Engine:
         was_air = False
         empty_warned = False
         nxt = time.perf_counter()
+        tick = 0
         while not self.ev.is_set():
             nxt += 0.02
             wait = nxt - time.perf_counter()
@@ -2241,6 +2304,13 @@ class Engine:
                         starved = True  # attend 200 ms d'avance avant de reprendre
             if self.tone and air:
                 live, phase = tone_block(phase)
+            if air and self.backup and g >= 0.99 and not self.pl_pause:     # playlist de secours seule à l'antenne
+                if max(peak_db(pl)) > p["thr"]:
+                    self.pl_silent_ms = 0
+                else:
+                    self.pl_silent_ms += 20
+            else:
+                self.pl_silent_ms = 0
             # --- détection du signal (seulement quand l'entrée est ouverte)
             if cap:
                 lv = peak_db(live)
@@ -2287,9 +2357,7 @@ class Engine:
                         self.backup = False
                 elif (p["enabled"] and has and not self.manual and not self.backup and self.silent_ms >= p["delay"]):
                     self.backup = True
-                    msg = f"Aucun signal depuis {p['delay'] / 1000:g} s : la playlist de secours prend le relais."
-                    self.log(msg)
-                    self.alert(msg, "fallback")
+                    self.log(f"Aucun signal depuis {p['delay'] / 1000:g} s : la playlist de secours prend le relais.")
                 elif self.backup and not self.manual and (self.loud_ms >= p["rec"] or not p["enabled"] or not has):
                     self.backup = False
                     if not has:
@@ -2298,7 +2366,6 @@ class Engine:
                         self.log("Playlist de secours désactivée : retour au direct.")
                     else:
                         self.log("Signal retrouvé : retour au direct (fondu).")
-                        self.alert("Signal retrouvé : retour au direct.", "fallback-back")
                 if p["enabled"] and not has and self.silent_ms >= p["delay"] and not empty_warned:
                     empty_warned = True
                     self.log("⚠ Silence à l'antenne, mais la playlist de secours est vide : rien ne peut prendre le relais.")
@@ -2361,6 +2428,12 @@ class Engine:
                 if parts:
                     self.cmon.push(self.clip_mix(parts))
             self.proc_ms += ((time.perf_counter() - t0) * 1000 - self.proc_ms) * 0.05
+            tick += 1
+            if tick % 25 == 0:                       # toutes les 0,5 s : pannes à signaler
+                try:
+                    self.watch_incidents(p, air, cap)
+                except Exception as ex:
+                    self.log(f"Surveillance des pannes : {ex}")
 
     @staticmethod
     def clip_mix(parts):
@@ -2520,16 +2593,12 @@ class Output:
             self.t_live = time.time()
         if old == state:
             return
-        key = "out-" + self.cfg["id"]
         if state == "error":
             self.had_error = True
-            self.eng.log(f"[{self.name}] erreur : {detail}")
-            self.eng.alert(f"Sortie « {self.name} » en erreur : {detail}", key)
+            self.eng.log(f"[{self.name}] erreur : {detail}")      # (l'alerte est envoyée par Engine.watch_incidents)
         elif state == "live":
             self.eng.log(f"[{self.name}] en direct")
-            if self.had_error:
-                self.had_error = False
-                self.eng.alert(f"Sortie « {self.name} » rétablie.", key + "-ok")
+            self.had_error = False
             threading.Thread(target=self.send_meta, args=(self.eng.meta,), daemon=True).start()
 
     def supervise(self):
