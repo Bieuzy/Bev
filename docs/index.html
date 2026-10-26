@@ -81,6 +81,8 @@ p{margin:0}
 .splash h1{font-size:clamp(68px,11vw,116px);font-weight:800;letter-spacing:-.03em;line-height:.9}
 .splash .sub{display:block;font-size:14px;font-weight:600;letter-spacing:.18em;color:var(--splash-sub);margin-top:14px}
 .splash .lede{font-size:19px;color:var(--splash-txt);font-weight:500;margin:22px 0 12px}
+.origin{font-size:14px;color:var(--splash-mut);margin:-4px 0 14px}
+.origin a{color:var(--splash-sub);font-weight:600}
 .outs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:26px}
 .outs span{font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:8px;background:rgba(255,255,255,.08);color:var(--splash-txt)}
 .first{font-size:13px;color:var(--splash-mut);margin-top:14px}
@@ -146,6 +148,12 @@ kbd{font-family:var(--font);font-size:12.5px;font-weight:600;background:var(--fi
 .empty{display:flex;align-items:center;gap:14px}
 .skel{height:14px;border-radius:7px;background:var(--field);margin-top:10px}
 
+.hist .rows{display:flex;flex-direction:column;margin-top:10px}
+.hist .row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 0;border-top:1px solid var(--line)}
+.hist .row b{font-size:14.5px;font-variant-numeric:tabular-nums}
+.hist .row time{color:var(--mut);font-size:13px}
+.hist .links{display:flex;gap:6px;margin-left:auto}
+footer a{color:var(--acct)}
 footer{background:var(--rail);border-top:1px solid var(--line)}
 footer .wrap{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding-block:22px;font-size:13.5px;color:var(--mut)}
 footer .l{display:flex;align-items:center;gap:10px}
@@ -216,6 +224,7 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
     <div>
       <h1>Bev<span class="sub">BROADCAST TOOL</span></h1>
       <p class="lede">Le logiciel de diffusion des radios associatives.</p>
+      <p class="origin">Né pour la diffusion de <a href="https://rbg.bzh">Radio Bro Gwened</a>.</p>
       <div class="outs"><span>Internet</span><span>FM</span><span>DAB+</span><span>Enregistrement</span></div>
       <div class="dl">
         <a class="btn primary" id="btn-win" href="https://github.com/Bieuzy/Bev/releases/latest">
@@ -247,7 +256,7 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 
 <footer>
   <div class="wrap">
-    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · porté par des radios associatives de Bretagne</span>
+    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · un projet né à <a href="https://rbg.bzh">Radio Bro Gwened</a></span>
     <a href="https://github.com/Bieuzy/Bev">GitHub</a>
   </div>
 </footer>
@@ -322,6 +331,22 @@ function render(list){
     if (more) more.addEventListener("click", function(){ c.querySelector(".notes").classList.remove("clip"); more.remove(); });
     box.appendChild(c);
   });
+  var older = list.filter(function(r){ return r !== latest; });
+  if (older.length) {
+    var h = document.createElement("div");
+    h.className = "card hist";
+    h.innerHTML = '<h3>Versions précédentes</h3><p class="sub">Au cas où une version récente pose problème sur votre machine.</p>' +
+      '<div class="rows">' + older.map(function(r){
+        var aw = findAsset(r, WIN), am = findAsset(r, MAC), l = "";
+        if (aw) l += '<a class="btn sm" href="' + esc(aw.browser_download_url) + '"><svg width="14" height="14"><use href="#i-win"/></svg>Windows</a>';
+        if (am) l += '<a class="btn sm" href="' + esc(am.browser_download_url) + '"><svg width="14" height="14"><use href="#i-mac"/></svg>Mac</a>';
+        if (!l) l = '<a class="btn sm" href="' + esc(r.html_url) + '">Voir sur GitHub</a>';
+        return '<div class="row"><b>' + esc((r.tag_name || "").replace(/^v/i, "Version ").replace(/^(?!Version)/, "Version ")) + '</b>' +
+          (r.prerelease ? '<span class="chip">Préversion</span>' : '') +
+          '<time>' + frDate(r.published_at) + '</time><span class="links">' + l + '</span></div>';
+      }).join("") + '</div>';
+    box.appendChild(h);
+  }
 }
 function fail(){
   document.getElementById("releases").innerHTML =
@@ -331,7 +356,7 @@ function fail(){
 (function(){
   var done = false, t = setTimeout(function(){ if (!done) { done = true; fail(); } }, 8000);
   try {
-    fetch("https://api.github.com/repos/" + REPO + "/releases?per_page=10", {headers:{Accept:"application/vnd.github+json"}})
+    fetch("https://api.github.com/repos/" + REPO + "/releases?per_page=30", {headers:{Accept:"application/vnd.github+json"}})
       .then(function(r){ if (!r.ok) throw new Error(r.status); return r.json(); })
       .then(function(j){ if (done) return; done = true; clearTimeout(t); render(j); })
       .catch(function(){ if (!done) { done = true; clearTimeout(t); fail(); } });
