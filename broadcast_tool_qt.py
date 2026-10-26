@@ -6813,6 +6813,9 @@ class FactCard(Card):
         self.txt.setToolTip(text)
         if self.mini:
             text = self.wrap2(text, self.wfont(), max(120, self.txt.width() - 8))
+        cb = getattr(self, "on_text", None)
+        if cb:
+            cb()
         if instant or not ANIM or not self.isVisible():
             self.txt.setText(text)
             return
@@ -6827,6 +6830,9 @@ class FactCard(Card):
         if getattr(self, "_phase", "") == "out":
             self._phase = "in"
             self.txt.setText(self._next_text)
+            cb = getattr(self, "on_text", None)
+            if cb:
+                cb()
             self.fade.setStartValue(0.0)
             self.fade.setEndValue(1.0)
             self.fade.start()
@@ -7702,7 +7708,11 @@ class CartNow(QWidget):
         if sig == self.items:
             return
         self.items = sig
-        self.setVisible(bool(items))
+        if self.isHidden() == bool(items):
+            self.setVisible(bool(items))
+            cb = getattr(self, "on_shown", None)
+            if cb:
+                cb()                                  # le bandeau se réorganise (place pour la cartouche)
         self.update()
 
     def mouseReleaseEvent(self, e):
@@ -13186,8 +13196,11 @@ class PagesMixin4:
         threading.Thread(target=work, daemon=True).start()
 
     def set_net_label(self, text, color):
+        changed = text != self.l_net.text()
         self.l_net.setText(text)
-        set_ss(self.l_net, f"color:{color};")
+        set_ss(self.l_net, f"background:{FIELD};color:{color};font-weight:700;border-radius:12px;padding:4px 14px;")
+        if changed:
+            QTimer.singleShot(0, self.fit_band)
 
     def net_after_cycle(self, res):
         self.net_busy = False
@@ -14988,6 +15001,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         bh.addLayout(col, 1)
         self.cart_now = CartNow()
         self.cart_now.clicked.connect(lambda: self.engine and self.engine.stop_cart())
+        self.cart_now.on_shown = lambda: QTimer.singleShot(0, self.fit_band)
         bh.addWidget(self.cart_now)
         # sonie de sortie, visible sur tous les onglets (les flux à l'antenne sont déjà dans le voyant EN ANTENNE)
         self.loud = LoudChip()
@@ -14996,7 +15010,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.l_net = lab("Réseau : détection…", "")
         self.l_net.setStyleSheet(f"background:{FIELD};color:{MUT};font-weight:700;border-radius:12px;padding:4px 14px;")
         self.l_net.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.l_net.setMinimumWidth(250)
+        self.l_net.setMinimumWidth(170)
         self.l_net.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.l_net.mouseReleaseEvent = lambda _e: self.go_tab("net")
         bh.addWidget(self.l_net)
@@ -15005,6 +15019,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         bh.addWidget(self.mini_in)
         bh.addWidget(self.mini_out)
         bar.lay.addLayout(bh)
+        self.band = bar
         shell.addWidget(bar)
         # ---- pages
         self.stack = QStackedWidget()
@@ -15168,13 +15183,37 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             return
         super().keyPressEvent(e)
 
+    def fit_band(self):
+        """Bandeau « en lecture » : chaque élément garde sa largeur, rien ne se chevauche. Quand la place manque (cartouche
+        en lecture, fenêtre de portable), on range d'abord l'état du réseau, puis le vumètre d'entrée (l'antenne reste)."""
+        bar = getattr(self, "band", None)
+        if bar is None:
+            return
+        m = bar.lay.contentsMargins()
+        avail = bar.width() - m.left() - m.right()
+        sp = 12
+        need = self.mini_lbl.width() + sp + 150 + self.loud.width() + sp + self.mini_out.width() + sp   # 150 : « Hors antenne »
+        if self.cart_now.isVisibleTo(bar):
+            need += self.cart_now.minimumWidth() + sp
+        net = max(self.l_net.minimumWidth(), self.l_net.sizeHint().width()) + sp
+        mi = self.mini_in.width() + sp
+        narrow = bool(getattr(self, "_narrow", False))
+        show_net = not narrow and need + net + mi <= avail
+        show_in = need + mi + (net if show_net else 0) <= avail
+        if self.l_net.isVisibleTo(bar) != show_net:
+            self.l_net.setVisible(show_net)
+        if self.mini_in.isVisibleTo(bar) != show_in:
+            self.mini_in.setVisible(show_in)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        QTimer.singleShot(0, self.fit_band)
         RZ[0] = time.time() + .3
         QTimer.singleShot(0, self.place_upd_bubble)
         if hasattr(self, "l_beta"):
             self.compact_header()
         QTimer.singleShot(0, self.apply_compact)
+        QTimer.singleShot(0, self.diff_fit)
 
     NARROW_W = 1180
 
@@ -15188,7 +15227,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             return
         self._narrow = on
         self.l_date.setVisible(not on)
-        self.l_net.setVisible(not on)
+        QTimer.singleShot(0, self.fit_band)
         self.btn_prof.setMaximumWidth(170 if on else 230)
         self.btn_prof.setMinimumWidth(110 if on else 130)
         self.prof_label()
@@ -15281,6 +15320,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if getattr(self, "facts", None) is not None:
             self.facts.set_mini(lvl >= 1)
             self.facts.setVisible(not MINI)
+            QTimer.singleShot(0, self.diff_fit)
         if hasattr(self, "wave"):
             self.wave.setVisible(lvl < 2 and not MINI)
         if hasattr(self, "al_phone"):
@@ -15717,7 +15757,40 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         w.setObjectName("page")
         sa.setWidget(w)
+        self._diff_sa = sa
+        self.facts.on_text = lambda: QTimer.singleShot(0, self.diff_fit)
         return sa
+
+    def diff_fit(self):
+        """Diffusion : la colonne de droite (Flux, À l'antenne, Le saviez-vous) doit tenir dans la hauteur visible. Qt ne
+        sait pas réduire une carte sous son minimum : il la faisait déborder sur la suivante (anecdote par-dessus « À
+        l'antenne »). On choisit donc l'anecdote complète, puis resserrée (3 lignes), puis rangée si la place manque."""
+        d = getattr(self, "_diff", None)
+        sa = getattr(self, "_diff_sa", None)
+        if not d or sa is None or MINI:
+            return
+        h, left, right, src, fb, outf, air, facts = d
+        if getattr(self, "_narrow", False):          # une seule colonne qui défile : tout reste affiché
+            facts.setVisible(True)
+            return
+        avail = sa.viewport().height() - 4
+        sp = right.spacing()
+        base = outf.minimumSizeHint().height() + air.minimumSizeHint().height() + 2 * sp
+        width = max(200, air.width() or (self.width() // 2))
+
+        def need(mini):
+            facts.set_mini(mini)
+            facts.layout().activate()
+            lay = facts.layout()
+            return lay.totalHeightForWidth(width) if lay.hasHeightForWidth() else facts.sizeHint().height()
+        lvl = getattr(self, "_compact_lvl", 0)
+        if lvl < 1 and base + need(False) <= avail:
+            facts.setVisible(True)
+        elif base + need(True) <= avail:
+            facts.setVisible(True)
+        else:
+            facts.set_mini(lvl >= 1)
+            facts.setVisible(False)
 
     # --- options du secours
     def build_fb_dialog(self):
