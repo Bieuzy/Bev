@@ -55,6 +55,8 @@ def main():
         W, H, k, state = jobs[i]
         w.resize(W, H)
         w.go_tab(k)
+        if k == "son":                            # onglet de réglages, le temps que sa pastille glisse
+            w.proc_tab(int(state[3:]) if state and state.startswith("tab") else 0)
         # une cartouche en lecture dans le bandeau (cas le plus chargé) sur le Cartoucheur ; le moteur absent la
         # remettrait à zéro à chaque tic : on fige l'affichage le temps de la capture
         cn = w.cart_now
@@ -65,15 +67,12 @@ def main():
 
     def shoot(i):
         W, H, k, state = jobs[i]
-        if k == "son" and state is not None:      # processeur : onglet de réglages, ou mesures simulées
-            w.proc_tab(int(state[3:]) if state.startswith("tab") else 0)
+        if k == "son" and state is not None:      # processeur : mesures simulées (l'onglet est choisi avant l'attente)
             if state == "live":
                 w.proc_meters.set({"agc": 3.4, "bagc": 1.0, "gr": [4.2, 2.8, 3.5, 5.1, 2.2], "lim": 1.6, "clip": 0.9,
                                    "lufs": -15.8, "lufs_m": -14.6, "out": -1.1}, "air")
                 w.proc_meters.set = lambda *_a: None          # (le moteur absent ne l'efface plus)
-        elif k == "son":
-            w.proc_tab(0)
-        elif state is not None:                    # état simulé, dessiné juste avant la capture
+        elif state is not None and k != "son":                    # état simulé, dessiné juste avant la capture
             text = {"air": "EN ANTENNE  01:12:09", "partial": "1 FLUX HS  01:12:09", "secours": "SECOURS  01:12:09",
                     "bad": "Aucun flux en ligne", "wait": "Connexion des flux…"}[state]
             w.l_air.set_mode(state)
