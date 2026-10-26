@@ -9744,14 +9744,23 @@ class PagesMixin1:
             hero.lay.addWidget(SeaScene(440, 96, bg=PANEL, light_x=.86), 0, Qt.AlignmentFlag.AlignLeft)
         else:
             hero.lay.addWidget(Hero(), 0, Qt.AlignmentFlag.AlignLeft)
-        hero.lay.addWidget(lab("« Bev », c'est « direct » en breton.", "", True))
-        hero.lay.addWidget(lab("On est parti d'un constat simple : beaucoup de radios associatives diffusent avec un vieux PC, un logiciel bricolé et "
-                               "un bénévole qui croise les doigts le samedi soir. Bev essaie de lui faciliter la vie : envoyer l'émission vers "
-                               "Internet, la FM ou le DAB+, passer sur une playlist si le micro lâche, lancer ses jingles, et être prévenu quand "
-                               "quelque chose cloche.", "", True))
-        hero.lay.addWidget(lab("Il est fait avec et pour des radios bretonnes, sans budget ni équipe technique, et il n'est pas fini. "
-                               "Si quelque chose vous agace, plante ou manque, dites-le : c'est comme ça qu'il avance.", "mut", True))
-        k = lab("Trugarez ha kenavo ! Merci, et bonne émission.", "")
+        hero.lay.addWidget(lab("« Bev » signifie « direct » en breton.", "", True))
+        hero.lay.addWidget(lab("Bev est un logiciel de diffusion radiophonique destiné aux radios associatives : diffusion vers Internet, "
+                               "la FM et le DAB+, enregistrement de l'antenne, playlist de secours, cartoucheur, processeur d'antenne "
+                               "et surveillance des flux, avec alerte en cas de panne.", "", True))
+        orig = lab("", "", True)
+        orig.setTextFormat(Qt.TextFormat.RichText)
+        orig.setOpenExternalLinks(True)
+        orig.setText(f"Sa création initiale a été réalisée en 2026 pour <a href='https://rbg.bzh' style='color:{ACCT}'>Radio Bro Gwened</a>"
+                     " (rbg.bzh), radio associative du pays vannetais.")
+        hero.lay.addWidget(orig)
+        hero.lay.addWidget(lab("Bev est une application libre, utilisable gratuitement. Ses auteurs invitent chaque utilisatrice et chaque "
+                               "utilisateur à soutenir une radio associative de son choix : par un don, une adhésion ou du bénévolat.", "", True))
+        hero.lay.addWidget(lab("Les radios associatives défendent des valeurs essentielles : une presse libre et indépendante, sans "
+                               "financeur privé ; le travail d'enquête et d'information de proximité ; un rôle d'acteur culturel local, "
+                               "ouvert aux langues et aux expressions du territoire ; et une place de premier lieu d'éducation aux médias, "
+                               "où chacun peut apprendre à faire de la radio.", "mut", True))
+        k = lab("Trugarez ! Merci, et bonne antenne.", "")
         k.setStyleSheet(f"color:{ACCT};font-weight:700;font-size:14px;")
         hero.lay.addWidget(k)
         hero.lay.addStretch(1)
