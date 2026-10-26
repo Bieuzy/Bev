@@ -3392,20 +3392,18 @@ def auto_parse(raw, ctype=""):
         except ValueError:
             pass
     if t.startswith("<"):
-        import xml.etree.ElementTree as ET
-        try:
-            root = ET.fromstring(t)
-            d = {}
-            for el in root.iter():
-                tag = el.tag.split("}")[-1]
-                if (el.text or "").strip() and tag.lower() not in d:
-                    d[tag] = el.text.strip()
-                for k, v in el.attrib.items():
-                    d.setdefault(k, v)
+        # XML lu sans bibliothèque XML (absente du socle des versions déjà installées : la mise à jour express reste
+        # possible) : balises <title>…</title> et attributs title="…", premières occurrences
+        import html as _html
+        d = {}
+        for tag, txt in re.findall(r"<(?:[\w.-]+:)?([\w.-]+)[^>]*>([^<]+)</", t):
+            if txt.strip():
+                d.setdefault(tag.lower(), _html.unescape(txt.strip()))
+        for k, v in re.findall(r"([\w.-]+)\s*=\s*\"([^\"]*)\"", t):
+            d.setdefault(k.lower(), _html.unescape(v))
+        if d:
             take(d)
             return out
-        except ET.ParseError:
-            pass
     if "=" in t and ("&" in t or t.split("=", 1)[0].lower() in sum(AUTO_KEYS.values(), ())) and "\n" not in t:
         take(urllib.parse.parse_qs(t.lstrip("?"), keep_blank_values=False))
         if out["title"] or out["artist"]:
@@ -3486,66 +3484,104 @@ class AutomateMeta:
                 continue
 
     # --- réseau
+    @staticmethod
+    def _local_ip(ip, lan):
+        """Adresse autorisée : cet ordinateur, et (option) le réseau local (10/8, 172.16/12, 192.168/16, fe80::, fc00::/7)."""
+        ip = ip.split("%")[0].lower()
+        if ip in ("127.0.0.1", "::1") or ip.startswith("127.") or ip.startswith("::ffff:127."):
+            return True
+        if not lan:
+            return False
+        ip = ip[7:] if ip.startswith("::ffff:") else ip
+        if ip.startswith(("10.", "192.168.", "fe80:", "fc", "fd")):
+            return True
+        m = re.match(r"^172\.(\d+)\.", ip)
+        return bool(m and 16 <= int(m.group(1)) <= 31)
+
     def _start_server(self, port, lan):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        import ipaddress
-        me = self
-
-        class H(BaseHTTPRequestHandler):
-            def log_message(self, *a):
-                pass
-
-            def _allowed(self):
-                try:
-                    ip = ipaddress.ip_address(self.client_address[0])
-                    return ip.is_loopback or (lan and ip.is_private)
-                except ValueError:
-                    return False
-
-            def _answer(self, code, text):
-                body = (text + "\n").encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _handle(self, raw, ctype):
-                if not self._allowed():
-                    return self._answer(403, "refusé : adresse hors du réseau local")
-                info = auto_parse(raw, ctype)
-                if not (info["title"] or info["artist"]):
-                    return self._answer(400, "aucun titre reçu (paramètres attendus : artist, title, cover)")
-                me.receive(info, "réseau")
-                self._answer(200, "ok : " + auto_text(info))
-
-            def do_GET(self):
-                q = urllib.parse.urlsplit(self.path).query
-                if not q:
-                    return self._answer(200 if self._allowed() else 403, "Bev : prêt à recevoir le titre en cours "
-                                        "(?artist=…&title=…&cover=…)")
-                self._handle(q, "")
-
-            def do_POST(self):
-                n = min(int(self.headers.get("Content-Length") or 0), 65536)
-                raw = self.rfile.read(n) if n else b""
-                ctype = self.headers.get("Content-Type", "")
-                q = urllib.parse.urlsplit(self.path).query
-                self._handle(raw if raw.strip() else q.encode(), ctype)
+        """Petit serveur HTTP (socket seulement, sans http.server : absent du socle des versions déjà installées, ce qui
+        aurait imposé l'installateur complet au lieu de la mise à jour express)."""
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0" if lan else "127.0.0.1", port), H)
-            srv.daemon_threads = True
-            self.srv, self.port_err = srv, ""
-            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True).start()
-            self.log(f"Automate : réception des titres sur le port {port}" + (" (réseau local)." if lan else " (cet ordinateur)."))
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0" if lan else "127.0.0.1", port))
+            srv.listen(16)
+            srv.settimeout(0.5)
         except OSError as ex:
             self.srv, self.port_err = None, f"port {port} indisponible ({ex.strerror or ex})"
             self.log(f"Automate : {self.port_err}.")
+            return
+        self.srv, self.port_err = srv, ""
+
+        def serve():
+            while self.srv is srv and not self.stop_ev.is_set():
+                try:
+                    c, addr = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=self._client, args=(c, addr[0], lan), daemon=True).start()
+            try:
+                srv.close()
+            except OSError:
+                pass
+        threading.Thread(target=serve, daemon=True).start()
+        self.log(f"Automate : réception des titres sur le port {port}" + (" (réseau local)." if lan else " (cet ordinateur)."))
+
+    def _client(self, c, ip, lan):
+        def answer(code, text):
+            body = (text + "\n").encode("utf-8")
+            head = (f"HTTP/1.0 {code} {'OK' if code == 200 else 'Refus'}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("ascii")
+            try:
+                c.sendall(head + body)
+            except OSError:
+                pass
+        try:
+            c.settimeout(5)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 16384:
+                part = c.recv(4096)
+                if not part:
+                    break
+                data += part
+            head, _, body = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            meth, path = (lines[0].split(" ") + ["", ""])[:2]
+            hdr = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+            n = min(int(hdr.get("content-length") or 0), 65536)
+            while len(body) < n:
+                part = c.recv(4096)
+                if not part:
+                    break
+                body += part
+            if not self._local_ip(ip, lan):
+                return answer(403, "refusé : adresse hors du réseau local")
+            q = urllib.parse.urlsplit(path).query
+            raw = body[:n] if (meth.upper() == "POST" and body[:n].strip()) else q.encode()
+            if not raw.strip():
+                return answer(200, "Bev : prêt à recevoir le titre en cours (?artist=…&title=…&cover=…)")
+            info = auto_parse(raw, hdr.get("content-type", ""))
+            if not (info["title"] or info["artist"]):
+                return answer(400, "aucun titre reçu (paramètres attendus : artist, title, cover)")
+            self.receive(info, "réseau")
+            answer(200, "ok : " + auto_text(info))
+        except (OSError, ValueError, IndexError):
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
 
     def _stop_server(self):
-        srv, self.srv = self.srv, None
+        srv, self.srv = self.srv, None             # (la boucle d'accueil s'arrête d'elle-même et ferme la prise)
         if srv is not None:
-            threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
+            try:
+                srv.close()
+            except OSError:
+                pass
 
     # --- titre reçu
     def receive(self, info, source, base=""):

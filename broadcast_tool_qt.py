@@ -44,7 +44,7 @@ from collections import deque
 # RUNTIME est à augmenter quand le socle change (nouvelle bibliothèque, nouvelle version de Python, de PySide6, de ffmpeg…) :
 # les versions concernées passent alors par l'installateur complet.
 # ======================================================================================================================
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 RUNTIME = 1
 UPD_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
     "~/Library/Application Support" if sys.platform == "darwin" else "~/.local/share"), "Bev", "maj")
@@ -3696,6 +3696,27 @@ Problèmes fréquents
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
+    "1.2.0": """## Processeur d'antenne (bêta)
+
+- **Quatre banques A, B, C, D** de réglages, et **un traitement par flux** : par exemple Internet sur A, FM sur B (filtre 15 kHz), enregistrement en son brut. Tous tournent en même temps.
+- **À zéro** (réglage neutre) et **Réinitialiser** (retour au préréglage de la banque).
+- Page épurée, sur un seul écran : multibande en 3 réglages (force, vitesse, graves / médiums / aigus), AGC, mesures et densité réunis.
+
+## Antenne
+
+- Le voyant d'antenne change de couleur : rouge, tout passe ; orange, un flux est HS ; jaune, la playlist de secours est à l'antenne. Il ne déborde plus.
+- La **sonie de sortie** (LUFS) est visible sur tous les onglets, dans le bandeau.
+- **Automate de diffusion** (Radiologik, RadioDJ…) : titre, artiste et pochette récupérés par fichier ou par le réseau, affichés dans « À l'antenne » et envoyés aux flux.
+
+## Alertes
+
+- Un message quand il n'y a plus de son en entrée, au même délai que la playlist de secours, et une alerte si la playlist de secours est muette.
+- Chaque panne est signalée, début et fin, même quand plusieurs se suivent dans la même session ; un envoi raté (Internet coupé) est retenté pendant 30 minutes.
+
+## Divers
+
+- Pas de réglage de débit pour FLAC et WAV (qualité maximale d'office).
+- Nouvelle présentation dans « À propos ».""",
     "1.1.1": """## Des mises à jour qui passent toutes seules
 
 - **Mise à jour express** : la plupart des versions ne pèsent plus que ~1 Mo. Bev récupère son nouveau code, vérifie son empreinte, et redémarre en quelques secondes. Pas d'installateur à lancer, pas de droits administrateur : Smart App Control, SmartScreen, l'antivirus et le pare-feu n'ont plus rien à bloquer.
