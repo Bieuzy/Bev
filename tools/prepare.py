@@ -32,7 +32,7 @@ def font(size, bold=True):
 
 # 1) icônes
 logo = None
-for node in ast.parse(src).body:
+for node in ast.parse(open("bev_assets.py", encoding="utf-8").read()).body:     # le logo est rangé avec les polices
     if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_ICON_B64" for t in node.targets):
         v = ast.literal_eval(node.value)
         logo = Image.open(io.BytesIO(base64.b64decode("".join(v) if not isinstance(v, str) else v))).convert("RGBA")
