@@ -210,7 +210,10 @@ jobs:
 
   # Mise à jour express : le code de cette version (~1 Mo) + son manifeste, joints à la Release. Les Bev déjà installés
   # passent à la nouvelle version sans installateur (voir tools/express.py et _express_boot dans broadcast_tool_qt.py).
+  # needs : le code express n'est joint à la Release qu'une fois les deux constructions ET leur selftest réussis. Avant, il
+  # partait en parallèle : une version qui ne démarrait pas était quand même proposée en express à tous les Bev installés.
   express:
+    needs: [windows, mac]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
