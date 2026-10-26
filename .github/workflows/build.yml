@@ -84,6 +84,17 @@ jobs:
         with:
           name: captures
           path: captures/*.png
+      # À la demande seulement : captures aussi publiées sur la branche « captures » (consultables sans télécharger d'artefact)
+      - name: Branche « captures »
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cd captures
+          git init -q -b captures
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Captures de ${GITHUB_REF_NAME} (${GITHUB_SHA::7})"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" captures
 
   windows:
     if: ${{ !inputs.captures_seules }}
