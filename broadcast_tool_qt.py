@@ -338,8 +338,14 @@ class Card(QFrame):
             self.hl = h
             self.lay.addLayout(h)
             if sub:
-                s = lab(sub, "mut", True)
-                s.setStyleSheet(f"color:{MUT};font-size:12px;")
+                # une ligne (« … » si la place manque, texte complet en infobulle) : un sous-titre qui passe à la ligne
+                # donne à la carte une hauteur dépendant de sa largeur, et Qt lui réserve alors sa hauteur IDÉALE au lieu
+                # de sa hauteur minimale : les cartes suivantes débordaient (Diffusion : anecdote sur « À l'antenne »)
+                s = CLabel(sub, "mut", False, MUT)
+                s.elide = True
+                s.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                s.setMinimumWidth(40)
+                s.setStyleSheet("font-size:12px;")
                 self.sub = s
                 self.lay.addWidget(s)
                 self.lay.addSpacing(2)
@@ -9961,7 +9967,7 @@ class EQCurve(QWidget):
         super().__init__()
         self.setMinimumHeight(110)
         self.setMinimumWidth(260)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.vals = {}
 
     @staticmethod
@@ -9999,7 +10005,7 @@ class EQCurve(QWidget):
         f8 = QFont(self.font())
         f8.setPointSizeF(7.5)
         p.setFont(f8)
-        for d in (-12, -6, 0, 6, 12):
+        for d in ((-12, -6, 0, 6, 12) if y1 - y0 >= 90 else (-12, 0, 12)):     # petite hauteur : 3 repères lisibles
             p.setPen(QPen(grid, 1, Qt.PenStyle.DashLine if d else Qt.PenStyle.SolidLine))
             p.drawLine(QPointF(x0, dy(d)), QPointF(x1, dy(d)))
             p.setPen(txt)
@@ -10043,13 +10049,15 @@ class EQCurve(QWidget):
 
 
 class ProcMeters(QWidget):
-    """Vumètres du processeur, façon rack de diffusion : AGC (± dB), réduction de gain des 5 bandes, limiteur final,
-    écrêteur, et sonie de sortie (LUFS court terme / momentanée). Mis à jour 30 fois par seconde."""
+    """Ce que fait le processeur, en lignes horizontales lisibles (une par étape, dans l'ordre où passe le son) :
+    volume automatique (± dB), compression de chacune des 5 bandes, limiteur final et écrêteur, puis la sonie de sortie.
+    Mis à jour 30 fois par seconde. Rien ne se chevauche : chaque ligne a son nom à gauche et sa valeur à droite."""
+    ROWS = (("agc", "Volume auto"),) + tuple((i, n) for i, n in enumerate(BAND_NAMES)) + (("lim", "Limiteur"), ("clip", "Écrêteur"))
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(110)
-        self.setMinimumWidth(380)
+        self.setMinimumHeight(150)
+        self.setMinimumWidth(420)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.m, self.state = {}, "idle"
         self.disp = {"agc": 0.0, "bagc": 0.0, "gr": [0.0] * 5, "lim": 0.0, "clip": 0.0}
@@ -10072,143 +10080,124 @@ class ProcMeters(QWidget):
             self.hold = [max(v, h - .15) for v, h in zip(vals, self.hold)]
         self.update()
 
+    def status(self):
+        live = self.state in ("air", "input")
+        if self.state == "off":
+            return "Processeur indisponible (numpy absent) : le son part sans traitement", BADC
+        if self.state == "idle":
+            return "En attente du son : lance l'antenne ou « Voir l'entrée » (Diffusion)", MUT
+        if live and self.m.get("bypass"):
+            return "BYPASS : le son brut part à l'antenne", "#ffb020"
+        if self.state == "input":
+            return "Hors antenne : mesures sur l'entrée, rien n'est diffusé", MUT
+        return "À l'antenne : mesures en direct", OKC
+
     def paintEvent(self, e):
         p = new_painter(self)
         W, H = self.width(), self.height()
         txt, mut = QColor(TXT), QColor(MUT)
-        grid = QColor("#d5d9e3" if LIGHT else "#252c3c")
+        live = self.state in ("air", "input")
+        bypass = bool(self.m.get("bypass")) and live
+        d = self.disp
         f = QFont(self.font())
         f.setPixelSize(11)
         fb = QFont(f)
         fb.setBold(True)
-        top, bot = 22, H - 22
-        live = self.state in ("air", "input")
-        bypass = bool(self.m.get("bypass")) and live
-        d = self.disp
-
-        def label(x, w, s, y=None, col=mut, font=f):
-            p.setFont(font)
-            p.setPen(col)
-            p.drawText(QRectF(x + w / 2 - 40, (bot + 4) if y is None else y, 80, 16), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, s)
-
-        def bar(x, w, frac, col, zero_top=True, center=False, val=0.0, hold=None):
-            r = QRectF(x, top, w, bot - top)
+        try:
+            fb.setFeature(QFont.Tag("tnum"), 1)
+        except Exception:
+            pass
+        # --- état, en haut (jamais par-dessus les mesures)
+        msg, col = self.status()
+        p.setFont(fb)
+        p.setPen(QColor(col))
+        p.drawText(QRectF(0, 0, W - 170, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(fb).elidedText(msg, Qt.TextElideMode.ElideRight, W - 176))
+        # --- lignes : nom | barre | valeur
+        top = 24
+        n = len(self.ROWS)
+        rh = max(12.0, min(22.0, (H - top) / n))
+        lw, vw = 92, 58
+        x0, x1 = lw, W - 160 - vw
+        p.setFont(f)
+        for k, (key, name) in enumerate(self.ROWS):
+            y = top + k * rh
+            cy = y + rh / 2
+            if key == 0 or key == "lim":                   # séparateurs : volume | compression | protection
+                p.setPen(QPen(QColor("#d5d9e3" if LIGHT else "#2b3242"), 1))
+                p.drawLine(QPointF(0, y - 1), QPointF(x1 + vw, y - 1))
+            p.setFont(f)
+            p.setPen(mut)
+            p.drawText(QRectF(0, y, lw - 8, rh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+            bh = max(5.0, min(9.0, rh - 8))
+            tr = QRectF(x0, cy - bh / 2, x1 - x0, bh)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(TRACK))
-            p.drawRoundedRect(r, 4, 4)
-            if not live:
-                return
-            c = QColor(col)
-            if bypass:
-                c.setAlphaF(.35)
-            p.setBrush(c)
-            if center:                                   # AGC : barre centrée sur 0 (vers le haut = gain ajouté)
-                mid = (top + bot) / 2
-                hgt = max(-1.0, min(1.0, frac)) * (bot - top) / 2
-                p.drawRoundedRect(QRectF(x, min(mid, mid - hgt), w, abs(hgt) + 1), 3, 3)
-                p.setPen(QPen(QColor(TXT), 1))
-                p.drawLine(QPointF(x - 2, mid), QPointF(x + w + 2, mid))
-            else:                                        # réduction de gain : descend depuis le haut
-                hgt = max(0.0, min(1.0, frac)) * (bot - top)
-                p.drawRoundedRect(QRectF(x, top, w, hgt + .5), 3, 3)
-                if hold is not None and hold > 0.05:
-                    hy = top + max(0.0, min(1.0, hold)) * (bot - top)
-                    p.setPen(QPen(QColor(TXT), 1.6))
-                    p.drawLine(QPointF(x + 1, hy), QPointF(x + w - 1, hy))
-        # échelle des réductions de gain (0 à -18 dB)
-        xs0 = 40
-        p.setFont(f)
-        for db in (0, 6, 12, 18):
-            y = top + db / 18 * (bot - top)
-            p.setPen(QPen(grid, 1, Qt.PenStyle.DashLine))
-            p.drawLine(QPointF(xs0 + 74, y), QPointF(W - 170, y))
-            p.setPen(mut)
-            p.drawText(QRectF(xs0 + 40, y - 7, 32, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "-%d" % db if db else "0")
-        # AGC
-        bw = 18
-        bar(10, bw, d["agc"] / 15.0, "#4cc9f0", center=True)
-        label(10, bw, "AGC")
-        bar(36, bw - 4, d["bagc"] / 6.0, "#35d49a", center=True)
-        label(36, bw - 4, "Gr.")
-        if live and not bypass:
+            p.drawRoundedRect(tr, bh / 2, bh / 2)
+            if key == "agc":                               # ± 15 dB autour du centre
+                v, rng, unit = d["agc"], 15.0, "%+.1f dB"
+                mid = tr.center().x()
+                if live:
+                    c = QColor("#4cc9f0")
+                    if bypass:
+                        c.setAlphaF(.35)
+                    p.setBrush(c)
+                    wv = max(-1.0, min(1.0, v / rng)) * tr.width() / 2
+                    p.drawRoundedRect(QRectF(min(mid, mid + wv), tr.top(), abs(wv) + 2, bh), bh / 2, bh / 2)
+                p.setPen(QPen(txt, 1))
+                p.drawLine(QPointF(mid, tr.top() - 2), QPointF(mid, tr.bottom() + 2))
+                hold = None
+            else:                                          # réduction de gain, de gauche à droite
+                if key == "lim":
+                    v, rng, c, hold = d["lim"], 6.0, QColor(ONAIR_RED), self.hold[5]
+                elif key == "clip":
+                    v, rng, c, hold = d["clip"], 8.0, QColor("#ffb020"), self.hold[6]
+                else:
+                    v, rng, hold = d["gr"][key], 18.0, self.hold[key]
+                    c = QColor(grad(.15 + key * .17)) if not callable(SEGCOL) else QColor(SEGCOL(min(1.0, v / 18)))
+                unit = "%.1f dB"
+                if live:
+                    if bypass:
+                        c.setAlphaF(.35)
+                    p.setBrush(c)
+                    p.drawRoundedRect(QRectF(tr.left(), tr.top(), max(bh, tr.width() * min(1.0, v / rng)), bh), bh / 2, bh / 2)
+                    if hold is not None and hold > .05:
+                        hx = tr.left() + tr.width() * min(1.0, hold / rng)
+                        p.setPen(QPen(txt, 1.6))
+                        p.drawLine(QPointF(hx, tr.top() - 1), QPointF(hx, tr.bottom() + 1))
             p.setFont(fb)
-            p.setPen(txt)
-            p.drawText(QRectF(0, 2, 70, 16), Qt.AlignmentFlag.AlignLeft, "%+.1f dB" % d["agc"])
-            if self.m.get("gate"):
-                p.setPen(QColor("#ffb020"))
-                p.setFont(f)
-                p.drawText(QRectF(70, 2, 110, 16), Qt.AlignmentFlag.AlignLeft, "porte : figée")
-        # 5 bandes
-        x = xs0 + 82
-        span = max(220, W - 170 - x - 70)
-        step = span / 5
-        bw2 = min(34.0, step * .62)
-        cols = SEGCOL if callable(SEGCOL) else None
-        for i in range(5):
-            bx = x + i * step + (step - bw2) / 2
-            v = d["gr"][i]
-            col = grad(.15 + i * .17) if not cols else cols(min(1.0, v / 18))
-            bar(bx, bw2, v / 18.0, col, hold=self.hold[i] / 18.0)
-            label(bx, bw2, PROC_SHORT[i])
-            if live:
-                label(bx, bw2, "%.1f" % v, y=top - 18, col=txt if v > .3 else mut, font=fb)
-        # limiteur final et écrêteur
-        lx = x + span + 10
-        bar(lx, 22, d["lim"] / 6.0, ONAIR_RED, hold=self.hold[5] / 6.0)
-        label(lx, 22, "Lim.")
-        if live:
-            label(lx, 22, "%.1f" % d["lim"], y=top - 18, col=txt, font=fb)
-        bar(lx + 36, 22, min(1.0, d["clip"] / 8.0), "#ffb020", hold=min(1.0, self.hold[6] / 8.0))
-        label(lx + 36, 22, "Écr.")
-        # sonie
-        rx = W - 150
-        r = QRectF(rx, top, 140, bot - top)
+            p.setPen(txt if live and abs(v) > .3 else mut)
+            p.drawText(QRectF(x1 + 6, y, vw - 6, rh), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       ((unit % v).replace(".", ",").replace("-", "−")) if live else "–")
+        # --- sonie de sortie, à droite
+        rx = W - 148
+        r = QRectF(rx, 0, 148, H)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(FIELD))
-        p.drawRoundedRect(r, 10, 10)
-        big = QFont(self.font())
-        big.setPixelSize(30)
-        big.setBold(True)
+        p.drawRoundedRect(r, 12, 12)
         lu, lm = self.m.get("lufs", -70.0), self.m.get("lufs_m", -70.0)
+        on = live and lu > -60
+        big = QFont(self.font())
+        big.setPixelSize(30 if H >= 150 else 24)
+        big.setBold(True)
+        cy = H / 2
         p.setFont(f)
         p.setPen(mut)
-        p.drawText(QRectF(rx, top + 8, 140, 16), Qt.AlignmentFlag.AlignHCenter, "SONIE DE SORTIE")
+        p.drawText(QRectF(rx, cy - 54, 148, 16), Qt.AlignmentFlag.AlignHCenter, "SONIE DE SORTIE")
         p.setFont(big)
-        p.setPen(QColor(ACCT) if live and lu > -60 else mut)
-        p.drawText(QRectF(rx, top + 26, 140, 40), Qt.AlignmentFlag.AlignHCenter, ("%.1f" % lu).replace("-", "−") if live and lu > -60 else "––")
+        p.setPen(QColor(ACCT) if on else mut)
+        p.drawText(QRectF(rx, cy - 38, 148, 40), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   ("%.1f" % lu).replace(".", ",").replace("-", "−") if on else "––")
         p.setFont(f)
-        p.setPen(mut)
-        p.drawText(QRectF(rx, top + 66, 140, 16), Qt.AlignmentFlag.AlignHCenter, "LUFS · court terme (3 s)")
-        p.setFont(fb)
-        p.setPen(txt if live else mut)
-        p.drawText(QRectF(rx, top + 92, 140, 16), Qt.AlignmentFlag.AlignHCenter,
-                   ("momentané %.1f" % lm) if live and lm > -60 else "momentané ––")
+        p.drawText(QRectF(rx, cy + 2, 148, 16), Qt.AlignmentFlag.AlignHCenter, "LUFS · sur 3 s")
+        p.setPen(txt if on and lm > -60 else mut)
+        p.drawText(QRectF(rx, cy + 22, 148, 16), Qt.AlignmentFlag.AlignHCenter,
+                   ("instantanée %.1f" % lm).replace(".", ",").replace("-", "−") if on and lm > -60 else "instantanée ––")
         out = self.m.get("out", -90.0)
-        p.setFont(f)
-        p.setPen(mut)
-        p.drawText(QRectF(rx, top + 112, 140, 16), Qt.AlignmentFlag.AlignHCenter,
-                   ("crête %.1f dBFS" % out) if live and out > -80 else "")
-        # état
-        msg = ""
-        if self.state == "idle":
-            msg = "En attente du son (antenne ou contrôle d'entrée)"
-        elif self.state == "off":
-            msg = "Processeur indisponible (numpy absent) : le son part sans traitement"
-        elif self.state == "input":
-            msg = "Hors antenne : mesures sur l'entrée (rien n'est diffusé)"
-        elif bypass:
-            msg = "BYPASS : son brut à l'antenne"
-        if msg:
-            p.setFont(fb)
-            fm = QFontMetrics(fb)
-            tw = fm.horizontalAdvance(msg) + 24
-            cx = (xs0 + 82 + lx + 60) / 2
-            rr = QRectF(cx - tw / 2, (top + bot) / 2 - 15, tw, 30)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(qc("#000000", 150) if not LIGHT else qc("#ffffff", 220))
-            p.drawRoundedRect(rr, 15, 15)
-            p.setPen(QColor("#ffb020") if bypass else txt)
-            p.drawText(rr, Qt.AlignmentFlag.AlignCenter, msg)
+        if on and out > -80:
+            p.setPen(mut)
+            p.drawText(QRectF(rx, cy + 40, 148, 16), Qt.AlignmentFlag.AlignHCenter,
+                       ("crête %.1f dBFS" % out).replace(".", ",").replace("-", "−"))
 
 
 class PagesMixin2:
@@ -10356,7 +10345,18 @@ class PagesMixin2:
     def _rel_put(pp, v):
         pp["mb_release"] = round(1200.0 / 20.0 ** ((v - 1) / 9), 0)
 
+    PROC_TABS = (
+        ("Niveau", "Rend le volume régulier : l'AGC remonte doucement les passages faibles, la densité règle le volume perçu."),
+        ("Couleur", "L'égalisation : la couleur du son (graves, voix, brillance) et le filtrage des fréquences inutiles."),
+        ("Compression", "Le « son » de l'antenne : le compresseur 5 bandes rend le son plus dense, plus égal et plus fort."),
+        ("Stéréo et sortie", "Largeur stéréo, puis protection finale : rien ne dépasse le plafond, même entre les échantillons."),
+    )
+
     def _page_son(self):
+        """Processeur d'antenne, repensé pour être lisible d'un coup d'œil :
+        1. en haut, ce qu'on choisit le plus souvent : la banque, le préréglage, le bypass ;
+        2. au milieu, ce que fait le processeur (une ligne par étape, dans l'ordre où passe le son) et le réglage de chaque flux ;
+        3. en bas, les réglages fins, rangés en 4 onglets (Niveau, Couleur, Compression, Stéréo et sortie)."""
         pg = Page()
         g = pg.grid
         g.setColumnStretch(0, 1)
@@ -10364,9 +10364,10 @@ class PagesMixin2:
         g.setColumnStretch(2, 1)
         self.proc = self.proc_load()
         self.procw, self.procs, self._proc_loading = [], [], True          # (construction : rien n'est envoyé)
-        # --- en-tête : banque, préréglages, à zéro, réinitialiser, bypass
+        # --- 1. en-tête : banque, préréglage, réinitialiser, à zéro, bypass
         top = Card()
-        top.lay.setSpacing(8)
+        top.lay.setSpacing(6)
+        top.lay.setContentsMargins(18, 12, 18, 12)
         h = QHBoxLayout()
         h.setSpacing(10)
         t = lab("Processeur d'antenne", "")
@@ -10376,122 +10377,145 @@ class PagesMixin2:
         beta.setStyleSheet(f"background:{ACC};color:{ONACC};font-size:10px;font-weight:800;border-radius:8px;padding:2px 8px;")
         beta.setToolTip("Fonction en cours de mise au point : écoutez le résultat avant de l'utiliser à l'antenne.")
         h.addWidget(beta, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addSpacing(12)
+        h.addSpacing(14)
         h.addWidget(lab("Banque", "mut"))
-        self.seg_bank = Segmented(list(BANKS), w=44, h=30)
+        self.seg_bank = Segmented(list(BANKS), w=40, h=28)
         self.seg_bank.setValue(BANKS.index(self.proc["edit"]))
         self.seg_bank.changed.connect(lambda k: self.proc_bank(BANKS[k]))
-        self.seg_bank.setToolTip("Quatre banques de réglages. Chaque flux choisit la sienne (à droite) : plusieurs traitements "
-                                 "peuvent tourner en même temps.")
+        self.seg_bank.setToolTip("Quatre banques de réglages. Chaque flux choisit la sienne (carte « Chaque flux ») : "
+                                 "plusieurs traitements peuvent tourner en même temps.")
         h.addWidget(self.seg_bank)
-        self.l_preset = lab("", "")
-        self.l_preset.setStyleSheet("font-size:14px;font-weight:700;")
-        h.addWidget(self.l_preset)
+        h.addSpacing(6)
+        self.btn_preset = btn("Préréglage", "", None, "Charger un préréglage radio dans la banque affichée")
+        menu = QMenu(self.btn_preset)
+        for name in PROC_ORDER:
+            a_ = menu.addAction(name.replace("&", "&&"))
+            a_.setToolTip(PROC_INFO.get(name, ""))
+            a_.triggered.connect(lambda _c=False, n=name: self.proc_preset(n))
+        menu.setToolTipsVisible(True)
+        self.btn_preset.setMenu(menu)
+        h.addWidget(self.btn_preset)
+        self.l_preset = self.btn_preset                     # (ancien nom : le préréglage s'affiche sur le bouton)
+        self.btn_preset_reset = btn("Réinitialiser", "", self.proc_reset, "Annule les réglages fins : la banque revient à son préréglage")
+        h.addWidget(self.btn_preset_reset)
+        h.addWidget(btn("À zéro", "", self.proc_zero, "Réglage neutre : aucune couleur ni compression, seul le limiteur "
+                                                       "final garantit le plafond. Point de départ pour construire son son."))
         h.addStretch(1)
         self.btn_bypass = btn("", "primary", self.proc_toggle_bypass,
                               "Bypass : le son brut part à l'antenne sur tous les flux (bascule en fondu, sans coupure)")
         self.btn_bypass.setMinimumHeight(36)
         h.addWidget(self.btn_bypass)
         top.lay.addLayout(h)
-        h2 = QHBoxLayout()
-        h2.setSpacing(8)
-        mb_ = btn("Préréglages  ▾", "", None, "Charger un préréglage radio dans la banque affichée")
-        menu = QMenu(mb_)
-        for name in PROC_ORDER:
-            a_ = menu.addAction(name.replace("&", "&&"))
-            a_.setToolTip(PROC_INFO.get(name, ""))
-            a_.triggered.connect(lambda _c=False, n=name: self.proc_preset(n))
-        menu.setToolTipsVisible(True)
-        mb_.setMenu(menu)
-        h2.addWidget(mb_)
-        h2.addWidget(btn("À zéro", "", self.proc_zero, "Réglage neutre : aucune couleur ni compression, seul le limiteur "
-                                                         "final garantit le plafond. Point de départ pour construire son son."))
-        self.btn_preset_reset = btn("Réinitialiser", "", self.proc_reset, "Annule les réglages fins de cette banque")
-        h2.addWidget(self.btn_preset_reset)
-        self.l_preset_info = lab("", "mut")
-        h2.addWidget(self.l_preset_info, 1)
-        top.lay.addLayout(h2)
+        self.l_preset_info = CLabel("", "mut", False, MUT)
+        self.l_preset_info.elide = True
+        self.l_preset_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.l_preset_info.setMinimumWidth(40)
+        top.lay.addWidget(self.l_preset_info)
         g.addWidget(top, 0, 0, 1, 3)
-        # --- niveau et densité (AGC + mesures + densité, un seul module)
-        nv = Card("Niveau et densité", "Volume automatique (AGC), densité, et ce que fait le processeur en ce moment")
-        hh = QHBoxLayout()
-        hh.setSpacing(18)
+        # --- 2a. ce que fait le processeur
+        nv = Card("Ce que fait le processeur", "Une ligne par étape, dans l'ordre où passe le son")
         self.proc_meters = ProcMeters()
-        self.proc_meters.setMinimumHeight(150)
-        hh.addWidget(self.proc_meters, 3)
-        col = QVBoxLayout()
-        col.setSpacing(6)
-        self.proc_slider(nv, "Densité", "lm", 1, 10, lambda v: ("naturel" if v < 3.5 else "dense" if v > 7 else "moyen") + f"  {v:.1f}",
-                         tip="MOINS ↔ PLUS : plus dense = plus fort et plus régulier, moins dense = plus naturel", lay=col)
-        self.proc_switch(nv, "Volume automatique (AGC)", "agc",
-                         "Ramène doucement toutes les sources au même niveau ; se fige dans les silences", lay=col)
-        self.proc_slider(nv, "Vitesse de l'AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau", lay=col)
-        col.addStretch(1)
-        cw_ = QWidget()
-        cw_.setLayout(col)
-        cw_.setMaximumWidth(330)
-        col.setContentsMargins(0, 0, 0, 0)
-        hh.addWidget(cw_, 2)
-        nv.lay.addLayout(hh, 1)
+        nv.lay.addWidget(self.proc_meters, 1)
         g.addWidget(nv, 1, 0, 1, 2)
-        # --- son envoyé à chaque flux
-        pf = Card("Traitement de chaque flux", "Une banque par flux, ou le son brut")
+        # --- 2b. réglage envoyé à chaque flux
+        pf = Card("Chaque flux", "La banque qui part sur chaque flux")
         self.fx_rows = QVBoxLayout()
         self.fx_rows.setSpacing(4)
         pf.lay.addLayout(self.fx_rows)
-        n_ = lab("Chaque banque utilisée ajoute un peu de calcul (environ 2 ms par bloc de 20 ms).", "mut", True)
-        n_.setStyleSheet(f"color:{MUT};font-size:11px;")
         pf.lay.addStretch(1)
+        n_ = lab("Chaque banque utilisée ajoute un peu de calcul.", "mut", True)
+        n_.setStyleSheet(f"color:{MUT};font-size:11px;")
+        n_.setToolTip("Environ 2 ms de calcul par bloc audio de 20 ms et par banque utilisée.")
         pf.lay.addWidget(n_)
         g.addWidget(pf, 1, 2)
-        # --- égalisation
-        eq = Card("Égalisation", "")
-        eq.lay.setSpacing(3)
+        # --- 3. réglages fins, en onglets
+        st = Card("Réglages", "")
+        self.l_proc_set = st.head
+        self.seg_proc = Segmented([n for n, _ in self.PROC_TABS], w=128, h=28)
+        st.hl.addWidget(self.seg_proc)
+        self.l_proc_tab = lab("", "mut")
+        self.l_proc_tab.setStyleSheet(f"color:{MUT};font-size:12px;")
+        st.lay.addWidget(self.l_proc_tab)
+        self.proc_stack = QStackedWidget()
+        st.lay.addWidget(self.proc_stack, 1)
+
+        def tab():
+            w_ = QWidget()
+            hh = QHBoxLayout(w_)
+            hh.setContentsMargins(0, 0, 0, 0)
+            hh.setSpacing(28)
+            c1, c2 = QVBoxLayout(), QVBoxLayout()
+            for c in (c1, c2):
+                c.setSpacing(4)
+                c.setContentsMargins(0, 0, 0, 0)
+            hh.addLayout(c1, 1)
+            hh.addLayout(c2, 1)
+            self.proc_stack.addWidget(w_)
+            return c1, c2
+        # Niveau
+        c1, c2 = tab()
+        self.proc_switch(st, "Volume automatique (AGC)", "agc",
+                         "Ramène doucement toutes les sources au même niveau ; se fige dans les silences", lay=c1)
+        self.proc_slider(st, "Vitesse de l'AGC", "agc_speed", .3, 6, "%.1f dB/s", tip="Vitesse de remontée du niveau", lay=c1)
+        self.proc_slider(st, "Densité", "lm", 1, 10, lambda v: ("naturel" if v < 3.5 else "dense" if v > 7 else "moyen") + f"  {v:.1f}",
+                         tip="MOINS ↔ PLUS : plus dense = plus fort et plus régulier, moins dense = plus naturel", lay=c2)
+        for c in (c1, c2):
+            c.addStretch(1)
+        # Couleur (égalisation) : la courbe à gauche, les curseurs à droite
+        c1, c2 = tab()
         self.eqc = EQCurve()
-        self.eqc.setMinimumHeight(64)
-        self.eqc.setMaximumHeight(84)
-        eq.lay.addWidget(self.eqc)
-        self.proc_slider(eq, "Coupe-bas", "hpf", 0, 120, lambda v: "aucun" if v < 1 else "%.0f Hz" % v, scale=1)
-        self.proc_slider(eq, "Graves", "bass", -6, 6, "%+.1f dB", tip="Plateau à 90 Hz")
-        self.proc_slider(eq, "Présence", "presence", -6, 6, "%+.1f dB", tip="Autour de 3 kHz : voix plus devant")
-        self.proc_slider(eq, "Air", "air", -6, 6, "%+.1f dB", tip="Plateau à 11 kHz : brillance")
-        self.proc_switch(eq, "FM : rien au-dessus de 15 kHz", "fm15",
-                         "Indispensable pour un émetteur FM (protège le pilote stéréo à 19 kHz)")
-        eq.lay.addStretch(1)
-        g.addWidget(eq, 2, 0)
-        # --- multibande, épuré : force, vitesse, équilibre graves / médiums / aigus
-        mb = Card("Multibande", "Le « son » de l'antenne, en 3 réglages")
-        mb.lay.setSpacing(3)
-        self.proc_switch(mb, "Compresseur multibande", "mb_on")
-        self.proc_slider(mb, "Force", "mb_drive", 0, 15, lambda v: ("légère" if v < 4 else "forte" if v > 9 else "moyenne") + f"  {v:.0f}",
-                         tip="Quantité de compression : plus fort = son plus dense et plus égal")
-        self.proc_slider(mb, "Vitesse", "mb_release", 1, 10, lambda v: ("lente" if v < 4 else "rapide" if v > 7 else "normale"),
-                         get=self._rel_get, put=self._rel_put, tip="Vitesse de retour : lente = naturel, rapide = punchy")
+        self.eqc.setMinimumHeight(110)
+        c1.addWidget(self.eqc, 1)
+        self.proc_slider(st, "Coupe-bas", "hpf", 0, 120, lambda v: "aucun" if v < 1 else "%.0f Hz" % v, scale=1,
+                         tip="Supprime les très basses fréquences (vent, chocs, ronflements)", lay=c2)
+        self.proc_slider(st, "Graves", "bass", -6, 6, "%+.1f dB", tip="Plateau à 90 Hz", lay=c2)
+        self.proc_slider(st, "Voix (présence)", "presence", -6, 6, "%+.1f dB", tip="Autour de 3 kHz : voix plus devant", lay=c2)
+        self.proc_slider(st, "Brillance (air)", "air", -6, 6, "%+.1f dB", tip="Plateau à 11 kHz", lay=c2)
+        self.proc_switch(st, "Émetteur FM : rien au-dessus de 15 kHz", "fm15",
+                         "Indispensable pour un émetteur FM (protège le pilote stéréo à 19 kHz)", lay=c2)
+        c2.addStretch(1)
+        # Compression
+        c1, c2 = tab()
+        self.proc_switch(st, "Compresseur multibande", "mb_on", lay=c1)
+        self.proc_slider(st, "Force", "mb_drive", 0, 15, lambda v: ("légère" if v < 4 else "forte" if v > 9 else "moyenne") + f"  {v:.0f}",
+                         tip="Quantité de compression : plus fort = son plus dense et plus égal", lay=c1)
+        self.proc_slider(st, "Vitesse", "mb_release", 1, 10, lambda v: ("lente" if v < 4 else "rapide" if v > 7 else "normale"),
+                         get=self._rel_get, put=self._rel_put, tip="Vitesse de retour : lente = naturel, rapide = punchy", lay=c1)
         for nm, bands in self.TONE:
-            self.proc_slider(mb, nm, "mix", -6, 6, "%+.1f dB",
+            self.proc_slider(st, nm, "mix", -6, 6, "%+.1f dB",
                              get=lambda pp, b=bands: sum(pp["mix"][i] for i in b) / len(b),
                              put=lambda pp, x, b=bands: pp.__setitem__("mix", [x if i in b else v for i, v in enumerate(pp["mix"])]),
-                             tip=f"Niveau des {nm.lower()} après compression")
-        mb.lay.addStretch(1)
-        g.addWidget(mb, 2, 1)
-        # --- stéréo et sortie
-        so = Card("Stéréo et sortie", "")
-        so.lay.setSpacing(3)
-        self.proc_slider(so, "Élargisseur", "width", 0, 100, "%.0f %%", scale=1,
-                         tip="Élargit l'image stéréo ; le mono reste intact")
-        self.proc_switch(so, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles FM et enceintes mono")
-        self.proc_switch(so, "Sortie mono", "mono")
-        self.proc_slider(so, "Écrêteur", "clip", 0, 100, "%.0f %%", scale=1,
-                         tip="Plus de volume perçu ; 0 pour la musique classique")
-        self.proc_slider(so, "Plafond", "ceiling", -3, -0.1, "%.1f dBTP",
-                         tip="Aucun échantillon ne dépasse ce niveau, même entre les échantillons (-1 dBTP pour les flux)")
-        so.lay.addStretch(1)
-        g.addWidget(so, 2, 2)
+                             tip=f"Niveau des {nm.lower()} après compression", lay=c2)
+        for c in (c1, c2):
+            c.addStretch(1)
+        # Stéréo et sortie
+        c1, c2 = tab()
+        self.proc_slider(st, "Élargisseur", "width", 0, 100, "%.0f %%", scale=1,
+                         tip="Élargit l'image stéréo ; le mono reste intact", lay=c1)
+        self.proc_switch(st, "Graves en mono (sous 120 Hz)", "bass_mono", "Graves plus fermes, compatibles FM et enceintes mono", lay=c1)
+        self.proc_switch(st, "Sortie mono", "mono", lay=c1)
+        self.proc_slider(st, "Écrêteur", "clip", 0, 100, "%.0f %%", scale=1,
+                         tip="Plus de volume perçu ; 0 pour la musique classique", lay=c2)
+        self.proc_slider(st, "Plafond", "ceiling", -3, -0.1, "%.1f dBTP",
+                         tip="Aucun échantillon ne dépasse ce niveau, même entre les échantillons (-1 dBTP pour les flux)", lay=c2)
+        for c in (c1, c2):
+            c.addStretch(1)
+        self.seg_proc.changed.connect(self.proc_tab)
+        self.proc_tab(int(self.data.get("settings", {}).get("proc_tab", 0) or 0) % len(self.PROC_TABS))
+        g.addWidget(st, 2, 0, 1, 3)
         g.setRowStretch(1, 1)
         self.fx_flux_rows()
         self._proc_loading = False
         self.proc_refresh()
         return pg
+
+    def proc_tab(self, k):
+        """Onglet de réglages affiché (retenu d'une ouverture à l'autre)."""
+        self.proc_stack.setCurrentIndex(k)
+        if self.seg_proc.val != k:
+            self.seg_proc.setValue(k)
+        self.l_proc_tab.setText(self.PROC_TABS[k][1])
+        self.data.setdefault("settings", {})["proc_tab"] = k
 
     def proc_bank(self, b):
         """Affiche (et règle) une autre banque ; ses mesures s'affichent."""
@@ -10552,13 +10576,19 @@ class PagesMixin2:
         custom = bool(pp.get("custom"))
         byp = bool(self.proc.get("bypass"))
         self.set_kind(self.btn_bypass, "○  BYPASS · son brut  (réactiver)" if byp else "●  PROCESSEUR À L'ANTENNE", "stop" if byp else "primary")
+        self.btn_bypass.setMinimumWidth(self.btn_bypass.fontMetrics().horizontalAdvance(self.btn_bypass.text()) + 44)
         shown = "Réglage à zéro" if name == "zero" else name
-        self.l_preset.setText(shown + ("  · modifié" if custom else ""))
-        set_ss(self.l_preset, f"font-size:14px;font-weight:700;color:{MUT if byp else TXT};")
+        txt = shown + ("  · modifié" if custom else "")
+        self.btn_preset.setText(txt)
+        self.btn_preset.setMinimumWidth(self.btn_preset.fontMetrics().horizontalAdvance(txt) + 60)   # (+ flèche du menu)
         self.btn_preset_reset.setEnabled(custom)
-        used = [c.get("name") or "flux" for c in getattr(self, "outputs_cfg", []) if out_bank(c) == self.proc["edit"]]
+        b = self.proc["edit"]
+        used = [c.get("name") or "flux" for c in getattr(self, "outputs_cfg", []) if out_bank(c) == b]
         info = ("Aucun réglage, seul le limiteur final." if name == "zero" else PROC_INFO.get(name, ""))
-        self.l_preset_info.setText(info + ("   ·   Utilisée par : " + ", ".join(used) if used else "   ·   Utilisée par aucun flux"))
+        self.l_preset_info.setText(info + (f"   ·   Banque {b} sur : " + ", ".join(used) if used else f"   ·   Banque {b} : sur aucun flux"))
+        self.l_preset_info.set_color(MUT)
+        if hasattr(self, "l_proc_set"):
+            self.l_proc_set.setText(f"Réglages fins · banque {b}")
         if self.seg_bank.val != BANKS.index(self.proc["edit"]):
             self.seg_bank.setValue(BANKS.index(self.proc["edit"]))
         self.eqc.set(pp)
@@ -10574,7 +10604,7 @@ class PagesMixin2:
             st = "air" if (self.on_air and e.air) else "input"
         self.proc_meters.set(pm or {}, st)
 
-    FX_LABELS = {**{b: f"Banque {b}" for b in BANKS}, RAW: "Son brut (sans traitement)"}
+    FX_LABELS = {**{b: f"Banque {b}" for b in BANKS}, RAW: "Son brut"}
 
     def fx_flux_rows(self):
         while self.fx_rows.count():
@@ -10587,14 +10617,17 @@ class PagesMixin2:
             w = QWidget()
             w.setLayout(h)
             h.setContentsMargins(0, 0, 0, 0)
-            l = lab(c["name"], "")
-            l.setMinimumWidth(90)
+            l = CLabel(c["name"], "", False, TXT)
+            l.elide = True
+            l.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            l.setMinimumWidth(60)
             h.addWidget(l, 1)
             cb = QComboBox()
             cb.addItems(list(self.FX_LABELS.values()))
             cb.setCurrentText(self.FX_LABELS[out_bank(c)])
             cb.activated.connect(lambda _i, cc=c, b=cb: self.fx_flux_set(cc, next(k for k, v in self.FX_LABELS.items() if v == b.currentText())))
-            cb.setMinimumWidth(170)
+            cb.setMinimumWidth(cb.fontMetrics().horizontalAdvance(self.FX_LABELS[RAW]) + 48)
+            cb.setToolTip("Banque du processeur pour ce flux, ou son brut (sans traitement)")
             h.addWidget(cb)
             self.fx_rows.addWidget(w)
         if not self.outputs_cfg:
@@ -15329,10 +15362,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         if hasattr(self, "assistant"):
             self.assistant.chips_compact(lvl >= 1)
         if hasattr(self, "eqc"):                        # (onglet Processeur : tout tient sur un écran)
-            self.eqc.setMinimumHeight(62 if lvl < 1 else 56)
-            self.eqc.setMaximumHeight(84 if lvl < 1 else 62)
+            self.eqc.setMinimumHeight(110 if lvl < 1 else 92)
         if hasattr(self, "proc_meters"):
-            self.proc_meters.setMinimumHeight(150 if lvl < 1 else 112)
+            self.proc_meters.setMinimumHeight(150 if lvl < 1 else 128)
         QTimer.singleShot(0, self.air_min)
 
     def compact_header(self):
@@ -15552,7 +15584,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         src.lay.addLayout(r)
         self.l_devst = lab("Recherche...", "mut")
         self.l_devst.setTextFormat(Qt.TextFormat.RichText)
-        self.l_devst.setWordWrap(True)
+        self.l_devst.setWordWrap(False)                  # (une ligne : pas de hauteur dépendant de la largeur)
+        self.l_devst.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.l_devst.setMinimumWidth(40)
         src.lay.addWidget(self.l_devst)
         mr = QHBoxLayout()
         self.meter_in = LevelMeter("ENTRÉE")
@@ -15670,7 +15704,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         self.tb_out.cellClicked.connect(self.on_tree_click)
         self.tb_out.doubleClicked.connect(lambda *_: self.edit_output())
         outf.lay.addWidget(self.tb_out, 1)
-        self.l_flux = CLabel("", "mut", True, MUT)
+        self.l_flux = CLabel("", "mut", False, MUT)      # une ligne, texte complet en infobulle (l'état de chaque flux
+        self.l_flux.elide = True                         # est déjà dans le tableau)
+        self.l_flux.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.l_flux.setMinimumWidth(40)
         outf.lay.addWidget(self.l_flux)
         r = QHBoxLayout()
         mb = btn("＋ Flux     ")
@@ -15775,14 +15812,17 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             return
         avail = sa.viewport().height() - 4
         sp = right.spacing()
-        base = outf.minimumSizeHint().height() + air.minimumSizeHint().height() + 2 * sp
         width = max(200, air.width() or (self.width() // 2))
+
+        def eff(c):                                  # hauteur que la colonne réserve vraiment à la carte
+            m = c.minimumSizeHint().height()
+            return max(m, c.heightForWidth(width)) if c.hasHeightForWidth() else m
+        base = eff(outf) + eff(air) + 2 * sp
 
         def need(mini):
             facts.set_mini(mini)
             facts.layout().activate()
-            lay = facts.layout()
-            return lay.totalHeightForWidth(width) if lay.hasHeightForWidth() else facts.sizeHint().height()
+            return eff(facts)
         lvl = getattr(self, "_compact_lvl", 0)
         if lvl < 1 and base + need(False) <= avail:
             facts.setVisible(True)

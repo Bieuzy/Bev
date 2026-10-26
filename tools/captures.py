@@ -52,8 +52,12 @@ def main():
         W, H, k, state = jobs[i]
         w.resize(W, H)
         w.go_tab(k)
-        # une cartouche en lecture dans le bandeau (cas le plus chargé) sur le Cartoucheur
-        w.cart_now.set_items([("02 - Hold On", "#5b6cff", 9.9, 111.8, False, True, False, False)] if k == "cart" else [])
+        # une cartouche en lecture dans le bandeau (cas le plus chargé) sur le Cartoucheur ; le moteur absent la
+        # remettrait à zéro à chaque tic : on fige l'affichage le temps de la capture
+        cn = w.cart_now
+        orig = type(cn).set_items
+        cn.set_items = lambda *_a: None
+        orig(cn, [("02 - Hold On", "#5b6cff", 9.9, 111.8, False, True, False, False)] if k == "cart" else [])
         QTimer.singleShot(900, lambda: shoot(i))
 
     def shoot(i):
