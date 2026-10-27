@@ -837,10 +837,15 @@ def draw_icon(p, key, cx, cy, col):
         p.drawArc(QRectF(-8, -6, 16, 14), 180 * 16, 180 * 16)
         L(0, 8, 0, 11)
         L(-4, 11, 4, 11)
-    elif key == "son":
-        for dx, ky in ((-6, -2), (0, 3), (6, -5)):
-            L(dx, -9, dx, 9)
-            E(3, dx, ky)
+    elif key == "son":                                   # processeur : cadran de niveau avec son aiguille
+        p.drawArc(QRectF(-9, -7, 18, 18), 20 * 16, 140 * 16)
+        for a in (35, 70, 110, 145):
+            r = math.radians(a)
+            L(math.cos(r) * 9, 2 - math.sin(r) * 9, math.cos(r) * 6.5, 2 - math.sin(r) * 6.5)
+        r = math.radians(60)
+        L(0, 2, math.cos(r) * 8, 2 - math.sin(r) * 8)
+        E(2.2, 0, 2, fill=True)
+        L(-8, 8, 8, 8)
     elif key == "cart":
         for dx in (-8, 1):
             for dy in (-8, 1):
@@ -862,12 +867,21 @@ def draw_icon(p, key, cx, cy, col):
         E(9)
         L(0, -1, 0, 5)
         E(1.5, 0, -4.6, fill=True)
-    elif key == "sos":
+    elif key == "sos":                                   # bouée de sauvetage : anneau et quatre bandes en diagonale
+        p.setPen(ppen(col, 1.8))
         E(9)
-        E(4)
-        for sx in (-1, 1):
-            for sy in (-1, 1):
-                L(sx * 4, sy * 4, sx * 8, sy * 8)
+        E(4.4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(col))
+        R, ri = 9.0, 4.4
+        for i in range(4):
+            a0 = 45 + i * 90 - 19
+            band = QPainterPath()
+            band.arcMoveTo(QRectF(-R, -R, 2 * R, 2 * R), a0)
+            band.arcTo(QRectF(-R, -R, 2 * R, 2 * R), a0, 38)
+            band.arcTo(QRectF(-ri, -ri, 2 * ri, 2 * ri), a0 + 38, -38)
+            band.closeSubpath()
+            p.drawPath(band)
     p.restore()
 
 

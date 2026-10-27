@@ -29,6 +29,7 @@ NEWS = {
 
 - Les bulles de Gaël restent dans sa colonne, au-dessus de lui : la page n'est plus cachée.
 - À propos : le phare de Bev, une présentation plus claire.
+- Nouvelles icônes dans le menu : un cadran de niveau pour le Processeur, une vraie bouée de sauvetage pour SOS.
 - Automate de diffusion : fenêtre refaite, avec une explication simple, l'adresse à recopier et un bouton « Tester la réception ».
 - Journal : le filtre « Playlist de secours » montre les silences et les relèves.
 - Cartoucheur : un clic sur une cartouche qui joue montre tout de suite ce qui se passe (symbole stop, pause ou lecture qui apparaît puis s'efface) ; pendant l'arrêt en fondu, la tuile affiche « fondu… ».
