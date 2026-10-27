@@ -383,7 +383,12 @@ class GaelBrain:
                                  (("crepe", "galette", "bilig", "faim"), "crepes", "Une crêpe au beurre salé, ça arrive ! Regarde sous le menu."),
                                  (("café", "cafe", "pause"), "cafe", "Une petite pause café, regarde sous le menu."),
                                  (("pluie", "crachin", "meteo", "il pleut"), "crachin", "Le crachin, c'est que de l'eau ! Je sors le parapluie, regarde sous le menu."),
-                                 (("goeland", "mouette", "oiseau"), "goeland", "Attention, un goéland chapardeur ! Regarde sous le menu.")):
+                                 (("goeland", "mouette", "oiseau"), "goeland", "Oh non, pas un goéland… pas sur le béret ! Regarde sous le menu."),
+                                 (("bagad", "bombarde", "biniou", "defile"), "bagad", "En avant le bagad ! Regarde sous le menu."),
+                                 (("mixage", "table de mixage", "console", "dj"), "mixage", "Je prends la console ! Regarde sous le menu."),
+                                 (("fierte", "pride", "lgbt", "queer", "arc-en-ciel", "arc en ciel"), "fierte",
+                                  "Bev est ouvert à toutes et à tous ! Regarde sous le menu."),
+                                 (("pylone", "emetteur", "grimpe", "escalade", "antenne fm"), "antenne", "Je grimpe au pylône FM ! Regarde sous le menu.")):
             if H(n, *words) and len(n) < 60 and not H(n, "flux", "secours", "erreur"):
                 if hasattr(a.rail, "gael"):
                     a.rail.gael.play(anim)
@@ -960,7 +965,7 @@ GAEL_TOOLS = [
     _tool("propose_monitor", "Propose d'ajouter une adresse de flux au monitoring.", {"url": {"type": "string"}}, ("url",)),
     _tool("propose_broadcast", "Propose de démarrer ou d'arrêter la diffusion.", {"action": {"type": "string", "enum": ["start", "stop"]}}, ("action",)),
     _tool("open_tab", "Ouvre un onglet de l'application.", {"tab": {"type": "string", "enum": ["diff", "son", "cart", "rec", "mon", "net", "sos", "set", "about"]}}, ("tab",)),
-    _tool("play_animation", "Gaël fait une petite animation sous le menu (pour le plaisir).", {"name": {"type": "string", "enum": ["gavotte", "crepes", "crachin", "goeland", "cafe", "casque", "etire", "hoquet"]}}, ("name",)),
+    _tool("play_animation", "Gaël fait une petite animation sous le menu (pour le plaisir).", {"name": {"type": "string", "enum": ["gavotte", "crepes", "crachin", "goeland", "cafe", "etire", "hoquet", "bagad", "mixage", "fierte", "antenne"]}}, ("name",)),
 ]
 
 

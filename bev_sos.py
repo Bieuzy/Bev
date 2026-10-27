@@ -281,6 +281,12 @@ class PagesMixin4:
             n["back_s"] = 90
 
     def net_log(self, msg):
+        now = time.time()
+        seen = getattr(self, "_net_seen", {})
+        self._net_seen = seen
+        if now - seen.get(msg, 0) < 300:          # même constat répété à chaque mesure : noté une fois toutes les 5 min
+            return
+        seen[msg] = now
         self.net_logbox.appendPlainText(f"{time.strftime('%d/%m %H:%M:%S')}  {msg}")
         self.log("Réseau : " + msg)
 
@@ -578,6 +584,8 @@ class PagesMixin4:
         main = order[0] if order else None
         target, reason = None, ""
         n = self.data["net"]
+        if not (act in order and self.net_bad.get(act, 0) >= 2):
+            self._net_bad_since = None                    # qualité redevenue correcte : le compteur repart de zéro
         if act in order and self.net_bad.get(act, 0) >= 2:
             alt = next((x for x in order if x != act and usable[x]), None)
             qa = quality(self.net_stats.get(act))[0]
@@ -585,7 +593,7 @@ class PagesMixin4:
                 target, reason = alt, f"« {self.net_label(act)} » {qa.lower()}"
             else:
                 self.net_log(f"« {self.net_label(act)} » {qa.lower()} et aucune connexion de secours disponible.")
-                self.alerts.send(f"Internet : « {self.net_label(act)} » {qa.lower()}, pas de lien de secours.", "out-net-down")
+                self.net_alert(f"Internet : « {self.net_label(act)} » {qa.lower()}, pas de lien de secours.", "out-net-down")
         elif main and act and act != main and usable.get(main) and now - self.net_good_since.get(main, now) >= n["back_s"]:
             target, reason = main, "retour au lien principal (stable)"
         if target and now - self.net_last_switch > 60:
@@ -593,9 +601,29 @@ class PagesMixin4:
                 self.net_switch(target, reason)
             else:
                 self.net_log(f"Conseil : {reason} → utiliser « {self.net_label(target)} » (sélectionne-la puis « Utiliser celle-ci maintenant »).")
-                self.alerts.send(f"Internet : {reason}. Lien conseillé : {self.net_label(target)}.", "out-net-advice")
+                self.net_alert(f"Internet : {reason}. Lien conseillé : {self.net_label(target)}.", "out-net-advice")
         self.net_render()
         self.net_gauge()
+
+    NET_ALERT_AFTER = 300       # mauvaise qualité : message seulement si elle dure 5 min…
+    NET_ALERT_EVERY = 3600      # … et au plus une fois par heure (pour chaque type de message)
+
+    def net_alert(self, text, key, sustained=True):
+        """Alertes sur la qualité d'Internet, allégées : le Wi-Fi qui faiblit quelques instants n'envoie plus rien (c'est noté
+        dans le journal du réseau). Un message ne part que si la mauvaise qualité dure 5 minutes, et au plus une fois par
+        heure ; une bascule de lien est signalée au plus une fois par heure."""
+        now = time.time()
+        if sustained:
+            if getattr(self, "_net_bad_since", None) is None:
+                self._net_bad_since = now
+            if now - self._net_bad_since < self.NET_ALERT_AFTER:
+                return
+        last = getattr(self, "_net_alert_t", {})
+        self._net_alert_t = last
+        if key in last and now - last[key] < self.NET_ALERT_EVERY:
+            return
+        last[key] = now
+        self.alerts.send(text + (" (depuis plus de 5 min)" if sustained else ""), key)
 
     def net_gauge(self):
         nm = None
@@ -620,10 +648,10 @@ class PagesMixin4:
     def net_switched(self, name, ok, msg, reason):
         if not ok:
             self.net_log(f"Bascule impossible : {msg}")
-            self.alerts.send(f"Internet : bascule vers {self.net_label(name)} impossible ({msg}).", "out-net-fail")
+            self.net_alert(f"Internet : bascule vers {self.net_label(name)} impossible ({msg}).", "out-net-fail", sustained=False)
             return
         self.net_log(f"Internet passe par « {self.net_label(name)} ».")
-        self.alerts.send(f"Internet : bascule sur {self.net_label(name)} ({reason}).", "out-net-switch")
+        self.net_alert(f"Internet : bascule sur {self.net_label(name)} ({reason}).", "out-net-switch", sustained=False)
         self.net_last = 0.0
         if self.on_air:
             outs = [o for o in self.engine.outputs if o.cfg["type"] == "internet"]
@@ -737,13 +765,14 @@ class PagesMixin4:
             faq.hide()
         jl = Card("Journal", "Historique des événements d'antenne")
         tb = QHBoxLayout()
-        self.seg_jf = Segmented(["Tout", "Problèmes", "Secours"], 74, 26)
+        self.seg_jf = Segmented(["Tout", "Problèmes", "Playlist de secours"], 50, 26, fit=True)
+        self.seg_jf.setToolTip("Playlist de secours : les silences à l'antenne et les moments où la playlist a pris le relais")
         self.seg_jf.changed.connect(lambda *_: self.journal_render())
         tb.addWidget(self.seg_jf)
         self.ed_jq = QLineEdit()
         self.ed_jq.setPlaceholderText("Chercher…")
         self.ed_jq.setMaximumWidth(140)
-        self.ed_jq.setMinimumWidth(80)
+        self.ed_jq.setMinimumWidth(110)
         self.ed_jq.textChanged.connect(lambda *_: self.journal_render())
         tb.addWidget(self.ed_jq)
         tb.addStretch(1)
@@ -777,7 +806,7 @@ class PagesMixin4:
         f = self.seg_jf.val
         if f == 1 and cls != "bad":
             return False
-        if f == 2 and cls not in ("warn",) and "secours" not in norm_txt(msg):
+        if f == 2 and not re.search(r"playlist de secours|prend le relais|retour au direct|aucun signal|silence", norm_txt(msg)):
             return False
         q = norm_txt(self.ed_jq.text().strip())
         return not q or q in norm_txt(msg) or q in ts
@@ -936,32 +965,67 @@ class PagesMixin4:
     def alert_test(self):
         if not self.alerts.channels():
             return self.alert_dialog()
-        self.alerts.send("Test d'alerte : si tu reçois ce message, les alertes fonctionnent.", force=True, urgent=True, sound=True)
-        self.log("Alerte de test envoyée.")
+        for k in self.alerts.configured():
+            self.alerts.set_status(k, "attente")
+        self.alert_summary()
+        self.alerts.send("Test d'alerte : si tu reçois ce message, les alertes fonctionnent.", force=True, urgent=True, test=True)
+        self.log("Alerte de test envoyée : le voyant passe au vert seulement si l'envoi réussit.")
+
+    def alert_result(self, kind, ok, test):
+        """Résultat d'un envoi (fil des alertes) : le voyant du canal suit ce qui s'est VRAIMENT passé."""
+        if kind not in self.alerts.CHAN_FIELDS:
+            return
+        if ok:
+            self.alerts.set_status(kind, "ok")
+        elif test:
+            self.alerts.set_status(kind, "echec")
+            self.log(f"⚠ Test d'alerte en échec ({ {'mail': 'mail', 'sms': 'SMS', 'msg': 'message'}[kind] }) : vérifie ses réglages.")
+        self.save_settings()
+        self.alert_summary()
 
     def alert_card_update(self):
+        """Le vert ne s'affiche que si chaque canal configuré a VRAIMENT réussi un envoi (test ou alerte), avec ses réglages
+        actuels. Configuré mais pas encore testé : orange ; test raté : rouge."""
         c = self.data["alerts"]
         ch = self.alerts.channels()
-        if ch:
-            self.al_head.setText("Tu seras prévenu en cas de panne")
+        conf = self.alerts.configured()
+        st = {k: self.alerts.chan_status(k) for k in conf}
+        bad = [k for k in conf if st[k] == "echec"]
+        wait = [k for k in conf if st[k] == "attente"]
+        untested = [k for k in conf if st[k] == "a_tester"]
+        names = {"mail": "mail", "sms": "SMS", "msg": c.get("kind", "message")}
+        if not conf:
+            head, col = "Personne ne sera prévenu en cas de panne !", BADC
+        elif bad:
+            head, col = "Le test a échoué (" + ", ".join(names[k] for k in bad) + ") : vérifie les réglages", BADC
+        elif wait:
+            head, col = "Test en cours…", ACC2
+        elif untested:
+            head, col = "Alertes configurées : envoie un test pour vérifier", ACC2
         else:
-            self.al_head.setText("Personne ne sera prévenu en cas de panne !")
-        col = OKC if ch else BADC
+            head, col = "Tu seras prévenu en cas de panne", OKC
+        self.al_head.setText(head)
         set_ss(self.al_head, f"font-size:16px;font-weight:700;color:{col};")
         self.al_card.set_color(col)
-        self.al_phone.set_state(bool(ch), ch)
+        verified = bool(conf) and all(st[k] == "ok" for k in conf)
+        self.al_phone.set_state(verified, ch if verified else [])
         self.al_cfg.setText("Modifier les alertes…" if ch else "Configurer SMS / mail…")
         if hasattr(self.rail, "set_badge"):
-            self.rail.set_badge("sos", None if ch else BADC)
-        mail = bool(c.get("mail_on") and c.get("mail_to"))
-        sms = bool(c.get("sms_on") and c.get("sms_to"))
-        msg = bool((c.get("url") or "").strip())
-        for key, ok, l, det in (("mail", mail, "Mail", c.get("mail_to", "")), ("sms", sms, "SMS", c.get("sms_to", "")),
-                                ("msg", msg, c.get("kind", "Message"), "")):
+            self.rail.set_badge("sos", None if verified else (BADC if (not conf or bad) else ACC2))
+        for key, l, det in (("mail", "Mail", c.get("mail_to", "")), ("sms", "SMS", c.get("sms_to", "")),
+                            ("msg", c.get("kind", "Message"), "")):
             w = self.al_chan[key]
-            w.setText(f"{'●' if ok else '○'}  {l}" + (f"  ·  {det}" if ok and det else ("  ·  non configuré" if not ok else "")))
-            bg = mixc(PANEL, OKC, .16).name() if ok else FIELD
-            set_ss(w, f"background:{bg};color:{OKC if ok else MUT};font-weight:700;border-radius:13px;padding:6px 13px;")
+            if key not in conf:
+                txt, fg, bg = f"○  {l}  ·  non configuré", MUT, FIELD
+            else:
+                s_ = st[key]
+                txt = {"ok": f"●  {l}" + (f"  ·  {det}" if det else "") + "  ·  testé",
+                       "echec": f"✕  {l}  ·  échec du test", "attente": f"◌  {l}  ·  test en cours…",
+                       "a_tester": f"◐  {l}" + (f"  ·  {det}" if det else "") + "  ·  à tester"}[s_]
+                fg = {"ok": OKC, "echec": BADC, "attente": ACC2, "a_tester": ACC2}[s_]
+                bg = mixc(PANEL, fg, .16).name()
+            w.setText(txt)
+            set_ss(w, f"background:{bg};color:{fg};font-weight:700;border-radius:13px;padding:6px 13px;")
 
     def alert_summary(self):
         self.alert_card_update()
@@ -1102,11 +1166,11 @@ class AlertDialog(QDialog):
         pov = QVBoxLayout(po)
         pov.setContentsMargins(2, 6, 2, 2)
         pov.setSpacing(8)
-        self.sw("sound", "Bip sonore sur cet ordinateur", c.get("sound", True), pov)
         for k, l in (("on_output", "Prévenir quand un flux tombe"), ("on_fallback", "Prévenir quand il n'y a plus de son en entrée (au délai du secours) ou que la playlist de secours est muette"),
                      ("on_monitor", "Prévenir quand un flux surveillé est inactif")):
             self.sw(k, l, c.get(k, True), pov)
-        pov.addWidget(lab("Les identifiants sont enregistrés en clair dans le fichier de réglages de cet ordinateur.", "mut", True))
+        pov.addWidget(lab("Les identifiants sont enregistrés dans le fichier de réglages de cet ordinateur (chiffrés pour ce compte "
+                          "sous Windows). Ils n'apparaissent jamais dans les journaux ni dans les rapports.", "mut", True))
         pov.addStretch(1)
         self.stack.addWidget(po)
         self.seg.changed.connect(self.stack.setCurrentIndex)

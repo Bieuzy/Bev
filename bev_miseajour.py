@@ -60,7 +60,8 @@ class MiseAJourMixin:
         self.update_bubble_close()
         self._upd_mode = mode
         self.bot_talk = 40
-        b = SpeechBubble(self.centralWidget(), tail="top" if NAVTOP else "left")
+        # menu latéral : la bulle reste dans la colonne de Gaël, au-dessus de lui (la page n'est jamais cachée)
+        b = SpeechBubble(self.centralWidget(), tail="top" if NAVTOP else ("bottom" if self.bubble_in_rail() else "left"))
         b.t = lab("", "", True)
         b.t.setStyleSheet("font-weight:800;font-size:13px;")
         b.lay.addWidget(b.t)
@@ -70,7 +71,7 @@ class MiseAJourMixin:
         b.bar = UpdBar()
         b.lay.addWidget(b.bar)
         b.btns = QWidget()
-        b.btn_l = QHBoxLayout(b.btns)
+        b.btn_l = QVBoxLayout(b.btns) if b.tail == "bottom" else QHBoxLayout(b.btns)     # colonne étroite : boutons empilés
         b.btn_l.setContentsMargins(0, 2, 0, 0)
         b.btn_l.setSpacing(6)
         b.lay.addWidget(b.btns)
@@ -93,16 +94,26 @@ class MiseAJourMixin:
 
     BUBBLE_W = 330
 
+    def bubble_in_rail(self):
+        """La bulle peut-elle tenir dans la colonne de Gaël ? (menu latéral déplié, Gaël visible)"""
+        g = getattr(self.rail, "gael", None)
+        return not NAVTOP and not getattr(self.rail, "compact", False) and g is not None and g.isVisible()
+
     def bubble_set(self, title=None, line=None, buttons=None, progress="keep"):
         """Fait évoluer la bulle en place (titre, texte, barre, boutons) : pas de clignotement, pas de nouvelle bulle."""
         b = self.upd_bubble
         if b is None:
             return
         cw = self.centralWidget()
-        wmax = max(220, min(self.BUBBLE_W, cw.width() - (self.rail.width() if not NAVTOP else 0) - 40))
-        for l in (b.t, b.l_line):
-            l.setMaximumWidth(wmax)
-            l.setMinimumWidth(min(wmax, 230))
+        if b.tail == "bottom":
+            wmax = self.rail.width() - 12 - 28                    # largeur de la colonne moins les marges de la bulle
+            for l in (b.t, b.l_line):
+                l.setFixedWidth(wmax)
+        else:
+            wmax = max(220, min(self.BUBBLE_W, cw.width() - (self.rail.width() if not NAVTOP else 0) - 40))
+            for l in (b.t, b.l_line):
+                l.setMaximumWidth(wmax)
+                l.setMinimumWidth(min(wmax, 230))
         if title is not None:
             b.t.setText(title)
         anim = b.anim.state() == QVariantAnimation.State.Running
@@ -126,8 +137,12 @@ class MiseAJourMixin:
             for txt, kind, fn in buttons:
                 bt = btn(txt, kind, fn)
                 bt.setMinimumHeight(30)
+                if b.tail == "bottom":
+                    bt.setMinimumWidth(0)
+                    bt.setStyleSheet("font-size:12px;padding:4px 8px;")
                 b.btn_l.addWidget(bt)
-            b.btn_l.addStretch(1)
+            if b.tail != "bottom":
+                b.btn_l.addStretch(1)
             vis(b.btns, bool(buttons))
         b.lay.activate()
         b.adjustSize()
@@ -140,6 +155,23 @@ class MiseAJourMixin:
         b.adjustSize()
         cw = self.centralWidget()
         W, H = cw.width(), cw.height()
+        if b.tail == "bottom":                                   # dans la colonne de Gaël, juste au-dessus de sa tête
+            g = getattr(self.rail, "gael", None)
+            bw = self.rail.width() - 12
+            b.setFixedWidth(bw)
+            b.adjustSize()
+            if g is not None and g.isVisible():
+                hp = g.mapTo(cw, g.head_point())
+                hp = QPointF(min(max(hp.x() - 22, 30), bw - 24), hp.y() - 40)
+            else:
+                hp = QPointF(bw / 2, H - 8)
+            x = 6
+            y = int(max(8, hp.y() - b.height()))
+            b.move(x, y)
+            b.tip = QPointF(hp.x() - x, min(hp.y() - y, b.height() - 1))
+            b.raise_()
+            b.update()
+            return
         if NAVTOP:
             bb = self.bot_btn
             if bb is not None and bb.isVisible():

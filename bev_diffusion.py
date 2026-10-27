@@ -553,82 +553,178 @@ class DiffusionMixin:
             self.set_label(l, txt, col)
 
     def automate_dialog(self):
+        """Fenêtre « Titre en cours depuis l'automate » : une explication simple, puis deux façons de faire (fichier ou
+        réseau), l'adresse à recopier dans l'automate et un bouton pour tester. Les réglages techniques (port, réseau local,
+        code secret) sont rangés dans « Réglages avancés »."""
         c = dict(self.automate_cfg())
         d = QDialog(self)
-        d.setWindowTitle("Titre en cours depuis un automate")
-        d.setMinimumWidth(560)
+        d.setWindowTitle("Titre en cours depuis l'automate")
         v = QVBoxLayout(d)
-        v.setContentsMargins(22, 18, 22, 16)
-        t = lab("Automate de diffusion", "")
-        t.setStyleSheet("font-size:18px;font-weight:700;")
-        v.addWidget(t)
-        v.addWidget(lab("Bev peut récupérer le titre, l'artiste et la pochette depuis votre automate (Radiologik, RadioDJ, "
-                        "Rivendell, mAirList…), les afficher dans « 4 · À l'antenne » et les envoyer à vos flux.", "mut", True))
-        sw_on = Switch("Utiliser l'automate")
+        v.setContentsMargins(24, 20, 24, 18)
+        v.setSpacing(10)
+        v.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        W = 520
+
+        def text(t, name="", style=""):
+            l_ = lab(t, name, True)
+            l_.setFixedWidth(W)
+            if style:
+                l_.setStyleSheet(style)
+            return l_
+        v.addWidget(text("Titre en cours depuis l'automate", "", "font-size:18px;font-weight:700;"))
+        v.addWidget(text("Votre logiciel de diffusion automatique (RadioDJ, Radiologik, mAirList, Rivendell…) sait quel morceau "
+                         "passe. Bev peut récupérer l'artiste, le titre et la pochette : il les affiche dans « 4 · À l'antenne » "
+                         "et les envoie aux auditeurs (titre du flux Internet, RDS, DAB+).", "mut"))
+        sw_on = Switch("Récupérer le titre depuis l'automate")
         sw_on.setChecked(bool(c["on"]))
         v.addWidget(sw_on)
-        f = QFormLayout()
-        f.setVerticalSpacing(8)
+        box = QWidget()
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(0, 4, 0, 0)
+        bv.setSpacing(8)
+        v.addWidget(box)
+        head = QHBoxLayout()
+        head.addWidget(lab("Comment l'automate transmet-il le titre ?", ""))
+        head.addStretch(1)
+        seg = Segmented(["Par le réseau", "Par un fichier"], 60, 28, fit=True)
+        seg.setValue(0 if (c["net"] or not c["file"]) else 1)
+        head.addWidget(seg)
+        bv.addLayout(head)
+        # --- par le réseau
+        net = QWidget()
+        nv = QVBoxLayout(net)
+        nv.setContentsMargins(0, 0, 0, 0)
+        nv.setSpacing(6)
+        nv.addWidget(text("À chaque nouveau morceau, l'automate appelle une adresse de Bev. Recopiez cette adresse dans ses "
+                          "réglages « Now Playing » (titre en cours) ou « envoi par adresse web » :", ""))
+        url_row = QHBoxLayout()
+        ed_url = QLineEdit()
+        ed_url.setReadOnly(True)
+        url_row.addWidget(ed_url, 1)
+        url_row.addWidget(btn("Copier", "", lambda: self.copy_text(ed_url.text(), "Adresse de l'automate")))
+        nv.addLayout(url_row)
+        nv.addWidget(text("Remplacez ARTISTE, TITRE et POCHETTE par les balises (variables) correspondantes de l'automate. "
+                          "Bev accepte aussi un envoi POST (JSON, formulaire, ou texte « Artiste - Titre »).", "mut"))
+        bv.addWidget(net)
+        # --- par un fichier
+        fil = QWidget()
+        fv = QVBoxLayout(fil)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(6)
+        fv.addWidget(text("L'automate écrit le morceau en cours dans un fichier (texte « Artiste - Titre », XML ou JSON). "
+                          "Choisissez ce fichier : Bev le relit dès qu'il change.", ""))
+        frow = QHBoxLayout()
         ed_f = QLineEdit(c["file"])
-        ed_f.setPlaceholderText("(facultatif) fichier écrit par l'automate : texte, XML ou JSON")
-        rowf = QHBoxLayout()
-        rowf.addWidget(ed_f, 1)
-        rowf.addWidget(btn("…", "", lambda: ed_f.setText(QFileDialog.getOpenFileName(d, "Fichier du titre en cours", ed_f.text())[0] or ed_f.text())))
-        f.addRow("Fichier", rowf)
-        sw_net = Switch("Recevoir les titres par le réseau (l'automate appelle une adresse de Bev)")
-        sw_net.setChecked(bool(c["net"]))
-        f.addRow("", sw_net)
-        sp = QSpinBox()
-        sp.setRange(1024, 65535)
-        sp.setValue(int(c["port"] or AUTO_PORT))
-        sp.setMaximumWidth(110)
-        f.addRow("Port", sp)
-        sw_lan = Switch("Accepter les autres ordinateurs du réseau local (automate sur un autre poste)")
+        ed_f.setPlaceholderText("Fichier écrit par l'automate")
+        frow.addWidget(ed_f, 1)
+        frow.addWidget(btn("Parcourir…", "", lambda: ed_f.setText(
+            QFileDialog.getOpenFileName(d, "Fichier du titre en cours", ed_f.text())[0] or ed_f.text())))
+        fv.addLayout(frow)
+        bv.addWidget(fil)
+        # --- réglages avancés (réseau)
+        adv_b = btn("Réglages avancés ▾", "", None)
+        adv = QWidget()
+        av = QVBoxLayout(adv)
+        av.setContentsMargins(0, 0, 0, 0)
+        av.setSpacing(6)
+        prow = QHBoxLayout()
+        prow.addWidget(lab("Port", ""))
+        ed_port = QLineEdit(str(int(c["port"] or AUTO_PORT)))
+        from PySide6.QtGui import QIntValidator
+        ed_port.setValidator(QIntValidator(1024, 65535, ed_port))
+        ed_port.setFixedWidth(90)
+        prow.addWidget(ed_port)
+        prow.addWidget(lab("(8765 par défaut ; à changer seulement s'il est déjà utilisé)", "mut"))
+        prow.addStretch(1)
+        av.addLayout(prow)
+        sw_lan = Switch("L'automate est sur un autre ordinateur du réseau local")
         sw_lan.setChecked(bool(c["lan"]))
-        f.addRow("", sw_lan)
-        sw_tok = Switch("Exiger le code secret des autres postes (recommandé)")
+        av.addWidget(sw_lan)
+        sw_tok = Switch("Exiger le code secret (recommandé)")
         sw_tok.setChecked(bool(c.get("lan_token", True)))
-        f.addRow("", sw_tok)
-        v.addLayout(f)
-        ex = QPlainTextEdit()
-        ex.setReadOnly(True)
-        ex.setMaximumHeight(118)
-        v.addWidget(ex)
+        av.addWidget(sw_tok)
+        av.addWidget(text("Le code secret, déjà inclus dans l'adresse ci-dessus, empêche un autre appareil du réseau de changer "
+                          "le titre à l'antenne.", "mut"))
+        adv.setVisible(False)
+        adv_b.clicked.connect(lambda: (adv.setVisible(not adv.isVisible()),
+                                       adv_b.setText("Réglages avancés ▴" if adv.isVisible() else "Réglages avancés ▾")))
+        bv.addWidget(adv_b, 0, Qt.AlignmentFlag.AlignLeft)
+        bv.addWidget(adv)
+        # --- test
+        trow = QHBoxLayout()
+        b_test = btn("Tester la réception", "", None)
+        trow.addWidget(b_test)
+        st = lab("", "mut", True)
+        trow.addWidget(st, 1)
+        bv.addLayout(trow)
 
-        def explain(*_):
+        def port():
+            try:
+                return max(1024, min(65535, int(ed_port.text())))
+            except ValueError:
+                return AUTO_PORT
+
+        def refresh(*_):
+            on = sw_on.isChecked()
+            box.setEnabled(on)
+            by_net = seg.val == 0
+            net.setVisible(by_net)
+            fil.setVisible(not by_net)
+            adv_b.setVisible(by_net)
+            adv.setVisible(adv.isVisible() and by_net)
+            sw_tok.setEnabled(sw_lan.isChecked())
             host = "127.0.0.1"
             if sw_lan.isChecked():
                 try:
                     host = default_route_ip() or host
                 except Exception:
                     pass
-            base = f"http://{host}:{sp.value()}/"
-            sw_tok.setVisible(sw_lan.isChecked())
             tk = f"token={c['token']}&" if (sw_lan.isChecked() and sw_tok.isChecked()) else ""
-            ex.setPlainText(f"Adresse à indiquer dans l'automate (envoi à chaque titre) :\n{base}?{tk}artist=ARTISTE&title=TITRE&cover=ADRESSE_POCHETTE\n\n"
-                            "Dans Radiologik : réglages de publication du titre en cours (Now Playing), envoi par adresse web, en "
-                            "remplaçant ARTISTE, TITRE et ADRESSE_POCHETTE par les balises correspondantes de Radiologik. "
-                            "Bev accepte aussi un envoi POST (JSON, formulaire ou texte « Artiste - Titre »), ou un fichier.")
-        for w_ in (sw_lan, sw_tok, sp):
-            (w_.toggled if isinstance(w_, Switch) else w_.valueChanged).connect(explain)
-        explain()
-        h = QHBoxLayout()
-        h.addWidget(btn("Copier l'adresse", "", lambda: self.copy_text(ex.toPlainText().splitlines()[1], "Adresse")))
-        h.addStretch(1)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(d.accept)
-        bb.rejected.connect(d.reject)
-        h.addWidget(bb)
-        v.addLayout(h)
-        if d.exec():
+            ed_url.setText(f"http://{host}:{port()}/?{tk}artist=ARTISTE&title=TITRE&cover=POCHETTE")
+            ed_url.setCursorPosition(0)
+            b_test.setVisible(by_net)
+
+        def save():
             cfg = self.automate_cfg()
-            cfg.update(on=sw_on.isChecked(), file=ed_f.text().strip(), net=sw_net.isChecked(), port=sp.value(), lan=sw_lan.isChecked(),
-                       lan_token=sw_tok.isChecked())
+            by_net = seg.val == 0
+            cfg.update(on=sw_on.isChecked(), net=by_net, port=port(), lan=sw_lan.isChecked(), lan_token=sw_tok.isChecked())
+            if not by_net:
+                cfg["file"] = ed_f.text().strip()
             if not cfg["on"]:
                 self.auto_info = None
             self.save_settings()
             self.automate_apply()
-            self.log("Automate : " + ("relié." if cfg["on"] else "désactivé."))
+
+        def test():
+            sw_on.setChecked(True)
+            save()
+            st.setText("Envoi d'un titre de test…")
+            url = f"http://127.0.0.1:{port()}/?token={c['token']}&artist=Bev&title=Test%20de%20r%C3%A9ception"
+
+            def work():
+                time.sleep(.6)                                     # le temps que Bev ouvre l'adresse
+                try:
+                    with urllib.request.urlopen(url, timeout=4) as r:
+                        ok = r.read().decode("utf-8", "replace").startswith("ok")
+                    msg = "Ça marche : « Bev - Test de réception » est arrivé dans « 4 · À l'antenne »." if ok else "Réponse inattendue de Bev."
+                except Exception as ex:
+                    msg = f"Bev ne reçoit rien sur ce port ({str(ex)[:80]}). Essayez un autre port dans « Réglages avancés »."
+                self.ui(st.setText, msg)
+            threading.Thread(target=work, daemon=True).start()
+        b_test.clicked.connect(test)
+        for w_ in (sw_on, sw_lan, sw_tok):
+            w_.toggled.connect(refresh)
+        seg.changed.connect(refresh)
+        ed_port.textChanged.connect(refresh)
+        refresh()
+        bb = QHBoxLayout()
+        bb.addStretch(1)
+        bb.addWidget(btn("Annuler", "", d.reject))
+        bb.addWidget(btn("Enregistrer", "primary", d.accept))
+        v.addLayout(bb)
+        if d.exec():
+            save()
+            self.log("Automate : " + ("relié." if self.automate_cfg()["on"] else "désactivé."))
 
     def pick_cover(self):
         f, _ = QFileDialog.getOpenFileName(self, "Pochette par défaut (logo de la radio)", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp);;Tous (*)")

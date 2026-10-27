@@ -781,6 +781,116 @@ def crash_watch(who="interface"):
     return prev
 
 
+# ------------------------------------------------------------------ sons de Windows (option « Couper les sons de Windows »)
+# Les sons du système (notification, erreur, nouveau mail…) sont lus par Windows dans HKCU\AppEvents\Schemes : chaque
+# événement y a un fichier son (« .Current »). Pour les couper, on note ces réglages dans un fichier de sauvegarde puis on
+# les vide (comme le modèle « Aucun son » de Windows) ; pour les rétablir, on remet exactement ce qui était noté. La
+# sauvegarde survit à un plantage : au lancement suivant, Bev rétablit les sons si l'option a été décochée entre-temps.
+WIN_SOUNDS_BAK = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Bev", "sons-windows.json")
+
+
+def _win_sound_keys(winreg):
+    root = r"AppEvents\Schemes\Apps"
+    out = []
+    try:
+        apps = winreg.OpenKey(winreg.HKEY_CURRENT_USER, root)
+    except OSError:
+        return out
+    with apps:
+        i = 0
+        while True:
+            try:
+                app = winreg.EnumKey(apps, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                ak = winreg.OpenKey(apps, app)
+            except OSError:
+                continue
+            with ak:
+                j = 0
+                while True:
+                    try:
+                        ev = winreg.EnumKey(ak, j)
+                    except OSError:
+                        break
+                    j += 1
+                    out.append(f"{root}\\{app}\\{ev}\\.Current")
+    return out
+
+
+def win_sounds_mute():
+    """Coupe les sons de Windows (sauvegarde d'abord). True si c'est fait. Sans effet hors Windows."""
+    if SYS != "Windows":
+        return False
+    try:
+        import winreg
+        if os.path.isfile(WIN_SOUNDS_BAK):            # déjà coupés (session précédente) : on garde la sauvegarde d'origine
+            with open(WIN_SOUNDS_BAK, encoding="utf-8") as fh:
+                bak = json.load(fh)
+        else:
+            bak = {"scheme": None, "events": {}}
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"AppEvents\Schemes") as k:
+                    bak["scheme"] = winreg.QueryValueEx(k, "")[0]
+            except OSError:
+                pass
+            for path in _win_sound_keys(winreg):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+                        bak["events"][path] = list(winreg.QueryValueEx(k, ""))      # [fichier son, type exact]
+                except OSError:
+                    continue
+            os.makedirs(os.path.dirname(WIN_SOUNDS_BAK), exist_ok=True)
+            with open(WIN_SOUNDS_BAK + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(bak, fh)
+            os.replace(WIN_SOUNDS_BAK + ".tmp", WIN_SOUNDS_BAK)
+        for path in bak["events"]:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "")
+            except OSError:
+                continue
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"AppEvents\Schemes", 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, ".None")
+        except OSError:
+            pass
+        return True
+    except Exception as ex:
+        trace("win_sounds_mute", ex)
+        return False
+
+
+def win_sounds_restore():
+    """Rétablit les sons de Windows tels qu'ils étaient avant (d'après la sauvegarde). True si quelque chose a été rétabli."""
+    if SYS != "Windows" or not os.path.isfile(WIN_SOUNDS_BAK):
+        return False
+    try:
+        import winreg
+        with open(WIN_SOUNDS_BAK, encoding="utf-8") as fh:
+            bak = json.load(fh)
+        for path, val in (bak.get("events") or {}).items():
+            v, t = (val[0], val[1]) if isinstance(val, list) else (val, winreg.REG_EXPAND_SZ if "%" in str(val) else winreg.REG_SZ)
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "", 0, t, v or "")
+            except OSError:
+                continue
+        if bak.get("scheme") is not None:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"AppEvents\Schemes", 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "", 0, winreg.REG_SZ, bak["scheme"])
+            except OSError:
+                pass
+        os.remove(WIN_SOUNDS_BAK)
+        return True
+    except Exception as ex:
+        trace("win_sounds_restore", ex)
+        return False
+
+
 def have_module(name):
     try:
         if importlib.util.find_spec(name) is not None:

@@ -1117,81 +1117,415 @@ class ACrachin(GAnim):
 
 
 class AGoeland(GAnim):
-    name, label, dur = "goeland", "Le goéland chapardeur", 8.6
-    LAND = 1.9
-    LEAVE = 5.2
+    """Un goéland passe au-dessus de Gaël… et lâche sa fiente pile sur le béret. Gaël, outré, menace l'oiseau du poing,
+    puis s'essuie le béret en soupirant."""
+    name, label, dur = "goeland", "Le goéland farceur", 8.6
+    DROP = 2.35            # l'oiseau lâche sa fiente
+    HIT = 2.85             # elle arrive sur le béret
+    SX = -7.0              # point d'impact sur le béret (repère racine, Gaël debout)
+    SY = -121.0
 
     def gull(self, t):
-        """(x, y, battement, posé ?) ; la coiffe culmine vers y = -150."""
-        if t < self.LAND:
-            u = ss(t / self.LAND)
-            x = lerp(118, 2, u)
-            y = lerp(-212, -152, u) - math.sin(u * math.pi) * 14
-            flap = 38 * math.sin(t * 17) if u < .82 else lerp(20, -50, (u - .82) / .18)
-            return x, y, flap, False
-        if t < self.LEAVE:
-            return 2, -152, -55, True
-        u = (t - self.LEAVE) / 1.6
-        x = lerp(2, -128, ss(u))
-        y = -152 - u * 70 - math.sin(u * 3) * 6
-        return x, y, 38 * math.sin(t * 18), False
+        """(x, y, battement, sens) : arrive de la droite, passe au-dessus de la tête, repart à gauche en riant."""
+        u = t / 4.6
+        x = lerp(124, -150, ss(u)) if u < 1 else -150
+        y = -198 - math.sin(u * math.pi) * 10 + math.sin(t * 5) * 2
+        return x, y, 36 * math.sin(t * 17), -1
 
     def pose(self, t, P):
-        if t < self.LAND:
-            P.update(lookv=-win(t, .6, 1.4), look=lerp(1, 0, win(t, .4, 1.6)), eye=0)
-        elif t < self.LEAVE:
-            v = t - self.LAND
-            bump = math.exp(-v * 5) * math.sin(v * 22)
-            P.update(sq=-.05 * bump, coif=-9 * bump, lookv=-1, eye=3 if v < 1.6 else 4, mouth=1 if v < 1.6 else 3)
-            if 1.8 < v < 3.2:               # il chasse l'oiseau d'un revers de main
-                k = win(v, 1.8, 2.1) * (1 - win(v, 2.9, 3.2))
-                P.update(ra1=lerp(10, 165, k), ra2=lerp(8, 30 + math.sin(v * 26) * 26, k), head=4 * math.sin(v * 13) * k)
+        gx = self.gull(t)[0]
+        if t < self.HIT:                              # il suit l'oiseau des yeux
+            P.update(lookv=-1, look=_cl(gx / 60, -1, 1), eye=0, mouth=0 if t < self.DROP else 1)
+        elif t < 3.5:                                 # « plop » : surprise
+            v = t - self.HIT
+            bump = math.exp(-v * 6) * math.sin(v * 24)
+            P.update(sq=-.06 * bump, coif=-10 * bump, y=2 * bump, eye=3, mouth=1, lookv=-1)
+        elif t < 6.0:                                 # outré : il menace le goéland du poing
+            v = t - 3.5
+            k = win(v, 0, .35) * (1 - win(v, 2.1, 2.5))
+            sh = math.sin(v * 26) * 6 * k
+            a = ik(-1, -34 + sh, -76 + sh * .5)
+            P.update(la1=lerp(10, a[0], k), la2=lerp(8, a[1], k), eye=5, mouth=4, look=-.8, lookv=-.6, rot=-3 * k,
+                     head=-5 * k + math.sin(v * 13) * 2 * k)
+        else:                                         # il secoue la tête pour s'en débarrasser, en soupirant
+            v = t - 6.0
+            k = win(v, 0, .3) * (1 - win(t, self.dur - .9, self.dur - .3))
+            P.update(head=9 * math.sin(v * 16) * k * (1 - win(v, .8, 1.6)), coif=7 * math.sin(v * 16) * k, eye=2, mouth=3,
+                     sq=.015 * math.sin(v * 16) * k)
+        return P
+
+    def splat_alpha(self, t):
+        if t < self.HIT:
+            return 0.0
+        return 1.0 - win(t, 6.2, 7.4)                 # il s'en débarrasse en secouant la tête
+
+    def front(self, p, t, gp, P):
+        x, y, flap, facing = self.gull(t)
+        if x > -146:
+            draw_gull(p, x, y, flap, 1.15, facing)
+        if self.DROP <= t < self.HIT:                 # la fiente tombe (elle accélère)
+            u = (t - self.DROP) / (self.HIT - self.DROP)
+            dx = lerp(self.gull(self.DROP)[0], self.SX, u)
+            dy = lerp(self.gull(self.DROP)[1] + 4, self.SY + P["y"], u * u)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#f4f6f0"))
+            p.drawEllipse(QPointF(dx, dy), 2.2, 3.2)
+        a = self.splat_alpha(t)
+        if a > .01:                                   # la tache sur le béret, avec ses coulures
+            sx, sy = self.SX + P["x"], self.SY + P["y"]
+            v = t - self.HIT
+            grow = _cl(v / .12)
+            drip = _cl(v / 1.4)
+            c = QColor("#f4f6f0")
+            c.setAlphaF(a)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            for ox, oy, r in ((0, 0, 4.6), (-4, 1.2, 2.6), (4.2, .8, 2.9), (1.5, -2.2, 2.4)):
+                p.drawEllipse(QPointF(sx + ox * grow, sy + oy * grow), r * grow, r * .78 * grow)
+            p.drawRoundedRect(QRectF(sx - 5.2, sy, 1.8, 2 + 5 * drip), .9, .9)
+            p.drawEllipse(QPointF(sx - 4.3, sy + 2 + 5 * drip), 1.3, 1.3)
+            p.drawRoundedRect(QRectF(sx + 3, sy, 1.6, 1.5 + 3 * drip), .8, .8)
+            c2 = QColor("#c9cdb8")
+            c2.setAlphaF(a * .8)
+            p.setBrush(c2)
+            p.drawEllipse(QPointF(sx + .8, sy + .4), 1.6, 1.1)
+            if v < .35:                               # éclaboussures
+                for k in range(5):
+                    ang = math.radians(-160 + k * 35)
+                    d = 4 + v * 40
+                    c3 = QColor("#f4f6f0")
+                    c3.setAlphaF(_cl(1 - v / .35))
+                    p.setBrush(c3)
+                    p.drawEllipse(QPointF(sx + math.cos(ang) * d, sy + math.sin(ang) * d * .6), .9, .9)
+        for t0, txt, tx, ty in ((self.HIT - .1, "Kiaaa !", None, None), (3.6, "Hé !!", -46, -150), (7.0, "Pfff…", 22, -146)):
+            k = (t - t0) / 1.3
+            if 0 <= k <= 1:
+                if tx is None:
+                    tx, ty = self.gull(t)[0] - 18, self.gull(t)[1] - 12
+                c = QColor(TXT)
+                c.setAlphaF(_cl(min(k * 6, (1 - k) * 2.5)))
+                f = QFont()
+                f.setPointSizeF(8.5)
+                f.setBold(True)
+                p.setFont(f)
+                p.setPen(c)
+                p.drawText(QPointF(tx, ty), txt)
+
+
+def _tube(p, a, b, w0, w1, col, edge=None):
+    """Tube conique de a vers b (largeur w0 puis w1), pour les instruments."""
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    n = math.hypot(dx, dy) or 1
+    nx, ny = -dy / n, dx / n
+    path = QPainterPath(QPointF(a.x() + nx * w0 / 2, a.y() + ny * w0 / 2))
+    path.lineTo(QPointF(b.x() + nx * w1 / 2, b.y() + ny * w1 / 2))
+    path.lineTo(QPointF(b.x() - nx * w1 / 2, b.y() - ny * w1 / 2))
+    path.lineTo(QPointF(a.x() - nx * w0 / 2, a.y() - ny * w0 / 2))
+    path.closeSubpath()
+    p.setPen(QPen(QColor(edge), 1.1) if edge else Qt.PenStyle.NoPen)
+    p.setBrush(QColor(col))
+    p.drawPath(path)
+    return nx, ny
+
+
+class ABagad(GAnim):
+    """Gaël défile avec le bagad : il marche au pas et joue de la bombarde ; les notes s'envolent du pavillon."""
+    name, label, dur = "bagad", "Le bagad", 8.6
+    BEAT = .5
+    ANG = math.radians(32)          # bombarde inclinée vers l'avant
+
+    def k(self, t):
+        return win(t, .2, .8) * (1 - win(t, self.dur - .8, self.dur - .2))
+
+    def pts(self, s):
+        """Point de la bombarde à la distance s de l'embouchure (repère du corps, hanches à l'origine)."""
+        return 2 + math.sin(self.ANG) * s, -56 + math.cos(self.ANG) * s
+
+    def pose(self, t, P):
+        k = self.k(t)
+        b = t / self.BEAT
+        step = math.sin(math.pi * b)
+        lift = abs(step)
+        even = int(b) % 2 == 0
+        P.update(y=-1.5 * lift * k, x=6 * math.sin(2 * math.pi * t / (self.BEAT * 8)) * k, head=-4 * k + 1.5 * step * k,
+                 eye=1 if k > .5 else 0, mouth=1 if k > .3 else 0)
+        if even:
+            P.update(ll1=4 + 20 * lift * k, ll2=36 * lift * k)
         else:
-            v = t - self.LEAVE
-            k = win(v, .3, .7) * (1 - win(t, self.dur - .6, self.dur))
-            P.update(la1=lerp(10, 58, k), la2=lerp(8, 82, k), ra1=lerp(10, 58, k), ra2=lerp(8, 82, k), eye=2 if v < 1.6 else 1,
-                     mouth=0 if v < 1.6 else 2, lookv=-.5 * (1 - win(v, 1, 2)), look=-.6 * (1 - win(v, 1, 2)), y=-2 * math.sin(k * math.pi))
+            P.update(rl1=4 + 20 * lift * k, rl2=36 * lift * k)
+        up, lo = ik(-1, *self.pts(17)), ik(1, *self.pts(31))
+        fing = math.sin(t * 15) * 4 * k        # les doigts bougent sur les trous
+        P.update(la1=lerp(10, up[0], k), la2=lerp(8, up[1] + fing, k), ra1=lerp(10, lo[0], k), ra2=lerp(8, lo[1] - fing, k))
         return P
 
     def front(self, p, t, gp, P):
-        x, y, flap, perched = self.gull(t)
-        if perched:
-            v = t - self.LAND
-            peck = max(0.0, math.sin(v * 9)) * 3 if 0.5 < v < 1.6 else 0
-            y = -152 + P["y"] + peck * .4
-            x = 2 + math.sin(v * 2) * 2
-            if 2.1 < v < 3.0:
-                y -= 6 * math.sin((v - 2.1) / .9 * math.pi)
-                flap = 30 * math.sin(v * 20)
-            draw_gull(p, x, y, flap, 1.25, -1 if v < 2.5 else 1, perched=True)
+        k = self.k(t)
+        if k < .05:
+            return
+        T = gp.body_transform(P)
+        a = T.map(QPointF(*self.pts(0)))
+        b = T.map(QPointF(*self.pts(44)))
+        m = T.map(QPointF(*self.pts(36)))
+        p.save()
+        p.setOpacity(_cl(k * 2))
+        _tube(p, a, m, 3.2, 5.6, "#8a5a32", "#4a2e18")
+        _tube(p, m, b, 5.6, 13.0, "#9b6a3c", "#4a2e18")
+        for s_ in (8, 22, 35):                            # bagues de laiton
+            q = T.map(QPointF(*self.pts(s_)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#e2b04a"))
+            p.drawEllipse(q, 3.2 + s_ * .04, 1.4)
+        p.setBrush(QColor("#2b1a0d"))                     # anche
+        p.drawEllipse(a, 1.6, 1.6)
+        p.restore()
+        for i in range(4):                                # notes qui s'envolent du pavillon
+            u = ((t * .8) + i / 4) % 1.0
+            col = QColor(grad((i * .27) % 1))
+            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.8)) * k)
+            draw_note(p, b.x() + 6 + u * 26 + math.sin(u * 6 + i) * 6, b.y() - 6 - u * 70, col, .95, i % 2 == 1)
+
+
+class AMixage(GAnim):
+    """Gaël derrière une table de mixage : il pousse les faders en rythme, casque au cou, les vumètres dansent."""
+    name, label, dur = "mixage", "La table de mixage", 8.0
+    DESK_Y = -44.0                   # dessus de la console (repère racine)
+
+    def k(self, t):
+        return win(t, .1, .7) * (1 - win(t, self.dur - .7, self.dur - .1))
+
+    def fader(self, i, t):
+        """Position (0 = bas, 1 = haut) du fader i : chaque piste a son mouvement."""
+        return .5 + .4 * math.sin(t * (1.3 + i * .37) + i * 1.9)
+
+    def pose(self, t, P):
+        k = self.k(t)
+        bob = math.sin(t * 2 * math.pi / .52)
+        hl = (-15 + 3 * math.sin(t * 2.1), -21 + 4 * (self.fader(1, t) - .5))
+        hr = (17 + 3 * math.sin(t * 1.7 + 1), -21 + 4 * (self.fader(4, t) - .5))
+        l, r = ik(-1, *hl), ik(1, *hr)
+        P.update(la1=lerp(10, l[0], k), la2=lerp(8, l[1], k), ra1=lerp(10, r[0], k), ra2=lerp(8, r[1], k),
+                 head=3 * bob * k, y=-1.2 * abs(bob) * k, eye=1 if k > .5 else 0, mouth=2 if k > .5 else 0, lookv=.6 * k)
+        return P
+
+    def back(self, p, t, gp, P):
+        k = self.k(t)
+        if k < .05:
+            return
+        T = gp.body_transform(P)                          # casque autour du cou
+        p.save()
+        p.setOpacity(k)
+        a, b = T.map(QPointF(-17, -42)), T.map(QPointF(17, -42))
+        p.setPen(ppen("#2a2f3a", 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(a.x(), a.y() - 9, b.x() - a.x(), 18), 180 * 16, 180 * 16)
+        p.restore()
+
+    def front(self, p, t, gp, P):
+        k = self.k(t)
+        if k < .02:
+            return
+        p.save()
+        p.translate(0, (1 - k) * 60)                     # la console monte du bas
+        p.setOpacity(_cl(k * 1.5))
+        top, x0, x1 = self.DESK_Y, -50.0, 50.0
+        body = QPainterPath(QPointF(x0, top))
+        body.lineTo(QPointF(x1, top))
+        body.lineTo(QPointF(x1 + 4, 2))
+        body.lineTo(QPointF(x0 - 4, 2))
+        body.closeSubpath()
+        p.setPen(QPen(QColor("#0b0f17"), 1.2))
+        p.setBrush(QColor("#2b3240"))
+        p.drawPath(body)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#3a4354"))
+        p.drawRoundedRect(QRectF(x0 + 2, top + 2, x1 - x0 - 4, 9), 2, 2)
+        for i in range(6):                                # tranches : bouton, fader, vumètre
+            cx = x0 + 10 + i * 16
+            p.setBrush(QColor("#c9d2e3"))
+            p.drawEllipse(QPointF(cx, top + 6.5), 2.4, 2.4)
+            p.setPen(ppen("#11151d", 1.6))
+            p.drawLine(QPointF(cx, top + 15), QPointF(cx, top + 37))
+            p.setPen(Qt.PenStyle.NoPen)
+            f = self.fader(i, t)
+            p.setBrush(QColor(ACC if i in (1, 4) else "#e8ecf3"))
+            p.drawRoundedRect(QRectF(cx - 4, top + 33 - f * 18 - 2, 8, 4.5), 1.2, 1.2)
+            lvl = _cl(f * .9 + .25 * abs(math.sin(t * 9 + i * 1.7)))
+            for j in range(5):                            # diodes
+                on = j < lvl * 5
+                col = "#3ddc84" if j < 3 else ("#ffd23f" if j < 4 else "#ff4d5e")
+                p.setBrush(QColor(col) if on else QColor("#1a1f29"))
+                p.drawRect(QRectF(cx + 4.5, top + 33 - j * 4, 2, 2.6))
+        p.setBrush(QColor("#ff4d5e") if int(t * 2) % 2 == 0 else QColor("#6b1f27"))   # voyant ON AIR
+        p.drawRoundedRect(QRectF(x1 - 18, top - 7, 16, 6), 2, 2)
+        f = QFont()
+        f.setPointSizeF(3.6)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(x1 - 18, top - 7, 16, 6), Qt.AlignmentFlag.AlignCenter, "ON AIR")
+        p.restore()
+        for i in range(3):
+            u = ((t * .6) + i / 3) % 1.0
+            col = QColor(ACC)
+            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.6)) * k)
+            draw_note(p, -38 + i * 34 + math.sin(u * 5 + i) * 6, -150 - u * 50, col, .85, i == 1)
+
+
+RAINBOW = ("#e40303", "#ff8c00", "#ffed00", "#008026", "#004dff", "#750787")
+PROGRESS = ("#ffffff", "#f5a9b8", "#5bcefa", "#613915", "#000000")
+
+
+class AFierte(GAnim):
+    """Gaël agite le drapeau des fiertés (arc-en-ciel et chevron « Progress », pour toutes et tous) ; des cœurs aux
+    couleurs de l'arc-en-ciel s'envolent. Bev est un logiciel ouvert à toutes et à tous."""
+    name, label, dur = "fierte", "La marche des fiertés", 8.4
+
+    def k(self, t):
+        return win(t, .2, .8) * (1 - win(t, self.dur - .9, self.dur - .3))
+
+    def pose(self, t, P):
+        k = self.k(t)
+        w = math.sin(t * 5.2)
+        a = ik(1, 30 + 6 * w, -96 + 3 * abs(w))
+        hop = abs(math.sin(t * 2 * math.pi / .9))
+        P.update(ra1=lerp(10, a[0], k), ra2=lerp(8, a[1], k), la1=lerp(10, 40, k), la2=lerp(8, 60, k),
+                 y=-3 * hop * k, rot=2 * w * k, eye=1 if k > .4 else 0, mouth=2 if k > .4 else 0, look=.5 * k, lookv=-.4 * k)
+        return P
+
+    def front(self, p, t, gp, P):
+        k = self.k(t)
+        if k < .05:
+            return
+        h = gp.hand_pos(P, 1)
+        tip = QPointF(h.x() + 3, h.y() - 74)
+        p.save()
+        p.setOpacity(_cl(k * 2))
+        p.setPen(ppen("#d6c3a1", 2.4))                    # hampe
+        p.drawLine(QPointF(h.x() - 1, h.y() + 10), tip)
+        W, H, n = 44.0, 30.0, 12
+        x0, y0 = tip.x() + 1, tip.y() + 1
+
+        def wave(u):
+            return math.sin(u * 3.2 - t * 7) * 3.2 * u
+
+        for i, col in enumerate(RAINBOW):                 # bandes de l'arc-en-ciel, qui ondulent
+            path = QPainterPath(QPointF(x0, y0 + i * H / 6))
+            for j in range(n + 1):
+                u = j / n
+                path.lineTo(QPointF(x0 + u * W, y0 + i * H / 6 + wave(u)))
+            for j in range(n, -1, -1):
+                u = j / n
+                path.lineTo(QPointF(x0 + u * W, y0 + (i + 1) * H / 6 + wave(u)))
+            path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(col))
+            p.drawPath(path)
+        for i, col in enumerate(PROGRESS):                # chevron « Progress » (trans, personnes racisées)
+            d = (len(PROGRESS) - i) * 3.2
+            path = QPainterPath(QPointF(x0, y0))
+            path.lineTo(QPointF(x0 + d, y0 + H / 2 + wave(d / W)))
+            path.lineTo(QPointF(x0, y0 + H))
+            path.closeSubpath()
+            p.setBrush(QColor(col))
+            p.drawPath(path)
+        p.restore()
+        for i in range(6):                                # cœurs arc-en-ciel
+            u = ((t * .45) + i / 6) % 1.0
+            col = QColor(RAINBOW[i])
+            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.8)) * k)
+            draw_heart(p, -40 + (i % 3) * 14 + math.sin(u * 5 + i) * 6, -96 - u * 100, 1.0 + .3 * (i % 2), col)
+
+
+class AAntenne(GAnim):
+    """Gaël grimpe au pylône de l'émetteur FM, salue tout en haut pendant que les ondes partent, puis redescend en
+    glissant."""
+    name, label, dur = "antenne", "Tout en haut du pylône FM", 9.6
+    UP0, UP1 = 1.0, 4.6               # montée
+    TOP1 = 6.8                         # fin du salut, tout en haut
+    DOWN1 = 7.7                        # fin de la glissade
+    H = -66.0                          # hauteur atteinte (Gaël monte de 66)
+
+    def height(self, t):
+        if t < self.UP0:
+            return 0.0
+        if t < self.UP1:                               # par à-coups : une prise de main à chaque fois
+            u = (t - self.UP0) / (self.UP1 - self.UP0)
+            steps = 6
+            s = u * steps
+            return self.H * (int(s) + ss(s - int(s))) / steps
+        if t < self.TOP1:
+            return self.H
+        return self.H * (1 - ss(_cl((t - self.TOP1) / (self.DOWN1 - self.TOP1))))
+
+    def pose(self, t, P):
+        y = self.height(t)
+        P.update(y=y)
+        if self.UP0 <= t < self.UP1:
+            u = (t - self.UP0) / (self.UP1 - self.UP0) * 6
+            ph = u - int(u)
+            right = int(u) % 2 == 0
+            hi, lo = (8, -112 - 10 * ss(ph)), (8, -78 + 6 * ss(ph))
+            r = ik(1, *(hi if right else lo))
+            l = ik(-1, -hi[0], (lo if right else hi)[1])
+            P.update(ra1=r[0], ra2=r[1], la1=l[0], la2=l[1], lookv=-1, eye=0, mouth=0,
+                     ll1=30 if right else 6, ll2=50 if right else 10, rl1=6 if right else 30, rl2=10 if right else 50)
+        elif self.UP1 <= t < self.TOP1:
+            v = t - self.UP1
+            l = ik(-1, -8, -100)
+            wave_ = math.sin(v * 11)
+            r = ik(1, 34 + 6 * wave_, -112)
+            P.update(la1=l[0], la2=l[1], ra1=r[0], ra2=r[1], eye=1, mouth=2, look=.4, rl1=30, rl2=50, ll1=10, ll2=14)
+        elif t < self.DOWN1:                             # glissade (yeux écarquillés)
+            l, r = ik(-1, -8, -96), ik(1, 8, -96)
+            P.update(la1=l[0], la2=l[1], ra1=r[0], ra2=r[1], eye=3, mouth=1, ll1=20, ll2=30, rl1=20, rl2=30)
         else:
-            draw_gull(p, x, y, flap, 1.25, -1 if t < self.LAND else 1)
-        if self.LEAVE <= t < self.LEAVE + 1.1:     # « Kiaaa ! »
-            k = (t - self.LEAVE) / 1.1
-            c = QColor(TXT)
-            c.setAlphaF(_cl(min(k * 5, (1 - k) * 2)))
-            f = QFont()
-            f.setPointSizeF(8.5)
-            f.setBold(True)
-            p.setFont(f)
-            p.setPen(c)
-            p.drawText(QPointF(x - 20, y - 12), "Kiaaa !")
-        if t >= self.LEAVE:                  # plume qui tombe en zigzag
-            u = (t - self.LEAVE) / 3.0
-            if u <= 1:
-                fx = 4 + math.sin(u * 9) * 14
-                fy = lerp(-150, -6, u)
-                c = QColor("#ffffff")
-                c.setAlphaF(_cl((1 - u) * 3))
-                p.save()
-                p.translate(fx, fy)
-                p.rotate(math.sin(u * 9) * 40)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(c)
-                p.drawEllipse(QPointF(0, 0), 2.2, 6)
-                p.setPen(QPen(qc("#b9c3d1", c.alpha()), .8))
-                p.drawLine(QPointF(0, -6), QPointF(0, 8))
-                p.restore()
+            v = t - self.DOWN1
+            bump = math.exp(-v * 5) * math.sin(v * 18)
+            P.update(sq=-.05 * bump, eye=1, mouth=2)
+        return P
+
+    def back(self, p, t, gp, P):
+        k = win(t, 0, .6) * (1 - win(t, self.dur - .6, self.dur))
+        if k < .02:
+            return
+        p.save()
+        p.setOpacity(k)
+        top = -206.0
+        legs = ((-24.0, 0.0, -3.0, top), (24.0, 0.0, 3.0, top))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for x0, y0, x1, y1 in legs:
+            p.setPen(ppen("#c9d2e3", 2.4))
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+        y, i = 0.0, 0
+        while y > top + 14:                              # croisillons, bandes rouges et blanches vers le haut
+            y2 = y - 15
+            w1 = lerp(24, 3, y / top)
+            w2 = lerp(24, 3, y2 / top)
+            col = ("#e5483f" if (i // 2) % 2 else "#e9edf4") if y < top * .55 else "#9aa6ba"
+            p.setPen(ppen(col, 1.3))
+            p.drawLine(QPointF(-w1, y), QPointF(w2, y2))
+            p.drawLine(QPointF(w1, y), QPointF(-w2, y2))
+            p.drawLine(QPointF(-w2, y2), QPointF(w2, y2))
+            y, i = y2, i + 1
+        for yy in (top + 22, top + 34):                  # dipôles de l'antenne
+            p.setPen(ppen("#e9edf4", 1.6))
+            p.drawLine(QPointF(-11, yy), QPointF(11, yy))
+        on = int(t * 2.4) % 2 == 0                       # balise rouge
+        p.setPen(Qt.PenStyle.NoPen)
+        if on:
+            p.setBrush(qc("#ff3b30", 70))
+            p.drawEllipse(QPointF(0, top - 3), 7, 7)
+        p.setBrush(QColor("#ff3b30") if on else QColor("#7a1d18"))
+        p.drawEllipse(QPointF(0, top - 3), 2.6, 2.6)
+        p.restore()
+        if self.UP1 <= t < self.DOWN1 + .4:              # les ondes partent du sommet
+            for j in range(3):
+                u = ((t - self.UP1) * .7 + j / 3) % 1.0
+                c = qc(G_AMBER, int(255 * (1 - u) * k))
+                rad = 8 + u * 30
+                p.setPen(ppen(c, 2))
+                for sgn in (-1, 1):
+                    p.drawArc(QRectF(-rad, top + 22 - rad, 2 * rad, 2 * rad), (0 if sgn > 0 else 180) * 16 - 40 * 16, 80 * 16)
 
 
 class ACafe(GAnim):
@@ -1224,27 +1558,6 @@ class ACafe(GAnim):
             p.drawLine(QPointF(-3 + i * 3 + math.sin(u * 6 + i) * 1.5, -14 - u * 12),
                        QPointF(-3 + i * 3 + math.sin(u * 6 + i + 1) * 1.5, -17 - u * 12))
         p.restore()
-
-
-class ACasque(GAnim):
-    name, label, dur = "casque", "Le morceau préféré", 5.0
-
-    def pose(self, t, P):
-        k = win(t, .3, .8) * (1 - win(t, 4.4, 4.9))
-        b = t * 2 * math.pi / .55
-        P.update(head=lerp(0, 7 * math.sin(b), k), y=-1.6 * k * abs(math.sin(b / 2)), eye=1 if k > .3 else 0, mouth=2 if k > .5 else 0,
-                 la1=lerp(10, 70, k), la2=lerp(8, 90, k))
-        return P
-
-    def front(self, p, t, gp, P):
-        k = win(t, .3, .8) * (1 - win(t, 4.4, 4.9))
-        if k <= .01:
-            return
-        for i in range(3):
-            u = ((t * .7) + i / 3) % 1.0
-            col = QColor(ACC)
-            col.setAlphaF(_cl(min(u * 5, (1 - u) * 1.6)) * k)
-            draw_note(p, 30 + math.sin(u * 5 + i) * 8, -110 - u * 55, col, .8, i == 1)
 
 
 class AEtire(GAnim):
@@ -1414,7 +1727,8 @@ class AMaj(GAnim):
         p.restore()
 
 
-G_ANIMS = [AGavotte(), ACrepes(), ACrachin(), AGoeland(), ACafe(), ACasque(), AEtire(), AHoquet()]
+G_ANIMS = [AGavotte(), ACrepes(), ACrachin(), AGoeland(), ACafe(), AEtire(), AHoquet(), ABagad(), AMixage(), AFierte(),
+           AAntenne()]
 G_HELLO = AHello()
 G_MAJ = AMaj()
 

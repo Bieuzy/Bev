@@ -728,10 +728,6 @@ class AntenneMixin:
             border = {"flux": "#ff4d5e", "son": "#ff7a1a", "secours": SECOURS_Y}.get(kind)
             self.centralWidget().set_border(border)
             if kind in ("flux", "son"):
-                if kind not in self._air_beeped:            # un seul bip par panne (la sirène, si elle est cochée, répète)
-                    self._air_beeped.add(kind)
-                    if self.data.get("alerts", {}).get("sound", True):
-                        self.alerts.beep()
                 self.log("⚠ Rupture de flux : " + ", ".join(bad) if kind == "flux" else
                          f"⚠ Silence à l'antenne depuis {e.silent_ms // 1000} s : rien ne prend le relais.")
             elif prev in ("flux", "son"):

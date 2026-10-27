@@ -414,7 +414,7 @@ class SpeechBubble(QFrame):
         self.tip = QPointF(0, 0)                  # pointe de la queue, en coordonnées de la bulle
         self.k = 1.0                              # 0 -> 1 : apparition
         self.lay = QVBoxLayout(self)
-        m = (34, 12, 24, 20) if tail == "left" else (16, 30, 24, 20)
+        m = {"left": (34, 12, 24, 20), "top": (16, 30, 24, 20), "bottom": (14, 12, 17, 34)}[tail]
         self.lay.setContentsMargins(*m)
         self.lay.setSpacing(8)
         self.anim = QVariantAnimation(self)
@@ -447,6 +447,8 @@ class SpeechBubble(QFrame):
         self.anim.start()
 
     def body(self):
+        if self.tail == "bottom":
+            return QRectF(self.rect()).adjusted(2, 2, -5, -24)
         return QRectF(self.rect()).adjusted(22 if self.tail == "left" else 2, 20 if self.tail == "top" else 2, -11, -11)
 
     def paintEvent(self, e):
@@ -467,6 +469,12 @@ class SpeechBubble(QFrame):
             tail.moveTo(a1)
             tail.quadTo(QPointF(r.left() - 4, y0 + 4), tp)
             tail.quadTo(QPointF(r.left() - 2, y0 + 16), a2)
+        elif self.tail == "bottom":
+            x0 = min(max(tp.x() - 10, r.left() + 18), r.right() - 34)
+            a1, a2 = QPointF(x0, r.bottom() - 2), QPointF(x0 + 20, r.bottom() - 2)
+            tail.moveTo(a1)
+            tail.quadTo(QPointF(x0 + 4, r.bottom() + 4), tp)
+            tail.quadTo(QPointF(x0 + 16, r.bottom() + 2), a2)
         else:
             x0 = min(max(tp.x() - 14, r.left() + 18), r.right() - 34)
             a1, a2 = QPointF(x0, r.top() + 2), QPointF(x0 + 20, r.top() + 2)

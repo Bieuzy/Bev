@@ -80,6 +80,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         QTimer.singleShot(2600, self.after_update_greet)
         QTimer.singleShot(1200, self.warm_pages)          # pages cachées prêtes avant le premier clic sur un onglet
         QTimer.singleShot(6500, self.guide_start)         # premier lancement : Gaël guide jusqu'à la première antenne
+        QTimer.singleShot(300, self.sounds_boot)           # sons de Windows coupés pendant que Bev est ouvert (option)
         QTimer.singleShot(20000, self.express_settle)
         if not self.data.get("np_tried") and np is None:
             self.data["np_tried"] = True
@@ -802,6 +803,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             os.remove(self.MARK)                  # fermeture normale : pas de reprise automatique au prochain lancement
         except OSError:
             pass
+        win_sounds_restore()                      # sons de Windows rétablis (option « Couper les sons de Windows »)
         try:
             self.save_all()
         except Exception as _ex:

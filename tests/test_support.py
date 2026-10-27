@@ -64,6 +64,7 @@ def win(tmp_path_factory):
     old = os.environ.get("HOME"), os.environ.get("USERPROFILE"), bc.CONF
     os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
     bc.CONF = str(home / ".broadcast_tool.json")      # jamais les vrais réglages de la radio (tests lancés sur son poste)
+    bc.WIN_SOUNDS_BAK = str(home / "sons-windows.json")  # ni les sons de Windows de ce poste
     app = QApplication.instance() or QApplication([sys.argv[0]])
     w = bev.MainWindow()
     w.resize(1366, 768)
@@ -132,3 +133,118 @@ def test_guide_premier_lancement(win):
     assert S.get("guide_done") and win.upd_bubble is None
     win.guide_start()                                                 # « Ne plus afficher » : plus jamais de guide
     assert not getattr(win, "_guide_on", False)
+
+
+# ------------------------------------------------------------------ sons de Windows (registre simulé)
+class _FakeWinreg:
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, REG_EXPAND_SZ = 1, 2, 1, 2
+
+    def __init__(self):
+        self.vals = {r"AppEvents\Schemes": (".Default", 1),
+                     r"AppEvents\Schemes\Apps\.Default\SystemAsterisk\.Current": (r"%SystemRoot%\media\Windows Background.wav", 2),
+                     r"AppEvents\Schemes\Apps\.Default\Notification.Default\.Current": (r"C:\Sons\ding.wav", 1)}
+
+    class _K:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def OpenKey(self, base, path, *a):
+        if not isinstance(base, int):
+            path = base.path + "\\" + path
+        if not any(k == path or k.startswith(path + "\\") for k in self.vals):
+            raise OSError(path)
+        return self._K(path)
+
+    def EnumKey(self, k, i):
+        kids = sorted({p[len(k.path) + 1:].split("\\")[0] for p in self.vals if p.startswith(k.path + "\\")})
+        if i >= len(kids):
+            raise OSError("fin")
+        return kids[i]
+
+    def QueryValueEx(self, k, name):
+        if k.path not in self.vals:
+            raise OSError(k.path)
+        return self.vals[k.path]
+
+    def SetValueEx(self, k, name, _r, typ, val):
+        self.vals[k.path] = (val, typ)
+
+
+def test_sons_windows_coupes_puis_retablis(tmp_path, monkeypatch):
+    fake = _FakeWinreg()
+    before = dict(fake.vals)
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr(bc, "SYS", "Windows")
+    monkeypatch.setattr(bc, "WIN_SOUNDS_BAK", str(tmp_path / "sons-windows.json"))
+    assert bc.win_sounds_mute()
+    ev = [v for k, v in fake.vals.items() if k.endswith(".Current")]
+    assert ev and all(v[0] == "" for v in ev) and fake.vals[r"AppEvents\Schemes"][0] == ".None"
+    assert bc.win_sounds_mute()                       # deuxième coupure (après un plantage) : la sauvegarde d'origine reste
+    assert bc.win_sounds_restore()
+    assert fake.vals == before                        # tout revient exactement (type REG_EXPAND_SZ compris)
+    assert not (tmp_path / "sons-windows.json").exists()
+    assert not bc.win_sounds_restore()                # rien à rétablir
+
+
+# ------------------------------------------------------------------ voyant « Prévenir en cas de panne »
+def test_voyant_vert_seulement_apres_un_envoi_reussi(win):
+    a = win.alerts
+    win.data["alerts"].update(mail_on=True, mail_to="radio@exemple.bzh", mail_host="smtp.exemple.bzh", url="", sms_on=False)
+    win.data["alerts"].pop("verified", None)
+    win.alert_summary()
+    assert a.chan_status("mail") == "a_tester" and "envoie un test" in win.al_head.text()
+    assert not win.al_phone.ok                        # pas de téléphone « vert » sans preuve
+    win.alert_result("mail", False, True)             # le test échoue
+    assert a.chan_status("mail") == "echec" and "échoué" in win.al_head.text() and not win.al_phone.ok
+    win.alert_result("mail", True, True)              # le test réussit
+    assert a.chan_status("mail") == "ok" and win.al_phone.ok and "Tu seras prévenu" in win.al_head.text()
+    win.data["alerts"]["mail_host"] = "smtp.autre.bzh"   # réglages modifiés : il faut retester
+    win.alert_summary()
+    assert a.chan_status("mail") == "a_tester" and not win.al_phone.ok
+    win.data["alerts"].update(mail_on=False)
+    win.alert_summary()
+
+
+def test_alertes_reseau_allegees(win, monkeypatch):
+    sent = []
+    monkeypatch.setattr(win.alerts, "send", lambda text, key=None, **k: sent.append(key))
+    now = [1000.0]
+    monkeypatch.setattr(bev.time, "time", lambda: now[0])
+    win._net_bad_since, win._net_alert_t = None, {}
+    for _ in range(10):                              # Wi-Fi faible pendant 4 min : rien ne part
+        win.net_alert("Internet : Wi-Fi faible", "out-net-down")
+        now[0] += 24
+    assert sent == []
+    now[0] += 120                                    # au-delà de 5 min : un message
+    win.net_alert("Internet : Wi-Fi faible", "out-net-down")
+    assert sent == ["out-net-down"]
+    for _ in range(20):                              # puis plus rien pendant une heure
+        now[0] += 60
+        win.net_alert("Internet : Wi-Fi faible", "out-net-down")
+    assert sent == ["out-net-down"]
+
+
+def test_animations_de_gael():
+    names = [a.name for a in bev.G_ANIMS]
+    assert "casque" not in names
+    for n in ("goeland", "bagad", "mixage", "fierte", "antenne"):
+        assert n in names
+    from PySide6.QtGui import QImage, QPainter
+    gp = bev.GaelPainter()
+    img = QImage(300, 300, QImage.Format.Format_ARGB32)
+    for a in bev.G_ANIMS:                            # chaque animation se dessine du début à la fin sans erreur
+        for i in range(12):
+            t = a.dur * i / 11
+            p = QPainter(img)
+            p.translate(150, 260)
+            P = a.pose(t, dict(bev.POSE0))
+            a.back(p, t, gp, P)
+            gp.draw(p, P, t=t, hand_r=a.hand_r(t), hand_l=a.hand_l(t))
+            a.front(p, t, gp, P)
+            p.end()

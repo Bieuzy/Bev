@@ -1334,14 +1334,18 @@ class Segmented(QWidget):
     """Sélecteur segmenté façon macOS."""
     changed = Signal(int)
 
-    def __init__(self, labels, w=56, h=32, parent=None):
+    def __init__(self, labels, w=56, h=32, parent=None, fit=False):
         super().__init__(parent)
         f = QFont(self.font())                       # chaque segment est assez large pour son texte (« Problèmes »
         f.setBold(True)                              # dépassait de sa pastille)
         f.setPointSizeF(9.5)
-        w = max(w, max(QFontMetrics(f).horizontalAdvance(t) for t in labels) + 20) if labels else w
+        tw = [QFontMetrics(f).horizontalAdvance(t) + 22 for t in labels]
+        w = max([w] + tw) if labels else w
         self.labels, self.w, self.h, self.val, self.pos = list(labels), w, h, 0, 0.0
-        self.setFixedSize(w * len(labels) + 6, h + 6)
+        # fit : chaque segment à la largeur de son texte (libellés de longueurs très différentes) ; sinon tous égaux
+        self.ws = [max(min(w, 56), x) for x in tw] if fit else [w] * len(labels)
+        self.xs = [3 + sum(self.ws[:k]) for k in range(len(self.ws))]
+        self.setFixedSize(sum(self.ws) + 6, h + 6)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.an = QVariantAnimation(self)
         self.an.setDuration(140)
@@ -1363,17 +1367,26 @@ class Segmented(QWidget):
             self.changed.emit(k)
 
     def mouseReleaseEvent(self, e):
-        k = int((e.position().x() - 3) // self.w)
+        x = e.position().x()
+        k = next((i for i in range(len(self.ws)) if self.xs[i] <= x < self.xs[i] + self.ws[i]), -1)
         if 0 <= k < len(self.labels) and k != self.val:
             self.setValue(k, True)
+
+    def _seg_rect(self, pos):
+        """Pastille pour une position (éventuellement entre deux segments, pendant qu'elle glisse)."""
+        i = max(0, min(len(self.ws) - 1, int(pos)))
+        j = min(len(self.ws) - 1, i + 1)
+        t = pos - i
+        x = self.xs[i] + (self.xs[j] - self.xs[i]) * t
+        w = self.ws[i] + (self.ws[j] - self.ws[i]) * t
+        return QRectF(x, 3, w, self.h)
 
     def paintEvent(self, e):
         p = new_painter(self)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor("#e3e6ee" if LIGHT else "#1a1f2b"))
-        p.drawRoundedRect(QRectF(1, 1, self.w * len(self.labels) + 4, self.h + 4), (self.h + 4) / 2, (self.h + 4) / 2)
-        x = 3 + self.pos * self.w
-        r = QRectF(x, 3, self.w, self.h)
+        p.drawRoundedRect(QRectF(1, 1, sum(self.ws) + 4, self.h + 4), (self.h + 4) / 2, (self.h + 4) / 2)
+        r = self._seg_rect(self.pos)
         if PSYCHE:
             soft_pill(p, r, ACC, mixc(ACC, "#c04bff", .5), self.h / 2)
         else:
@@ -1386,7 +1399,7 @@ class Segmented(QWidget):
         for k, t in enumerate(self.labels):
             on = abs(k - self.pos) < .5
             p.setPen(QColor(ONACC if on else LABEL_C))
-            p.drawText(QRectF(3 + k * self.w, 3, self.w, self.h), Qt.AlignmentFlag.AlignCenter, t)
+            p.drawText(QRectF(self.xs[k], 3, self.ws[k], self.h), Qt.AlignmentFlag.AlignCenter, t)
 
 
 # ------------------------------------------------------------------ navigation latérale / haute

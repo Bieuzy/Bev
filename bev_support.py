@@ -65,7 +65,7 @@ def settings_summary(data):
                f"seuil {fb.get('threshold')} dB, délai {fb.get('silence_s')} s")
     S = data.get("settings") or {}
     keep = ("mini", "perf", "theme", "mood", "nav", "look_v", "engine_proc", "resume_crash", "keep_awake", "topmost", "update_check",
-            "daily_log", "gael_ai", "siren", "disk_warn", "panic_key")
+            "daily_log", "gael_ai", "disk_warn", "panic_key", "mute_windows")
     opts = [f"{k}={S.get(k)}" for k in keep if k in S] + ([f"autostart={data.get('autostart')}"] if data.get("autostart") else [])
     out.append("Réglages : " + (", ".join(opts) if opts else "par défaut"))
     al = data.get("alerts") or {}
@@ -78,6 +78,25 @@ def settings_summary(data):
 
 class SupportMixin:
     """Partie de MainWindow : première prise en main et support."""
+
+    # ------------------------------------------------------------ sons de Windows
+    def set_mute_windows(self, on):
+        self.set_val("mute_windows", bool(on))
+        if on:
+            ok = win_sounds_mute()
+            self.log("Sons de Windows coupés (ils reviennent à la fermeture de Bev)." if ok else
+                     "Impossible de couper les sons de Windows (voir le rapport de support).")
+        elif win_sounds_restore():
+            self.log("Sons de Windows rétablis.")
+
+    def sounds_boot(self):
+        """Au lancement : sons coupés si l'option est cochée ; sinon, s'ils étaient restés coupés (Bev fermé brutalement),
+        ils sont rétablis."""
+        if self.data.get("settings", {}).get("mute_windows"):
+            if win_sounds_mute():
+                self.log("Sons de Windows coupés pendant que Bev est ouvert.")
+        elif win_sounds_restore():
+            self.log("Sons de Windows rétablis (ils étaient restés coupés après une fermeture brutale).")
 
     # ------------------------------------------------------------ « Prêt pour l'antenne ? »
     def readiness(self, prof=None):

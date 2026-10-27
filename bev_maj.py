@@ -15,7 +15,22 @@ NEWS = {
 - « Signaler un problème » (SOS et À propos) : un rapport prêt à envoyer (version, réglages, diagnostic, journaux), sans mot de passe, clé, adresse mail, numéro ni lien d'alerte. Enregistrer, copier, ou ouvrir directement la fiche de bug GitHub.
 - Les erreurs internes sont notées avec tous leurs détails ; Gaël propose de les signaler, l'antenne n'est jamais touchée.
 - Si Bev se ferme brutalement, il le dit au lancement suivant et propose d'envoyer le rapport.
-- Demander « signaler un bug » à Gaël ouvre aussi le rapport.""",
+- Demander « signaler un bug » à Gaël ouvre aussi le rapport.
+
+## Alertes et sons
+
+- « Prévenir en cas de panne » : le voyant vert ne s'allume que si l'envoi a vraiment réussi (test ou alerte). Configuré mais pas testé : orange ; test raté : rouge, avec le canal en cause.
+- Plus aucun bip dans Bev (l'option « Bip répété » est retirée) : les pannes se voient à l'écran et partent par message, mail ou SMS.
+- Nouveau réglage : couper les sons de Windows pendant que Bev est ouvert (ils reviennent à la fermeture).
+- Alertes sur la qualité d'Internet allégées : un message seulement si le problème dure 5 minutes, au plus une fois par heure.
+
+## Interface
+
+- Les bulles de Gaël restent dans sa colonne, au-dessus de lui : la page n'est plus cachée.
+- À propos : le phare de Bev, une présentation plus claire.
+- Automate de diffusion : fenêtre refaite, avec une explication simple, l'adresse à recopier et un bouton « Tester la réception ».
+- Journal : le filtre « Playlist de secours » montre les silences et les relèves.
+- Gaël : le goéland est devenu farceur (gare au béret !), et quatre nouvelles animations : le bagad, la table de mixage, la marche des fiertés et l'escalade du pylône FM.""",
     "1.3.0": """## Plus fluide
 
 - Changement d'onglet jusqu'à trois fois plus rapide, y compris le premier clic et juste après avoir changé la taille de la fenêtre : les onglets cachés sont préparés pendant les temps morts.

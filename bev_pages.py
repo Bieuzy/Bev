@@ -81,7 +81,7 @@ class PagesMixin1:
         QTimer.singleShot(0, fn)
 
     def bell(self):
-        QApplication.beep()
+        pass                                             # (plus aucun bip dans Bev)
 
     def copy_text(self, txt, what="Adresse"):
         QApplication.clipboard().setText(txt)
@@ -181,14 +181,11 @@ class PagesMixin1:
                 os.remove(self.MARK)
         except OSError:
             pass
-        if S.get("siren") and getattr(self, "alert_kind", None) in ("flux", "son") and self.prop_n % 2 == 0:
-            QApplication.beep()
         if S.get("disk_warn") and time.time() - self._disk_t > 1800:
             try:
                 d = self.rec_dir() or ""
                 if d and os.path.isdir(d) and shutil.disk_usage(d).free < 2e9:
                     self._disk_t = time.time()
-                    QApplication.beep()
                     self.log(f"⚠ Disque presque plein : moins de 2 Go libres pour les enregistrements ({d}).")
                     self.toast("Disque presque plein : moins de 2 Go libres", 6000)
             except OSError:
@@ -302,15 +299,21 @@ class PagesMixin1:
         sec.setStyleSheet(f"color:{MUT};font-size:10px;font-weight:800;letter-spacing:1px;margin-top:6px;")
         c.lay.addWidget(sec)
         for key, label, tip in (            # (anciennes « Propositions » : rangées ici, explication au survol)
-                ("siren", "Bip répété tant qu'une panne dure", "Un bip toutes les 10 s sur cet ordinateur, jusqu'au retour de l'antenne (au lieu d'un seul)."),
                 ("resume_crash", "Reprendre l'antenne après une fermeture brutale", "Si Bev ou l'ordinateur a planté en pleine émission, la diffusion repart toute seule au prochain lancement."),
                 ("daily_log", "Garder un journal par jour dans un fichier", "Un fichier texte par jour dans le dossier « Bev_journaux » de votre dossier personnel."),
-                ("disk_warn", "Prévenir quand le disque des enregistrements se remplit", "Alerte (bip + journal) sous 2 Go libres, rappelée toutes les 30 minutes."),
+                ("disk_warn", "Prévenir quand le disque des enregistrements se remplit", "Message à l'écran et dans le journal sous 2 Go libres, rappelé toutes les 30 minutes."),
                 ("panic_key", "Raccourci d'urgence Ctrl + Maj + S", "Bascule tout de suite sur la playlist de secours, et revient au direct en réappuyant.")):
             w = Switch(label)
             w.setToolTip(tip)
             w.setChecked(bool(S.get(key, False)))
             w.toggled.connect(lambda on, k=key: self.set_val(k, bool(on)))
+            c.lay.addWidget(w)
+        if SYS == "Windows":
+            w = Switch("Couper les sons de Windows pendant que Bev est ouvert")
+            w.setToolTip("Notifications, alertes et autres sons du système ne risquent plus de partir à l'antenne. "
+                         "Ils reviennent dès que Bev est fermé.")
+            w.setChecked(bool(S.get("mute_windows", False)))
+            w.toggled.connect(self.set_mute_windows)
             c.lay.addWidget(w)
         c.lay.addStretch(1)
         g.addWidget(c, 0, 1, 2, 1)
@@ -1002,23 +1005,57 @@ class PagesMixin1:
     def _page_about(self):
         pg = Page()
         g = pg.grid
-        hero = Card("Bev", "« Bev » signifie « direct » en breton.")
-        hero.lay.setSpacing(6)
-        hero.lay.addWidget(lab("Bev est un logiciel de diffusion radiophonique destiné aux radios associatives : diffusion vers Internet, "
-                               "la FM et le DAB+, enregistrement de l'antenne, playlist de secours, cartoucheur, processeur d'antenne "
-                               "et surveillance des flux, avec alerte en cas de panne.", "", True))
+        hero = Card()
+        hero.lay.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        logo = QLabel()                                   # le phare de Bev (le logo de l'application)
+        pm = QPixmap()
+        pm.loadFromData(base64.b64decode("".join(_ICON_B64) if not isinstance(_ICON_B64, str) else _ICON_B64))
+        if not pm.isNull():
+            dpr = self.devicePixelRatioF()
+            pm = pm.scaled(int(72 * dpr), int(72 * dpr), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pm.setDevicePixelRatio(dpr)
+            logo.setPixmap(pm)
+        logo.setFixedSize(72, 72)
+        top.addWidget(logo, 0, Qt.AlignmentFlag.AlignTop)
+        tv = QVBoxLayout()
+        tv.setSpacing(0)
+        tt = lab("Bev", "")
+        tt.setStyleSheet("font-size:30px;font-weight:800;letter-spacing:.5px;")
+        tv.addWidget(tt)
+        ts = lab("BROADCAST TOOL  ·  « direct » en breton", "")
+        ts.setStyleSheet(f"color:{ACCT};font-size:11px;font-weight:700;letter-spacing:1.5px;")
+        tv.addWidget(ts)
+        tv.addSpacing(4)
+        tv.addWidget(lab(f"Version {VERSION}", "mut"))
+        top.addLayout(tv, 1)
+        hero.lay.addLayout(top)
+        hero.lay.addSpacing(2)
+        hero.lay.addWidget(lab("Bev diffuse l'antenne des radios associatives. Tout ce qu'il faut tient dans une seule application :", "", True))
+        cs = QWidget()
+        cl = WrapRow(cs, 6)
+        cl.vsp = 6
+        ac = QColor(ACC)
+        rg = f"{ac.red()},{ac.green()},{ac.blue()}"
+        for txt in ("Internet", "FM", "DAB+", "Enregistrement et pige", "Playlist de secours", "Cartoucheur",
+                    "Processeur d'antenne", "Surveillance et alertes"):
+            c = QLabel(txt)
+            c.setStyleSheet(f"background:rgba({rg},22);border:1px solid rgba({rg},70);border-radius:11px;padding:3px 10px;"
+                            f"font-size:12px;font-weight:600;color:{ACCT};")
+            cl.addWidget(c)
+        cl.addStretch(1)
+        hero.lay.addWidget(cs)
         orig = lab("", "", True)
         orig.setTextFormat(Qt.TextFormat.RichText)
         orig.setOpenExternalLinks(True)
-        orig.setText(f"Sa création initiale a été réalisée en 2026 pour <a href='https://rbg.bzh' style='color:{ACCT}'>Radio Bro Gwened</a>"
-                     " (rbg.bzh), radio associative du pays vannetais.")
+        orig.setText(f"Né en 2026 à <a href='https://rbg.bzh' style='color:{ACCT}'>Radio Bro Gwened</a>, radio associative "
+                     "du pays vannetais.")
         hero.lay.addWidget(orig)
-        hero.lay.addWidget(lab("Bev est un logiciel libre (licence GNU GPL v3), utilisable gratuitement. Ses auteurs invitent chaque utilisatrice et chaque "
-                               "utilisateur à soutenir une radio associative de son choix : par un don, une adhésion ou du bénévolat.", "", True))
-        hero.lay.addWidget(lab("Les radios associatives défendent des valeurs essentielles : une presse libre et indépendante, sans "
-                               "financeur privé ; le travail d'enquête et d'information de proximité ; un rôle d'acteur culturel local, "
-                               "ouvert aux langues et aux expressions du territoire ; et une place de premier lieu d'éducation aux médias, "
-                               "où chacun peut apprendre à faire de la radio.", "mut", True))
+        hero.lay.addWidget(lab("Bev est un logiciel libre et gratuit (licence GNU GPL v3). En retour, soutenez une radio associative "
+                               "de votre choix : un don, une adhésion ou un peu de bénévolat.", "", True))
+        hero.lay.addWidget(lab("Les radios associatives font vivre une information libre et indépendante. Elles portent la culture "
+                               "et les langues de leur territoire. Et chacun peut y apprendre à faire de la radio.", "mut", True))
         k = lab("Trugarez ! Merci, et bonne antenne.", "")
         k.setStyleSheet(f"color:{ACCT};font-weight:700;font-size:14px;")
         hero.lay.addWidget(k)
