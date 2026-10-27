@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Captures d'écran de Bev (sans écran : QT_QPA_PLATFORM=offscreen), pour vérifier l'interface à chaque modification.
 Utilisation : python tools/captures.py [dossier]   -> un PNG par onglet et par taille de fenêtre.
 Les états de l'antenne (flux en ligne, flux en panne, playlist de secours) sont simulés pour la page Diffusion."""

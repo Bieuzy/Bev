@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Mise à jour express : prépare les deux fichiers joints à chaque Release GitHub.
   dist-express/bev-x.y.z.py   le code de Bev de cette version, en UN seul fichier (voir plus bas)
-  dist-express/bev-maj.json   le manifeste : version, socle (RUNTIME), empreinte SHA-256, taille, modules nécessaires
+  dist-express/bev-maj.json   le manifeste : version, socle (RUNTIME), empreinte SHA-256, taille, modules nécessaires,
+                              empreintes des installateurs. L'auteur le signe ensuite chez lui (tools/signer.py).
 Bev déjà installé télécharge ce fichier (~1 Mo) au lieu de l'installateur complet, vérifie l'empreinte et que tous les
 modules nécessaires sont présents dans son socle, puis redémarre dessus. Sinon, il propose l'installateur complet.
 
@@ -150,6 +152,16 @@ def main():
         fh.write(data)
     man = {"app": "Bev", "version": ver, "runtime": runtime, "file": name, "size": len(data),
            "sha256": hashlib.sha256(data).hexdigest()}
+    # Empreintes des installateurs de CETTE version (téléchargés depuis les constructions Windows / Mac dans
+    # dist-installers/) : une fois le manifeste signé par l'auteur (tools/signer.py), Bev ne lance un installateur
+    # téléchargé que s'il correspond exactement à l'une de ces empreintes.
+    inst = {}
+    for root, _, files in os.walk("dist-installers"):
+        for f in files:
+            if f.lower().endswith((".exe", ".dmg")):
+                with open(os.path.join(root, f), "rb") as fh:
+                    inst[f] = hashlib.sha256(fh.read()).hexdigest()
+    man["installers"] = dict(sorted(inst.items()))
     man["modules"] = [m for m in mods if m.split(".")[0] not in WINDOWS_ONLY]
     man["windows_modules"] = [m for m in mods if m.split(".")[0] in WINDOWS_ONLY]
     with open(os.path.join(OUT, "bev-maj.json"), "w", encoding="utf-8") as fh:

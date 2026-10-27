@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Préparation de la construction :
 1) icônes (.ico / .icns / .png) tirées du logo intégré au script ;
 2) image de démarrage (build/splash.png), affichée dès le double-clic sur Bev, avant même le chargement de l'application ;
