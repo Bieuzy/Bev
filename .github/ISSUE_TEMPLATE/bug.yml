@@ -1,0 +1,49 @@
+name: Signaler un problème
+description: Quelque chose ne marche pas comme prévu dans Bev
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci de prendre le temps de signaler ce problème !
+        Le plus simple : dans Bev, onglet **SOS** (ou **À propos**), bouton **Signaler un problème** : Bev prépare un rapport
+        (version, réglages, diagnostic, journaux) **sans mot de passe ni coordonnées**, et ouvre cette page pré-remplie.
+        Pour une faille de sécurité, n'ouvrez pas de fiche publique : utilisez « Report a vulnerability » (onglet Security).
+  - type: textarea
+    id: description
+    attributes:
+      label: Que s'est-il passé ?
+      description: Ce que vous avez vu, et ce que vous attendiez à la place.
+    validations:
+      required: true
+  - type: textarea
+    id: etapes
+    attributes:
+      label: Comment le reproduire ?
+      description: Les étapes, si vous les connaissez (onglet, bouton, réglage…).
+      placeholder: |
+        1. Onglet Diffusion
+        2. Clic sur Démarrer
+        3. …
+  - type: dropdown
+    id: antenne
+    attributes:
+      label: Effet sur l'antenne
+      options:
+        - Aucun (gêne dans l'interface)
+        - L'antenne a été perturbée (coupure, silence, son dégradé)
+        - Bev s'est fermé ou bloqué
+    validations:
+      required: true
+  - type: textarea
+    id: infos
+    attributes:
+      label: Version et système
+      description: Rempli automatiquement depuis Bev (À propos > Copier les infos sinon).
+      render: text
+  - type: textarea
+    id: rapport
+    attributes:
+      label: Rapport de Bev
+      description: Glissez ici le fichier « rapport-bev-….txt » enregistré par Bev (ou collez son contenu).

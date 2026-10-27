@@ -4,6 +4,18 @@ from bev_alertes import *  # noqa: F401,F403
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
+    "1.4.0": """## Première prise en main
+
+- « Prêt pour l'antenne ? » : au moment de démarrer, tout ce qui manque est montré d'un coup (entrée audio, flux, mot de passe, playlist de secours), avec un bouton pour régler chaque point.
+- Au premier lancement, Gaël indique l'étape suivante jusqu'à la première antenne (« Plus tard » ou « Ne plus afficher »).
+- Démarrage automatique et reprise après plantage : plus aucune fenêtre ne bloque un démarrage sans personne devant l'écran.
+
+## Support
+
+- « Signaler un problème » (SOS et À propos) : un rapport prêt à envoyer (version, réglages, diagnostic, journaux), sans mot de passe, clé, adresse mail, numéro ni lien d'alerte. Enregistrer, copier, ou ouvrir directement la fiche de bug GitHub.
+- Les erreurs internes sont notées avec tous leurs détails ; Gaël propose de les signaler, l'antenne n'est jamais touchée.
+- Si Bev se ferme brutalement, il le dit au lancement suivant et propose d'envoyer le rapport.
+- Demander « signaler un bug » à Gaël ouvre aussi le rapport.""",
     "1.3.0": """## Plus fluide
 
 - Changement d'onglet jusqu'à trois fois plus rapide, y compris le premier clic et juste après avoir changé la taille de la fenêtre : les onglets cachés sont préparés pendant les temps morts.

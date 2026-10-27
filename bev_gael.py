@@ -116,6 +116,10 @@ class AssistantKB:
             lambda: (self.state(), rs if (e() and any(o.state == "error" for o in e().outputs)) else None))
         add("Diagnostic", ["diagnostic", "verifie", "teste tout", "controle", "bilan", "check"], self.diagnose)
         add("Analyse du journal", ["journal", "historique des erreurs", "analyse", "logs"], lambda: (self.journal(), None))
+        add("Signaler un problème", ["bug", "signaler", "rapport", "support", "plante", "plantage", "beug", "remonter", "developpeur"],
+            lambda: ("Pour signaler un problème, je prépare un rapport (version, réglages, diagnostic, journaux) sans aucun mot de passe "
+                     "ni coordonnée. Tu pourras l'enregistrer, le copier ou ouvrir directement la page GitHub de Bev.",
+                     [("Signaler un problème", lambda: a.support_dialog())]))
         add("Flux en erreur", ["flux en erreur", "sortie en erreur", "flux", "erreur", "ne se connecte pas", "deconnecte", "serveur", "icecast", "shoutcast", "mot de passe", "401", "403", "refuse", "mountpoint", "connexion refusee", "timeout"],
             lambda: (self.output_help(), rs))
         add("Pas de son", ["pas de son", "silence", "plus de son", "rien ne sort", "muet", "inaudible", "ne s'entend pas", "on n'entend rien"],

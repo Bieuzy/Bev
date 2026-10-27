@@ -152,7 +152,7 @@ class PagesMixin1:
             pass
         if self._crashed and S.get("resume_crash") and not self.data.get("autostart"):
             self.log("Fermeture brutale détectée : reprise de l'antenne.")
-            QTimer.singleShot(3000, lambda: None if self.on_air else self.start())
+            QTimer.singleShot(3000, lambda: None if self.on_air else self.start(ask=False))
         self.prop_n, self._disk_t = 0, 0.0
         self.prop_tm = QTimer(self)
         self.prop_tm.timeout.connect(self.props_tick)
@@ -1054,6 +1054,7 @@ class PagesMixin1:
         h = QHBoxLayout()
         h.addWidget(btn("Copier les infos", "", lambda: self.copy_text("\n".join(f"{a} : {b}" for a, b in self.about_info), "Infos")))
         h.addWidget(btn("Vérifier les mises à jour", "", lambda: self.update_start(True)))
+        h.addWidget(btn("Signaler un problème", "", lambda: self.support_dialog()))
         h.addStretch(1)
         sy.lay.addLayout(h)
         g.addWidget(sy, 0, 1)

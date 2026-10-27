@@ -46,7 +46,7 @@ class MiseAJourMixin:
             else:
                 self._upd_express_ready = r["tag"]     # déjà téléchargée : il ne reste qu'à redémarrer
         if newer:
-            if manual or self.upd_bubble is None or getattr(self, "_upd_mode", "") == "info":
+            if manual or self.upd_bubble is None or getattr(self, "_upd_mode", "") in ("info", "guide"):
                 if getattr(self, "upd_pending", None) and getattr(self, "_upd_pending_tag", "") == r["tag"]:
                     return self.update_ready_bubble(r)
                 self.update_bubble(r)

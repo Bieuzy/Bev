@@ -724,6 +724,63 @@ def trace(where, ex=None):
         pass                                   # (le journal technique ne doit jamais gêner l'antenne)
 
 
+def trace_exc(where, etype, ex, tb):
+    """Erreur inattendue (non rattrapée) : notée AVEC sa pile d'appels complète dans le journal technique, pour pouvoir la
+    corriger. Même règle qu'ailleurs : une même erreur au même endroit, une fois par minute. Renvoie le résumé d'une ligne."""
+    try:
+        import traceback
+        txt = redact("".join(traceback.format_exception(etype, ex, tb)))
+        last = traceback.extract_tb(tb)[-1] if tb else None
+        sig = (where, etype.__name__, last.filename if last else "", last.lineno if last else 0)
+        now = time.time()
+        with _TRACE_LK:
+            if now - _TRACE_SEEN.get(sig, 0) < 60:
+                return None
+            _TRACE_SEEN[sig] = now
+            os.makedirs(os.path.dirname(TRACE_FILE), exist_ok=True)
+            if os.path.isfile(TRACE_FILE) and os.path.getsize(TRACE_FILE) > 512 * 1024:
+                os.replace(TRACE_FILE, TRACE_FILE + ".1")
+            with open(TRACE_FILE, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {where} : ERREUR NON RATTRAPÉE (version "
+                         f"{_bev_version()})\n{txt}\n")
+        place = f" ({os.path.basename(last.filename)}, ligne {last.lineno})" if last else ""
+        return redact(f"{etype.__name__}: {ex}")[:160] + place
+    except Exception:
+        return None
+
+
+def _bev_version():
+    try:
+        return sys.modules["bev_version"].VERSION
+    except Exception:
+        return "?"
+
+
+CRASH_FILE = os.path.join(os.path.expanduser("~"), "Bev_journaux", "bev-plantage.log")
+_CRASH_FH = []
+
+
+def crash_watch(who="interface"):
+    """Plantage brutal (fermeture sans message : erreur grave dans Qt, mémoire…) : Python écrit alors l'endroit du plantage
+    dans bev-plantage.log. Ce fichier reste vide si tout se passe bien. Renvoie le rapport d'un plantage PRÉCÉDENT, s'il y
+    en a un (et le met de côté dans bev-plantage-precedent.log), sinon ""."""
+    prev = ""
+    f = CRASH_FILE if who == "interface" else CRASH_FILE.replace(".log", f"-{who}.log")
+    try:
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        if os.path.isfile(f) and os.path.getsize(f) > 0:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                prev = fh.read()[-20000:]
+            os.replace(f, f.replace(".log", "-precedent.log"))
+        import faulthandler
+        fh = open(f, "w", encoding="utf-8")
+        faulthandler.enable(fh)
+        _CRASH_FH.append(fh)                    # (le fichier doit rester ouvert tant que Bev tourne)
+    except Exception as ex:
+        trace("crash_watch", ex)
+    return prev
+
+
 def have_module(name):
     try:
         if importlib.util.find_spec(name) is not None:
@@ -4053,6 +4110,9 @@ def _engine_worker_main():
         sys.setswitchinterval(0.002)
     except Exception:
         pass
+    crash_watch("moteur")                           # plantage brutal du moteur : noté pour le rapport de support
+    threading.excepthook = lambda a: trace_exc("moteur (fil " + str(getattr(a.thread, "name", "?")) + ")",
+                                               a.exc_type, a.exc_value, a.exc_traceback)
     if SYS == "Windows":                            # priorité « supérieure à la normale » : l'antenne passe avant le reste
         try:
             import ctypes

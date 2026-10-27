@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Faille de sécurité
+    url: https://github.com/Bieuzy/Bev/security/advisories/new
+    about: Signalement privé (ne pas publier de fiche).

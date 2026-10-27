@@ -199,29 +199,12 @@ class AntenneMixin:
         else:
             self.start()
 
-    def start(self):
+    def start(self, ask=True):
+        """Démarre l'antenne. ask=False : démarrage automatique (lancement, reprise après plantage), sans question."""
         prof = json.loads(json.dumps(self.collect_profile()))
-        if not shutil.which("ffmpeg"):
-            return err(self, "ffmpeg", "ffmpeg est introuvable (voir onglet SOS).")
+        if not self.ready_check(ask):                   # « Prêt pour l'antenne ? » : tout ce qui manque, d'un coup
+            return
         outs = [o for o in prof["outputs"] if o.get("enabled", True)]
-        if not outs:
-            return info(self, "Flux", "Ajoute et coche (Actif) au moins un flux dans « 2 · Flux ».")
-        for o in outs:
-            if o["type"] == "internet" and not o["password"]:
-                return info(self, "Mot de passe", f"Renseigne le mot de passe de « {o['name']} » (bouton Modifier).")
-        if prof["fallback"]["enabled"] and not [f for f in prof["fallback"]["playlist"] if f not in set(prof["fallback"].get("off") or [])]:
-            return info(self, "Playlist de secours", "La relève automatique est activée mais la playlist de secours est vide : "
-                                                     "ajoute des titres (bouton ＋ Ajouter), ou désactive la relève.")
-        dev = (prof["source"].get("device") or "").strip()
-        if not dev:
-            return info(self, "Entrée audio", "Choisis d'abord l'entrée audio à diffuser dans « 1 · Source audio ».")
-        known = set(self.dev_map.values())
-        if known and dev not in known and not dev.startswith("lavfi:"):
-            if not yes(self, "Entrée audio introuvable",
-                       f"L'entrée « {dev_short_name(dev)} » n'existe pas sur cet ordinateur (ou elle est débranchée).\n\n"
-                       "Sans elle, les flux partiront en silence. Choisis la bonne entrée dans « 1 · Source audio ».\n\n"
-                       "Démarrer quand même ?"):
-                return
         self.save_all()
         e = self.ensure_engine()
         if e is None:

@@ -752,6 +752,7 @@ class PagesMixin4:
         tb.addWidget(self.l_jcount)
         tb.addWidget(btn("Effacer", "", self.journal_clear))
         tb.addWidget(btn("Exporter", "", self.journal_export))
+        tb.addWidget(btn("Signaler", "", lambda: self.support_dialog(), "Signaler un problème : rapport prêt à envoyer (sans mot de passe ni coordonnées)"))
         jl.lay.addLayout(tb)
         self.logbox2 = QTextEdit()
         self.logbox2.setReadOnly(True)

@@ -41,7 +41,8 @@ from collections import deque
 #   Interface (Qt), chaque module reprenant tous les noms du précédent, dans cet ordre :
 #   bev_ui → bev_widgets → bev_alertes → bev_maj → bev_gael → bev_secours → bev_dialogues → bev_cartoucheur →
 #   bev_pages → bev_monitoring → bev_assistant → bev_sos → bev_bandeau → bev_diffusion → bev_antenne →
-#   bev_miseajour → bev_fenetre (fenêtre principale, qui hérite des parties définies dans les modules précédents)
+#   bev_miseajour → bev_support → bev_fenetre (fenêtre principale, qui hérite des parties définies dans les modules
+#   précédents)
 # Ajouter un module d'interface : l'insérer dans cette chaîne (et dans MODULES de tools/express.py).
 # ======================================================================================================================
 from bev_version import *  # noqa: E402,F401,F403
@@ -218,10 +219,28 @@ def main():
     close_boot_splash()
     app.setStyleSheet(qss())
     errs = []
+    prev_crash = ""
+    win = []
     if selftest:                       # vérification automatique (construction GitHub) : tout ouvrir, puis quitter
         import traceback
         sys.excepthook = lambda *a: errs.append("".join(traceback.format_exception(*a)))
+    else:
+        # Support : un plantage brutal est noté (et signalé au lancement suivant) ; une erreur inattendue est notée avec tous
+        # ses détails dans le journal technique, et Gaël propose de la signaler. L'antenne continue dans tous les cas.
+        prev_crash = crash_watch("interface")
+
+        def on_error(et, ex, tb):
+            sm = trace_exc("interface", et, ex, tb)
+            sys.__excepthook__(et, ex, tb)
+            if sm and win:
+                QTimer.singleShot(0, lambda: win[0].on_internal_error(sm))
+        sys.excepthook = on_error
+        threading.excepthook = lambda a: trace_exc("interface (fil " + str(getattr(a.thread, "name", "?")) + ")",
+                                                   a.exc_type, a.exc_value, a.exc_traceback)
     w = MainWindow()
+    win.append(w)
+    if prev_crash.strip():
+        QTimer.singleShot(4500, lambda: w.crash_greet(prev_crash))
     Splash.current = None
     if sp is not None:
         try:

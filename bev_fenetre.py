@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Bev (interface) - fenêtre principale : construction, en-tête, horloge, profils, fermeture.
-Ses autres parties sont dans bev_diffusion, bev_antenne et bev_miseajour (classes mixin), et dans les modules des pages."""
-from bev_miseajour import *  # noqa: F401,F403
+Ses autres parties sont dans bev_diffusion, bev_antenne, bev_miseajour et bev_support (classes mixin), et dans les modules des pages."""
+from bev_support import *  # noqa: F401,F403
 
 
 class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, PagesMixin4, DiffusionMixin,
-                 AntenneMixin, MiseAJourMixin, QMainWindow):
+                 AntenneMixin, MiseAJourMixin, SupportMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.root = self
@@ -71,7 +71,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         QTimer.singleShot(0, self.prewarm)                 # processus moteur prêt avant le premier « Démarrer »
         QTimer.singleShot(60, self.core_boot)              # moteur permanent : cartouches et Démarrer instantanés
         if self.data.get("autostart"):
-            QTimer.singleShot(2500, lambda: None if self.on_air else self.start())
+            QTimer.singleShot(2500, lambda: None if self.on_air else self.start(ask=False))
         if (UPDATE_REPO or S.get("update_repo")) and S.get("update_check", True):
             QTimer.singleShot(4000, lambda: self.update_start(False))
             self.upd_tm = QTimer(self)                        # puis toutes les 6 h (Bev reste souvent ouvert des jours entiers)
@@ -79,6 +79,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.upd_tm.start(6 * 3600 * 1000)
         QTimer.singleShot(2600, self.after_update_greet)
         QTimer.singleShot(1200, self.warm_pages)          # pages cachées prêtes avant le premier clic sur un onglet
+        QTimer.singleShot(6500, self.guide_start)         # premier lancement : Gaël guide jusqu'à la première antenne
         QTimer.singleShot(20000, self.express_settle)
         if not self.data.get("np_tried") and np is None:
             self.data["np_tried"] = True
