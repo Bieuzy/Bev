@@ -2,7 +2,7 @@
 """Préparation de la construction :
 1) icônes (.ico / .icns / .png) tirées du logo intégré au script ;
 2) image de démarrage (build/splash.png), affichée dès le double-clic sur Bev, avant même le chargement de l'application ;
-3) numéro de version + dépôt GitHub inscrits dans le script (bouton « Mise à jour »), et build/version.txt pour l'installateur."""
+3) numéro de version + dépôt GitHub inscrits dans bev_version.py (bouton « Mise à jour »), et build/version.txt pour l'installateur."""
 import ast
 import base64
 import io
@@ -12,8 +12,9 @@ import re
 from PIL import Image, ImageDraw, ImageFont
 
 SRC = "broadcast_tool_qt.py"
+VERSION_SRC = "bev_version.py"                   # la version et le dépôt sont inscrits ici
 os.makedirs("build", exist_ok=True)
-src = open(SRC, encoding="utf-8").read()
+src = open(VERSION_SRC, encoding="utf-8").read()
 
 
 def font(size, bold=True):
@@ -78,7 +79,7 @@ if re.match(r"^v?\d+(\.\d+)*$", tag):
     src = re.sub(r'^VERSION = ".*?"', f'VERSION = "{tag.lstrip("v")}"', src, count=1, flags=re.M)
 if repo:
     src = re.sub(r'^UPDATE_REPO = ".*?"', f'UPDATE_REPO = "{repo}"', src, count=1, flags=re.M)
-open(SRC, "w", encoding="utf-8").write(src)
+open(VERSION_SRC, "w", encoding="utf-8").write(src)
 ver = re.search(r'^VERSION = "(.*?)"', src, re.M).group(1)
 open("build/version.txt", "w").write(ver)
 print("Version :", ver, "(publiée)" if tag else "(non publiée)", "· dépôt :", repo or "(aucun)")

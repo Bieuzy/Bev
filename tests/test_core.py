@@ -136,7 +136,10 @@ def test_fichier_express(tmp_path):
     finally:
         os.chdir(cwd)
     assert ver == "9.8.7" and 'UPDATE_REPO = "compte/depot"' in text
-    assert not any(m.split(".")[0] in ("bev_core", "bev_assets") for m in mods)
+    assert not any(m.split(".")[0].startswith("bev_") for m in mods)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ours = {f[:-3] for f in os.listdir(root) if f.startswith("bev_") and f.endswith(".py")}
+    assert ours == set(express.MODULES), "module absent de MODULES (tools/express.py) : " + ", ".join(ours ^ set(express.MODULES))
     f = tmp_path / "bev-9.8.7.py"
     f.write_text(text, encoding="utf-8")
     probe = (
@@ -150,6 +153,39 @@ def test_fichier_express(tmp_path):
         r = subprocess.run([sys.executable, "-I", "-c", probe, str(f)], capture_output=True, text=True, timeout=60)
         assert r.stdout.strip() == "ok", r.stderr
     assert any(n.startswith("bev_core-") for n in os.listdir(tmp_path / "cache"))
+
+
+def test_fichier_express_interface(tmp_path):
+    """Un Bev déjà installé (ici : modules de la version installée déjà chargés) démarre l'interface complète depuis le
+    fichier express, avec les modules de la NOUVELLE version, et passe le selftest."""
+    pytest.importorskip("PySide6")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(root, "tools"))
+    import express
+    cwd = os.getcwd()
+    os.chdir(root)
+    try:
+        text, ver, runtime, mods = express.build("v9.8.7", "")
+    finally:
+        os.chdir(cwd)
+    f = tmp_path / "bev-9.8.7.py"
+    f.write_text(text, encoding="utf-8")
+    probe = (
+        "import os, sys; sys.path.insert(0, sys.argv[2]); code = sys.argv[1]\n"
+        "import bev_core, bev_version\n"                       # comme l'exécutable installé, avant la mise à jour express
+        "assert bev_version.VERSION != '9.8.7'\n"
+        "sys.argv = [code, '--selftest']\n"
+        "ns = {'__name__': '__bev_express__', '__file__': code, '_BEV_EXPRESS': code, '__builtins__': __builtins__}\n"
+        "exec(compile(open(code, 'rb').read(), code, 'exec'), ns)\n"
+        "assert sys.modules['bev_version'].VERSION == '9.8.7', 'module de la version installée utilisé'\n"
+        "assert sys.modules['bev_fenetre'].__file__.startswith(os.path.dirname(code))\n"
+        "ns['main']()\n")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    r = subprocess.run([sys.executable, "-c", probe, str(f), root], capture_output=True, text=True, timeout=180,
+                       cwd=str(tmp_path), env=env)
+    rep = (tmp_path / "selftest.txt").read_text(encoding="utf-8") if (tmp_path / "selftest.txt").exists() else ""
+    assert r.returncode == 0, (r.stdout[-2000:], r.stderr[-3000:], rep)
+    assert "Bev 9.8.7" in rep and "erreurs : 0" in rep, rep
 
 
 @needs_ffmpeg

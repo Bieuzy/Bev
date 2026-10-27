@@ -8,7 +8,7 @@ clé privée de l'auteur peut produire. Cette clé reste sur cet ordinateur : el
 1) Une seule fois : créer la clé
        python tools/signer.py cle
    -> crée la clé privée (dossier .bev-signature de ton dossier personnel) et affiche la clé PUBLIQUE, à recopier dans
-      broadcast_tool_qt.py, ligne UPDATE_PUBKEY = "...". SAUVEGARDE la clé privée (clé USB rangée à part) : perdue,
+      bev_version.py, ligne UPDATE_PUBKEY = "...". SAUVEGARDE la clé privée (clé USB rangée à part) : perdue,
       il faudrait repasser toutes les radios par l'installateur complet avec une nouvelle clé.
 
 2) À chaque Release publiée, quand GitHub a fini de construire (coche verte dans « Actions ») :
@@ -55,7 +55,7 @@ def cmd_key():
             fh.write(seed.hex() + "\n")
         print(f"Clé privée créée : {KEY_FILE}")
         print("  -> fais-en TOUT DE SUITE une copie sur une clé USB rangée à part. Ne la mets jamais sur GitHub.")
-    print("\nClé PUBLIQUE à recopier dans broadcast_tool_qt.py :")
+    print("\nClé PUBLIQUE à recopier dans bev_version.py :")
     print(f'UPDATE_PUBKEY = "{ed25519_public(seed).hex()}"')
 
 
