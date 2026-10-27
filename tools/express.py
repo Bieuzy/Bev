@@ -6,9 +6,11 @@
 Bev déjà installé télécharge ce fichier (~1 Mo) au lieu de l'installateur complet, vérifie l'empreinte et que tous les
 modules nécessaires sont présents dans son socle, puis redémarre dessus. Sinon, il propose l'installateur complet.
 
-Le code de Bev est réparti en plusieurs modules (broadcast_tool_qt.py, bev_core.py, bev_assets.py). Le fichier express les
-réunit : un court préambule, puis le texte de chaque module. Au lancement, le préambule
-  - installe bev_core et bev_assets de CETTE version (et non ceux de l'exécutable installé, plus anciens) ;
+Le code de Bev est réparti en plusieurs modules (broadcast_tool_qt.py, bev_version.py, bev_core.py, bev_assets.py et les
+modules de l'interface bev_ui.py … bev_fenetre.py). Le fichier express les réunit : un court préambule, puis le texte de
+chaque module. Au lancement, le préambule
+  - fournit les modules de CETTE version (et non ceux de l'exécutable installé, plus anciens) : chaque « import bev_… »
+    est servi depuis le fichier express, quel que soit l'ordre des imports ;
   - garde le code compilé en cache (dossier « cache » à côté) : Bev et son moteur audio ne recompilent plus 1 Mo de code
     à chaque démarrage ;
   - pour le moteur audio (--bev-engine), ne charge que bev_core : ni interface, ni Qt.
@@ -23,7 +25,11 @@ import re
 import sys
 
 SRC = "broadcast_tool_qt.py"
-MODULES = ("bev_core", "bev_assets")          # modules de Bev livrés DANS le fichier express
+VERSION_SRC = "bev_version.py"                # version et dépôt (inscrits ici par stamped)
+# modules de Bev livrés DANS le fichier express (tous les bev_*.py : tests/test_core.py vérifie qu'aucun n'est oublié)
+MODULES = ("bev_version", "bev_core", "bev_assets", "bev_ui", "bev_widgets", "bev_alertes", "bev_maj", "bev_gael",
+           "bev_secours", "bev_dialogues", "bev_cartoucheur", "bev_pages", "bev_monitoring", "bev_assistant", "bev_sos",
+           "bev_bandeau", "bev_diffusion", "bev_antenne", "bev_miseajour", "bev_fenetre")
 OUT = "dist-express"
 WINDOWS_ONLY = {"pyaudiowpatch", "winreg", "msvcrt", "winsound"}    # n'existent (et ne servent) que sous Windows
 
@@ -65,20 +71,41 @@ def _bev_code(name, src):
     return code
 
 
-def _bev_module(name):
-    m = _bt.ModuleType(name)
-    m.__file__ = _bo.path.join(_bo.path.dirname(_bo.path.abspath(__file__)), name + ".py")
-    _bs.modules[name] = m
-    exec(_bev_code(name, _BEV_SRC[name]), m.__dict__)
-    return m
+class _BevLoader:
+    """Charge un module de Bev depuis ce fichier (code compilé gardé en cache)."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, m):
+        m.__file__ = _bo.path.join(_bo.path.dirname(_bo.path.abspath(__file__)), self.name + ".py")
+        exec(_bev_code(self.name, _BEV_SRC[self.name]), m.__dict__)
+
+
+class _BevFinder:
+    """Placé en tête de sys.meta_path : « import bev_… » trouve le module de CETTE version, pas celui de l'exécutable."""
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name in _BEV_SRC and name != "broadcast_tool_qt":
+            return _bi.spec_from_loader(name, _BevLoader(name))
+        return None
+
+    @staticmethod
+    def invalidate_caches():
+        pass
 
 
 _BEV_SRC = {sources}
-_bev_core = _bev_module("bev_core")
+for _k in list(_BEV_SRC):                                       # modules de la version installée déjà chargés : remplacés
+    _bs.modules.pop(_k, None)
+_bs.meta_path.insert(0, _BevFinder)
 if "--bev-engine" in _bs.argv:                                  # moteur audio : le cœur seul, sans interface ni Qt
-    _engine_worker_main = _bev_core._engine_worker_main
+    _engine_worker_main = __import__("bev_core")._engine_worker_main
 else:
-    _bev_module("bev_assets")
     exec(_bev_code("broadcast_tool_qt", _BEV_SRC["broadcast_tool_qt"]), globals())
 '''
 
@@ -126,16 +153,17 @@ def required_modules(tree):
 
 def build(tag="", repo=""):
     """Le fichier express (texte) et la liste des modules du socle dont il a besoin."""
-    srcs = {"broadcast_tool_qt": stamped(open(SRC, encoding="utf-8").read(), tag, repo)}
+    srcs = {"broadcast_tool_qt": open(SRC, encoding="utf-8").read()}
     for m in MODULES:
         srcs[m] = open(m + ".py", encoding="utf-8").read()
+    srcs["bev_version"] = stamped(srcs["bev_version"], tag, repo)
     mods = set()
     for name, s in srcs.items():
         compile(s, name + ".py", "exec")                   # chaque module doit être correct
         mods |= required_modules(ast.parse(s))
-    mods = sorted(m for m in mods if m.split(".")[0] not in MODULES)
-    ver = re.search(r'^VERSION = "(.*?)"', srcs["broadcast_tool_qt"], re.M).group(1)
-    runtime = int(re.search(r"^RUNTIME = (\d+)", srcs["broadcast_tool_qt"], re.M).group(1))
+    mods = sorted(m for m in mods if m.split(".")[0] not in MODULES + ("broadcast_tool_qt",))
+    ver = re.search(r'^VERSION = "(.*?)"', srcs["bev_version"], re.M).group(1)
+    runtime = int(re.search(r"^RUNTIME = (\d+)", srcs["bev_version"], re.M).group(1))
     order = {m: srcs[m] for m in (*MODULES, "broadcast_tool_qt")}
     body = "{\n" + "".join(f"    {k!r}: {v!r},\n" for k, v in order.items()) + "}"
     text = PREAMBLE.format(ver=ver, mods=", ".join(MODULES), sources=body)

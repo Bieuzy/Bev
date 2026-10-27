@@ -94,8 +94,9 @@ def test_outil_de_signature(tmp_path, monkeypatch):
 def test_manifeste_contient_les_installateurs(tmp_path, monkeypatch):
     sys.path.insert(0, os.path.join(ROOT, "tools"))
     import express
-    for f in ("broadcast_tool_qt.py", "bev_core.py", "bev_assets.py"):
-        shutil.copy(os.path.join(ROOT, f), tmp_path / f)
+    for f in os.listdir(ROOT):
+        if f.endswith(".py") and (f.startswith("bev_") or f == "broadcast_tool_qt.py"):
+            shutil.copy(os.path.join(ROOT, f), tmp_path / f)
     (tmp_path / "dist-installers").mkdir()
     (tmp_path / "dist-installers" / "Bev-Setup-1.2.3.exe").write_bytes(b"installateur")
     (tmp_path / "dist-installers" / "selftest.txt").write_text("ok")
