@@ -31,6 +31,7 @@ NEWS = {
 - À propos : le phare de Bev, une présentation plus claire.
 - Automate de diffusion : fenêtre refaite, avec une explication simple, l'adresse à recopier et un bouton « Tester la réception ».
 - Journal : le filtre « Playlist de secours » montre les silences et les relèves.
+- Cartoucheur : un clic sur une cartouche qui joue montre tout de suite ce qui se passe (symbole stop, pause ou lecture qui apparaît puis s'efface) ; pendant l'arrêt en fondu, la tuile affiche « fondu… ».
 - Corrige des bouts de lignes jaunes ou rouges (cadre d'alerte) qui restaient affichés en passant du plein écran à la fenêtre.
 - Gaël : le goéland est devenu farceur (gare au béret !), et quatre nouvelles animations : le bagad, la table de mixage, la marche des fiertés et l'escalade du pylône FM.""",
     "1.3.0": """## Plus fluide

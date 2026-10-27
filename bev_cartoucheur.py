@@ -53,6 +53,56 @@ class FTile(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumSize(110, 70)
         self.setToolTip("Clic : lancer · clic droit : options · Maj + clic : au casque")
+        self.fx_kind, self.fx_k = None, 1.0              # retour visuel d'un clic (arrêt, pause, reprise)
+        self.fx = QVariantAnimation(self)
+        self.fx.setStartValue(0.0)
+        self.fx.setEndValue(1.0)
+        self.fx.setDuration(560)
+        self.fx.valueChanged.connect(lambda v: (setattr(self, "fx_k", float(v)), self.update()))
+        self.fx.finished.connect(lambda: (setattr(self, "fx_kind", None), self.update()))
+
+    def flash(self, kind):
+        """Petite animation qui confirme le clic : « stop » (carré), « pause » (deux barres) ou « play » (triangle)."""
+        self.fx_kind = kind
+        self.fx.stop()
+        if ANIM:
+            self.fx.start()
+        else:                                            # sans animation : le symbole reste affiché un instant
+            self.fx_k = .35
+            self.update()
+            QTimer.singleShot(450, lambda: (setattr(self, "fx_kind", None), self.update()))
+
+    def paint_fx(self, p, w, h):
+        k = self.fx_k
+        a = 1.0 - ss(k)                                  # s'efface
+        grow = .72 + .38 * back_out(min(1.0, k * 1.6))   # le symbole « saute » puis se pose
+        r = QRectF(1, 1, w - 2, h - 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc("#000000", int(70 * a)))           # la tuile s'assombrit un instant
+        p.drawRoundedRect(r.adjusted(.5, .5, -.5, -.5), 10, 10)
+        c = QPointF(w / 2, h / 2 + 2)
+        if self.fx_kind == "stop":                       # onde qui s'élargit : « c'est coupé »
+            ring = 20 + 26 * ss(k)
+            p.setPen(QPen(qc("#ffffff", int(150 * a)), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(c, ring, ring)
+        R = 19 * grow
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qc("#0b0f17", int(185 * a)))
+        p.drawEllipse(c, R, R)
+        p.setBrush(qc("#ffffff", int(255 * a)))
+        s_ = 8.5 * grow
+        if self.fx_kind == "stop":
+            p.drawRoundedRect(QRectF(c.x() - s_, c.y() - s_, 2 * s_, 2 * s_), 2.5, 2.5)
+        elif self.fx_kind == "pause":
+            p.drawRoundedRect(QRectF(c.x() - s_, c.y() - s_, s_ * .7, 2 * s_), 1.5, 1.5)
+            p.drawRoundedRect(QRectF(c.x() + s_ * .3, c.y() - s_, s_ * .7, 2 * s_), 1.5, 1.5)
+        else:
+            path = QPainterPath(QPointF(c.x() - s_ * .7, c.y() - s_))
+            path.lineTo(QPointF(c.x() + s_, c.y()))
+            path.lineTo(QPointF(c.x() - s_ * .7, c.y() + s_))
+            path.closeSubpath()
+            p.drawPath(path)
 
     def set_state(self, st):
         if st != self.st:
@@ -117,6 +167,14 @@ class FTile(QWidget):
                 p.drawRoundedRect(QRectF(w - 14, 10, 3, 10), 1, 1)
             else:
                 p.drawEllipse(QPointF(w - 15, 15), 4, 4)
+            if fading:                                   # arrêt demandé : le son baisse jusqu'au silence
+                ff = QFont(self.font())
+                ff.setPointSizeF(7.6)
+                ff.setBold(True)
+                p.setFont(ff)
+                p.setPen(QColor("#e0a800"))
+                p.drawText(QRectF(w - 80, 7, 58, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "fondu…")
+                p.setFont(tf)
         # forme d'onde
         wy0, wy1 = 27, h - 22
         mid, amp = (wy0 + wy1) / 2, (wy1 - wy0) / 2
@@ -172,6 +230,8 @@ class FTile(QWidget):
             p.drawRoundedRect(kr, 4, 4)
             p.setPen(QColor("#ffffff"))
             p.drawText(kr, Qt.AlignmentFlag.AlignCenter, key)
+        if self.fx_kind:
+            self.paint_fx(p, w, h)
 
 
 class CartNow(QWidget):
@@ -946,9 +1006,12 @@ class CartMixin:
         e = self.engine
         if st is not None and e:
             if st[6]:                                 # en pause : on reprend
+                self.tile_flash(cid, "play")
                 return e.pause_cart(cid, False)
             if d.get("pausable") and not shift and not force_play:
+                self.tile_flash(cid, "pause")
                 return e.pause_cart(cid, True)
+            self.tile_flash(cid, "stop")                  # retour visuel : le clic a bien été pris en compte
             return e.stop_cart(cid, fade=0.05 if shift else None)
         e = self.cart_engine((not self.on_air) or shift)
         if not e:
@@ -961,6 +1024,11 @@ class CartMixin:
                 t.cue = None
         e.play_cart(cid, d, (not self.on_air) or shift, at=at)
 
+    def tile_flash(self, cid, kind):
+        for t in self.tiles:
+            if t.cid == cid:
+                t.flash(kind)
+
     def pause_all(self, on):
         if self.engine:
             self.engine.pause_cart(None, bool(on))
@@ -970,6 +1038,9 @@ class CartMixin:
         self.stop_all(0.04 if shift else None)
 
     def stop_all(self, fade=None):
+        for t in self.tiles:
+            if t.st is not None:
+                t.flash("stop")
         if self.engine:
             self.engine.pause_cart(None, False)
             self.engine.stop_cart(None, fade)
