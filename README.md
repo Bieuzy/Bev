@@ -1,7 +1,6 @@
 # Bev
 
-Diffusion radio multi-sorties (Internet, FM, DAB+, enregistrement), playlist de secours, cartoucheur, monitoring.
-Portée par des radios associatives de Bretagne.
+Diffusion radio broadcast (Internet, FM, DAB+, enregistrement)
 
 ## Télécharger
 Page de téléchargement : **https://bieuzy.github.io/Bev/**
