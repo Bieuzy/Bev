@@ -1,8 +1,8 @@
-Bev — logiciel libre sous licence GNU GPL version 3 (voir LICENSE).
-Copyright (C) 2026 les auteurs de Bev (Bieuzy et contributeurs).
+Bev — gratuit pour tout usage non commercial, sous licence PolyForm Strict 1.0.0 (voir LICENSE et LICENCE-FR.md).
+Copyright (C) 2026 Bieuzy.
 Code source : https://github.com/Bieuzy/Bev
 
-Bev n'a aucune garantie, dans les limites prévues par la loi (articles 15 et 16 de la GPL v3).
+Bev est fourni tel quel, sans garantie, dans les limites prévues par la loi.
 
 ==========================================================================================
 COMPOSANTS D'AUTRES AUTEURS LIVRÉS AVEC BEV
@@ -17,7 +17,7 @@ FFmpeg (ffmpeg, ffprobe, ffplay) — programmes séparés, appelés par Bev
   Sur simple demande (issue sur le dépôt GitHub de Bev), le code source exact de la version livrée est fourni.
 
 Qt 6 et PySide6 (Qt for Python) — The Qt Company
-  Licence : GNU LGPL version 3, texte : LGPL-3.0.txt (avec la GPL v3 : LICENSE)
+  Licence : GNU LGPL version 3, texte : LGPL-3.0.txt (avec la GPL v3 qu'elle complète : GPL-3.0.txt)
   Code source : https://download.qt.io/official_releases/ — https://code.qt.io/
   Les bibliothèques Qt sont des fichiers séparés du dossier d'installation de Bev : elles peuvent être remplacées
   par une version modifiée.

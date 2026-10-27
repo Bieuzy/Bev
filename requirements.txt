@@ -1,5 +1,0 @@
-PySide6
-numpy
-psutil
-sounddevice
-PyAudioWPatch; sys_platform == "win32"
