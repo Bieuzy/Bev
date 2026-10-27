@@ -1,0 +1,39 @@
+Bev — logiciel libre sous licence GNU GPL version 3 (voir LICENSE).
+Copyright (C) 2026 les auteurs de Bev (Bieuzy et contributeurs).
+Code source : https://github.com/Bieuzy/Bev
+
+Bev n'a aucune garantie, dans les limites prévues par la loi (articles 15 et 16 de la GPL v3).
+
+==========================================================================================
+COMPOSANTS D'AUTRES AUTEURS LIVRÉS AVEC BEV
+==========================================================================================
+
+FFmpeg (ffmpeg, ffprobe, ffplay) — programmes séparés, appelés par Bev
+  Licence : GNU GPL version 3 (construction avec --enable-gpl --enable-version3), texte : LICENSE-ffmpeg.txt
+  Projet : https://ffmpeg.org — code source : https://ffmpeg.org/download.html
+  Windows : construction « essentials » de gyan.dev (https://www.gyan.dev/ffmpeg/builds/),
+            version figée dans .github/workflows/build.yml ; sources et options de construction sur cette page.
+  Mac : construction de Martin Riedl (https://ffmpeg.martin-riedl.de/), sources et scripts publiés sur ce site.
+  Sur simple demande (issue sur le dépôt GitHub de Bev), le code source exact de la version livrée est fourni.
+
+Qt 6 et PySide6 (Qt for Python) — The Qt Company
+  Licence : GNU LGPL version 3, texte : LGPL-3.0.txt (avec la GPL v3 : LICENSE)
+  Code source : https://download.qt.io/official_releases/ — https://code.qt.io/
+  Les bibliothèques Qt sont des fichiers séparés du dossier d'installation de Bev : elles peuvent être remplacées
+  par une version modifiée.
+
+Python — Python Software Foundation
+  Licence : PSF License Agreement, https://docs.python.org/3/license.html
+
+NumPy — Licence BSD (3 clauses) et licences compatibles, https://numpy.org/doc/stable/license.html
+psutil — Licence BSD (3 clauses), https://github.com/giampaolo/psutil/blob/master/LICENSE
+python-sounddevice — Licence MIT, https://github.com/spatialaudio/python-sounddevice/blob/master/LICENSE
+PortAudio — Licence MIT (style), https://www.portaudio.com/license.html
+PyAudioWPatch (Windows) — Licence Apache 2.0 (texte : Apache-2.0.txt), https://github.com/s0d3s/PyAudioWPatch
+
+Polices Inter (Rasmus Andersson) et Space Grotesk (Florian Karsten)
+  Licence : SIL Open Font License 1.1, texte : OFL-1.1.txt
+  Intégrées à Bev sous forme de sous-ensemble (caractères latins).
+
+PyInstaller (chargeur de l'application empaquetée)
+  Licence : GNU GPL v2 avec exception de « bootloader », https://pyinstaller.org/en/stable/license.html

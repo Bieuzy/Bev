@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Bev - ressources intégrées : polices (Inter, Space Grotesk, licence OFL) et logo, encodés en base64.
 Séparées du code : elles pèsent lourd et ne changent presque jamais.
 """

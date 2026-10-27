@@ -54,6 +54,10 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "..\dist\Bev\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; licence de Bev et mentions des composants d'autres auteurs (FFmpeg, Qt, polices…)
+Source: "..\LICENSE"; DestDir: "{app}\licences"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\licences\*"; DestDir: "{app}\licences"; Flags: ignoreversion
+Source: "..\ffmpeg\LICENSE-ffmpeg.txt"; DestDir: "{app}\licences"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Bev"; Filename: "{app}\Bev.exe"; Comment: "Diffusion radio"

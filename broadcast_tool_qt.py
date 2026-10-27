@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Bev (« direct » en breton) - diffusion radio multi-sorties (Internet / FM / DAB+ /
 enregistrement), playlist de secours, cartoucheur, monitoring et outils SOS.
 
@@ -44,7 +45,7 @@ from collections import deque
 # RUNTIME est à augmenter quand le socle change (nouvelle bibliothèque, nouvelle version de Python, de PySide6, de ffmpeg…) :
 # les versions concernées passent alors par l'installateur complet.
 # ======================================================================================================================
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 RUNTIME = 1
 UPD_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
     "~/Library/Application Support" if sys.platform == "darwin" else "~/.local/share"), "Bev", "maj")
@@ -154,6 +155,31 @@ from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,
                                QLayout, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QStyledItemDelegate, QWidgetItem as _WItem,
                                QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+
+
+def _selftest_secrets(errs):
+    """Selftest : chiffrement DPAPI des mots de passe (Windows) aller-retour, et vérification de signature Ed25519."""
+    import bev_core as _bc
+    try:
+        seed = bytes(range(32))
+        if not ed25519_verify(ed25519_public(seed), b"bev", ed25519_sign(seed, b"bev")):
+            errs.append("signature Ed25519 : vérification en échec")
+    except Exception as ex:
+        errs.append(f"signature Ed25519 : {ex}")
+    if SYS != "Windows":
+        return "sans objet (Windows seulement)"
+    try:
+        d = {"profiles": {"t": {"outputs": [{"password": "essai-é"}]}}, "alerts": {"url": "https://exemple/x"}}
+        enc = _bc.protect_secrets(d)
+        if not enc["profiles"]["t"]["outputs"][0]["password"].startswith(SECRET_PREFIX):
+            raise RuntimeError("non chiffré")
+        _bc.reveal_secrets(enc)
+        if enc != d:
+            raise RuntimeError("relecture différente")
+        return "oui (DPAPI)"
+    except Exception as ex:
+        errs.append(f"chiffrement des mots de passe : {ex}")
+        return "ÉCHEC"
 
 
 def _early_settings():
@@ -747,8 +773,8 @@ class WaveLoader(QObject):
                     bins = [max((abs(x) for x in a[i * step:(i + 1) * step]), default=0) / 32768.0 for i in range(k)]
                     pk = max(bins) or 1.0
                     bins = [b / pk for b in bins]
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("_run", _ex)
         if not bins:
             rnd = random.Random(path)
             bins = [.25 + .75 * abs(math.sin(i / 25.0 + rnd.random())) for i in range(360)]
@@ -3335,8 +3361,8 @@ def fetch_listeners(url):
         for s in [src] if isinstance(src, dict) else src:
             if s.get("listenurl", "").endswith(mount):
                 return int(s.get("listeners", 0))
-    except Exception:
-        pass
+    except Exception as _ex:
+        trace("fetch_listeners", _ex)
     return None
 
 
@@ -3533,7 +3559,12 @@ class Alerts:
                 req.add_header("Authorization", "Basic " + tok)
             else:  # Free Mobile : le numéro est celui du compte, « sms_to » sert de mémo
                 q = urllib.parse.urlencode({"user": c["sms_user"], "pass": c.get("sms_key", ""), "msg": text[:300]})
-                req = urllib.request.Request(c.get("sms_url") or "https://smsapi.free-mobile.fr/sendmsg?" + q)
+                base = (c.get("sms_url") or "").strip() or "https://smsapi.free-mobile.fr/sendmsg"
+                # (adresse personnalisée : l'identifiant, la clé et le message y sont ajoutés, comme pour l'adresse
+                # par défaut ; avant, ils étaient oubliés et le SMS échouait à chaque fois)
+                if "user=" in base:               # adresse complète déjà munie de l'identifiant : seul le message s'ajoute
+                    q = urllib.parse.urlencode({"msg": text[:300]})
+                req = urllib.request.Request(base + ("&" if "?" in base else "?") + q)
             urllib.request.urlopen(req, timeout=15).read()
             self.app.log("SMS d'alerte envoyé à " + c["sms_to"])
             return True
@@ -3555,6 +3586,7 @@ FIELDS = {
         ("mount", "Mountpoint (Icecast)", "entry", None),
         ("user", "Utilisateur (Icecast)", "entry", None),
         ("password", "Mot de passe source", "password", None),
+        ("tls", "Connexion chiffrée TLS (Icecast, si le serveur l'accepte)", "check", None),
         ("genre", "Genre", "entry", None),
         ("desc", "Description", "entry", None),
         ("format", "Format", "combo", list(FORMATS)),
@@ -3599,7 +3631,7 @@ FIELDS = {
         ("reconnect", "Relancer automatiquement", "check", None),
     ],
 }
-ADV = {"internet": ("sc_port", "user", "genre", "desc", "channels", "processing", "reconnect"),
+ADV = {"internet": ("sc_port", "user", "tls", "genre", "desc", "channels", "processing", "reconnect"),
        "fm": ("processing", "rds", "ps", "rds_mode", "rds_target", "rds_template", "reconnect"),
        "dab": ("profile", "processing", "odr_path", "extra", "net_format", "dls_file", "reconnect"),
        "record": ("bitrate", "keep_days", "processing", "reconnect")}
@@ -3706,6 +3738,16 @@ Problèmes fréquents
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
+    "1.2.1": """## Sécurité et solidité
+
+- Mises à jour signées par l'auteur de Bev : un compte GitHub piraté ne suffit plus pour envoyer du code aux radios.
+- Mots de passe des serveurs, du mail, des SMS et clé de Gaël chiffrés dans le fichier de réglages (Windows).
+- Automate de diffusion : code secret pour les autres postes du réseau, et aucune page web ne peut changer le titre à l'antenne.
+- Option de connexion chiffrée (TLS) pour les serveurs Icecast qui l'acceptent.
+- FFmpeg fixé sur une version stable (9.0.2), vérifiée à chaque construction.
+- Les erreurs discrètes sont notées dans Bev_journaux/bev-erreurs.log pour retrouver les bugs plus vite.
+- SMS Free Mobile : l'adresse personnalisée fonctionne.
+- Bev est un logiciel libre sous licence GNU GPL v3 ; les licences des composants sont livrées avec l'application.""",
     "1.2.0": """## Processeur d'antenne (bêta)
 
 - **Quatre banques A, B, C, D** de réglages, et **un traitement par flux** : par exemple Internet sur A, FM sur B (filtre 15 kHz), enregistrement en son brut. Tous tournent en même temps.
@@ -3756,6 +3798,10 @@ NEWS = {
 - Playlist de secours : bandeau et cadre jaunes ; le phare change d'animation selon l'état de l'antenne.""",
 }
 UPDATE_REPO = ""  # "compte/depot" GitHub où sont publiées les Releases (vide = vérification désactivée)
+# Clé PUBLIQUE de signature des mises à jour (64 caractères hexadécimaux, produite par « python tools/signer.py cle »).
+# Renseignée, Bev n'accepte plus que des versions dont le manifeste (bev-maj.json) est signé par la clé privée de
+# l'auteur, gardée hors de GitHub : un compte GitHub piraté ne suffit plus à envoyer du code aux radios.
+UPDATE_PUBKEY = ""
 
 
 def parse_ver(s):
@@ -3879,18 +3925,45 @@ def md_html(md):
     return "".join(out)
 
 
-def express_plan(assets, tag, get):
-    """La nouvelle version peut-elle s'installer en express (code seul) ? -> (infos, None) ou (None, raison)."""
-    if not getattr(sys, "frozen", False):
-        return None, "lancé depuis le code source"
+def signed_manifest(assets, get_raw, pubkey=None):
+    """Manifeste (bev-maj.json) de la Release et sa signature. -> (manifeste ou None, None) ou (None, raison du refus).
+    Sans clé publique dans Bev : manifeste lu sans contrôle d'auteur (comportement d'avant). Avec la clé : la signature
+    (bev-maj.json.sig) est OBLIGATOIRE et doit être valide, sinon la version n'est pas proposée du tout."""
+    pubkey = UPDATE_PUBKEY if pubkey is None else pubkey
     by = {str(a.get("name", "")): a for a in assets}
     m = by.get("bev-maj.json")
     if not m:
-        return None, "pas de mise à jour express pour cette version"
+        return (None, "version non signée (manifeste absent)") if pubkey else (None, None)
     try:
-        man = get(m["browser_download_url"])
+        raw = get_raw(m["browser_download_url"])
     except Exception as ex:
-        return None, f"manifeste illisible ({ex})"
+        return (None, f"manifeste illisible ({ex})") if pubkey else (None, None)
+    if pubkey:
+        sg = by.get("bev-maj.json.sig")
+        if not sg:
+            return None, "version pas encore signée par l'auteur"
+        try:
+            sig = bytes.fromhex(get_raw(sg["browser_download_url"]).decode("ascii", "replace").strip())
+            ok = ed25519_verify(bytes.fromhex(pubkey), raw, sig)
+        except Exception:
+            ok = False
+        if not ok:
+            return None, "signature invalide : cette version ne vient peut-être pas de l'auteur de Bev"
+    try:
+        man = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return (None, "manifeste illisible") if pubkey else (None, None)
+    return (man if isinstance(man, dict) else None), None
+
+
+def express_plan(assets, tag, man):
+    """La nouvelle version peut-elle s'installer en express (code seul) ? -> (infos, None) ou (None, raison).
+    man : le manifeste déjà lu (et vérifié, si les mises à jour sont signées) par signed_manifest."""
+    if not getattr(sys, "frozen", False):
+        return None, "lancé depuis le code source"
+    by = {str(a.get("name", "")): a for a in assets}
+    if not man:
+        return None, "pas de mise à jour express pour cette version"
     if not isinstance(man, dict) or _ver_tuple(man.get("version")) != _ver_tuple(tag):
         return None, "manifeste d'une autre version"
     if man.get("runtime") != RUNTIME:
@@ -3920,10 +3993,13 @@ def check_update(repo, timeout=10):
     import urllib.request
     import urllib.error
 
-    def get(url):
+    def get_raw(url):
         rq = urllib.request.Request(url, headers={"User-Agent": "Bev-update-check", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(rq, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
+            return r.read(4_000_000)
+
+    def get(url):
+        return json.loads(get_raw(url).decode("utf-8", "replace"))
     repo = str(repo).strip().replace("https://github.com/", "").strip("/")
     if repo.count("/") != 1:
         return {"error": "Le dépôt doit s'écrire « compte/depot » (par exemple monpseudo/bev)."}
@@ -3945,7 +4021,19 @@ def check_update(repo, timeout=10):
                "title": str(js.get("name") or "").strip(),
                "asset": a.get("browser_download_url", ""), "asset_name": a.get("name", ""), "size": int(a.get("size") or 0),
                "digest": str(a.get("digest") or "")}
-        res["express"], res["express_why"] = express_plan(js.get("assets", []), res["tag"], get)
+        if parse_ver(res["tag"]) <= parse_ver(VERSION):    # rien de plus récent : pas besoin du manifeste
+            res["express"], res["express_why"] = None, "déjà à jour"
+            return res
+        man, why = signed_manifest(js.get("assets", []), get_raw)
+        if why:                                    # mises à jour signées : version refusée en bloc (ni express ni installateur)
+            return {"error": f"Bev {res['tag'].lstrip('vV')} n'est pas proposée : {why}.", "unsigned": True}
+        inst = (man or {}).get("installers") or {}
+        if UPDATE_PUBKEY and res["asset_name"]:
+            if not re.fullmatch(r"[0-9a-f]{64}", str(inst.get(res["asset_name"], ""))):
+                return {"error": f"Bev {res['tag'].lstrip('vV')} n'est pas proposée : installateur absent du manifeste signé.",
+                        "unsigned": True}
+        res["installer_sha256"] = str(inst.get(res["asset_name"], "")) if UPDATE_PUBKEY else ""
+        res["express"], res["express_why"] = express_plan(js.get("assets", []), res["tag"], man)
         return res
     except urllib.error.HTTPError as ex:
         if ex.code == 404:
@@ -5838,8 +5926,8 @@ def _flac(fh):
                     key = {"title": "title", "artist": "artist", "album": "album", "genre": "genre", "date": "year"}.get(k.lower())
                     if key and key not in out:
                         out[key] = v
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("_flac", _ex)
         elif typ == 6 and "art" not in out:           # PICTURE
             try:
                 o = 4
@@ -6857,7 +6945,7 @@ OPTS = {"protocol": ["Icecast", "Shoutcast"], "format": ["MP3", "AAC", "OGG", "O
         "channels": ["1", "2"], "processing": ["Aucun", "Limiteur doux", "Radio (compresseur + limiteur)"],
         "bitrate": ["64", "96", "128", "192", "256", "320"]}
 LABELS = {"name": "Nom", "protocol": "Protocole", "host": "Serveur", "port": "Port", "sc_port": "Port source (Shoutcast)",
-          "mount": "Point de montage", "user": "Utilisateur", "password": "Mot de passe", "format": "Format",
+          "mount": "Point de montage", "user": "Utilisateur", "password": "Mot de passe", "tls": "TLS", "format": "Format",
           "bitrate": "Débit (kbit/s)", "channels": "Canaux", "genre": "Genre", "desc": "Description", "enabled": "Actif",
           "reconnect": "Reconnexion auto", "processing": "Traitement", "device": "Carte son", "folder": "Dossier",
           "rotate": "Rotation (min)", "keep_days": "Garder (jours, 0 = tout)", "prefix": "Préfixe", "pige": "Pige (h)",
@@ -7239,7 +7327,7 @@ class OutputDialog(QDialog):
             f = adv if key in adv_keys else main
             if typ == "check":
                 w = Switch(label)
-                w.setChecked(bool(cfg.get(key, True)))
+                w.setChecked(bool(cfg.get(key, key != "tls")))      # (TLS : désactivé tant qu'on ne l'a pas choisi)
                 w.toggled.connect(self.update_state)
                 f.addRow("", w)
             else:
@@ -9299,8 +9387,8 @@ class PagesMixin1:
         if self.engine:
             try:
                 self.engine.prof_update("carts", duck=int(v))
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("duck_changed", _ex)
 
     def set_station(self, *_):
         name = self.ed_station.text().strip()
@@ -9312,8 +9400,15 @@ class PagesMixin1:
         self.save_all()
         dst, _ = QFileDialog.getSaveFileName(self, "Exporter les réglages", "reglages_radio.json", "Réglages (*.json)")
         if dst:
-            shutil.copyfile(CONF, dst)
-            self.log("Réglages exportés : " + dst)
+            # export lisible sur un autre ordinateur : mots de passe en clair (ceux du fichier de réglages sont chiffrés
+            # pour CE compte Windows seulement)
+            try:
+                with open(dst, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, indent=2, ensure_ascii=False)
+            except OSError as e:
+                return err(self, "Exporter", f"Export impossible : {e}")
+            self.log("Réglages exportés : " + dst + " · attention, ce fichier contient les mots de passe en clair : "
+                     "ne le partage pas tel quel.")
 
     def import_conf(self):
         src, _ = QFileDialog.getOpenFileName(self, "Importer des réglages", "", "Réglages (*.json);;Tous (*)")
@@ -9332,7 +9427,11 @@ class PagesMixin1:
             shutil.copyfile(CONF, CONF + ".avant-import")
         except OSError:
             pass
-        shutil.copyfile(src, CONF)
+        try:
+            reveal_secrets(d)                     # (export d'avant la 1.2.1 : en clair ; sinon déchiffrés si possible)
+            save_data(d)                          # (et rechiffrés pour ce compte Windows)
+        except OSError:
+            shutil.copyfile(src, CONF)
         self.log("Réglages importés. Redémarrage…")
         self.restart_app()
 
@@ -9341,8 +9440,8 @@ class PagesMixin1:
             return info(self, "Redémarrer", "Arrête d'abord la diffusion : l'application doit se relancer.")
         try:
             self.save_all()
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("restart_app", _ex)
         try:
             relaunch_self()
         except Exception as e:
@@ -9848,8 +9947,8 @@ class PagesMixin1:
                 if sig != self.rec_sig:
                     self.rec_sig = sig
                     self.rec_files()
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("rec_tick", _ex)
 
     # ------------------------------------------------------------ À propos
     def _page_about(self):
@@ -9866,7 +9965,7 @@ class PagesMixin1:
         orig.setText(f"Sa création initiale a été réalisée en 2026 pour <a href='https://rbg.bzh' style='color:{ACCT}'>Radio Bro Gwened</a>"
                      " (rbg.bzh), radio associative du pays vannetais.")
         hero.lay.addWidget(orig)
-        hero.lay.addWidget(lab("Bev est une application libre, utilisable gratuitement. Ses auteurs invitent chaque utilisatrice et chaque "
+        hero.lay.addWidget(lab("Bev est un logiciel libre (licence GNU GPL v3), utilisable gratuitement. Ses auteurs invitent chaque utilisatrice et chaque "
                                "utilisateur à soutenir une radio associative de son choix : par un don, une adhésion ou du bénévolat.", "", True))
         hero.lay.addWidget(lab("Les radios associatives défendent des valeurs essentielles : une presse libre et indépendante, sans "
                                "financeur privé ; le travail d'enquête et d'information de proximité ; un rôle d'acteur culturel local, "
@@ -9928,7 +10027,7 @@ class PagesMixin1:
         h = QHBoxLayout()
         h.addWidget(btn("Tout lire", "", lambda: self.news_dialog(None)))
         h.addWidget(btn("Toutes les versions", "", lambda: webbrowser.open(
-            f"https://github.com/{self.data.get('settings', {}).get('update_repo') or UPDATE_REPO or 'Bieuzy/bev'}/releases")))
+            f"https://github.com/{UPDATE_REPO or self.data.get('settings', {}).get('update_repo') or 'Bieuzy/Bev'}/releases")))
         h.addStretch(1)
         nw.lay.addLayout(h)
         g.addWidget(nw, 1, 0)
@@ -10258,8 +10357,8 @@ class PagesMixin2:
         if e is not None and getattr(e, "running", False):
             try:
                 e.apply_fx()
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("proc_send", _ex)
 
     def proc_changed(self, refresh=True):
         if not hasattr(self, "_proc_tm"):
@@ -16067,6 +16166,10 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         c.setdefault("net", True)
         c.setdefault("port", AUTO_PORT)
         c.setdefault("lan", False)
+        if not c.get("token"):
+            c["token"] = uuid.uuid4().hex[:12]        # code secret de l'adresse (voir AutomateMeta._client)
+        if "lan_token" not in c:                      # automate déjà relié par le réseau local : rien ne change pour lui ;
+            c["lan_token"] = not c.get("lan")         # sinon, code secret exigé des autres postes
         return c
 
     def automate_apply(self):
@@ -16139,6 +16242,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         sw_lan = Switch("Accepter les autres ordinateurs du réseau local (automate sur un autre poste)")
         sw_lan.setChecked(bool(c["lan"]))
         f.addRow("", sw_lan)
+        sw_tok = Switch("Exiger le code secret des autres postes (recommandé)")
+        sw_tok.setChecked(bool(c.get("lan_token", True)))
+        f.addRow("", sw_tok)
         v.addLayout(f)
         ex = QPlainTextEdit()
         ex.setReadOnly(True)
@@ -16153,11 +16259,13 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 except Exception:
                     pass
             base = f"http://{host}:{sp.value()}/"
-            ex.setPlainText(f"Adresse à indiquer dans l'automate (envoi à chaque titre) :\n{base}?artist=ARTISTE&title=TITRE&cover=ADRESSE_POCHETTE\n\n"
+            sw_tok.setVisible(sw_lan.isChecked())
+            tk = f"token={c['token']}&" if (sw_lan.isChecked() and sw_tok.isChecked()) else ""
+            ex.setPlainText(f"Adresse à indiquer dans l'automate (envoi à chaque titre) :\n{base}?{tk}artist=ARTISTE&title=TITRE&cover=ADRESSE_POCHETTE\n\n"
                             "Dans Radiologik : réglages de publication du titre en cours (Now Playing), envoi par adresse web, en "
                             "remplaçant ARTISTE, TITRE et ADRESSE_POCHETTE par les balises correspondantes de Radiologik. "
                             "Bev accepte aussi un envoi POST (JSON, formulaire ou texte « Artiste - Titre »), ou un fichier.")
-        for w_ in (sw_lan, sp):
+        for w_ in (sw_lan, sw_tok, sp):
             (w_.toggled if isinstance(w_, Switch) else w_.valueChanged).connect(explain)
         explain()
         h = QHBoxLayout()
@@ -16170,7 +16278,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         v.addLayout(h)
         if d.exec():
             cfg = self.automate_cfg()
-            cfg.update(on=sw_on.isChecked(), file=ed_f.text().strip(), net=sw_net.isChecked(), port=sp.value(), lan=sw_lan.isChecked())
+            cfg.update(on=sw_on.isChecked(), file=ed_f.text().strip(), net=sw_net.isChecked(), port=sp.value(), lan=sw_lan.isChecked(),
+                       lan_token=sw_tok.isChecked())
             if not cfg["on"]:
                 self.auto_info = None
             self.save_settings()
@@ -16377,8 +16486,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     def pl_redraw_covers(self):
         try:
             self.pl_tv.set(self.pl_rows(), self.pl_now_idx())
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("pl_redraw_covers", _ex)
 
     def pl_cover_diag(self, i):
         f = self.playlist[i]
@@ -17383,7 +17492,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
     # ------------------------------------------------------------ mises à jour + bulle de Radiobot
     def update_start(self, manual=False):
         st = self.data.setdefault("settings", {})
-        repo = st.get("update_repo") or UPDATE_REPO
+        repo = UPDATE_REPO or st.get("update_repo")      # (version empaquetée : toujours le dépôt officiel)
         if not repo:
             if not manual:
                 return
@@ -17570,6 +17679,9 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def after_update_greet(self):
         """Premier lancement après une mise à jour : Gaël l'annonce, avec un accès direct aux nouveautés."""
+        if SECRETS_LOST:
+            self.log("Mots de passe illisibles (réglages venus d'un autre ordinateur ou compte Windows) : à ressaisir pour "
+                     + ", ".join(SECRETS_LOST[:6]))
         S = self.data.setdefault("settings", {})
         seen = S.get("seen_version")
         S["seen_version"] = VERSION
@@ -17714,8 +17826,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
         def go():
             try:
                 self.save_all()
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("go", _ex)
             relaunch_self(fresh=True)
             self._closing = True
             self.close()
@@ -17758,13 +17870,17 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
                 dg = r.get("digest", "")
                 if dg.startswith("sha256:") and dg[7:].lower() != sha:
                     raise RuntimeError("le fichier reçu est abîmé (empreinte différente)")
+                want = r.get("installer_sha256", "")
+                if UPDATE_PUBKEY and want != sha:
+                    raise RuntimeError("l'installateur reçu ne correspond pas à la version signée par l'auteur : rien n'a été lancé")
                 if os.path.exists(dst):
                     os.remove(dst)
                 os.replace(dst + ".part", dst)
-                try:                                      # (par précaution) pas de marque « téléchargé d'Internet »
-                    os.remove(dst + ":Zone.Identifier")
-                except OSError:
-                    pass
+                if UPDATE_PUBKEY:                         # installateur vérifié par signature : la marque « téléchargé
+                    try:                                  # d'Internet » est retirée ; sinon Windows garde son contrôle
+                        os.remove(dst + ":Zone.Identifier")
+                    except OSError:
+                        pass
                 # Defender analyse le fichier juste après son enregistrement et peut le supprimer quelques secondes plus
                 # tard : on vérifie qu'il est toujours là (et lisible) avant d'annoncer « Installateur prêt »
                 time.sleep(2.0)
@@ -17922,8 +18038,8 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             pass
         try:
             self.save_all()
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("closeEvent", _ex)
         try:
             self.mon_listen_stop()
         except Exception:
@@ -18095,6 +18211,8 @@ def main():
                    "capture son de l'ordinateur : " + ("oui" if have_loopback() else ("non" if SYS == "Windows" else "sans objet")),
                    "moteur audio séparé : " + (("oui (pid %s)" % w.engine.pid) if (isinstance(w.engine, EngineProxy) and w.engine.alive())
                                                else ("non (moteur dans l'application)" if w.engine is not None else "non (pas lancé)")),
+                   "chiffrement des mots de passe : " + _selftest_secrets(errs),
+                   "signature des mises à jour : " + ("clé publique présente" if UPDATE_PUBKEY else "pas encore de clé publique"),
                    f"erreurs : {len(errs)}"] + errs
             try:
                 with open("selftest.txt", "w", encoding="utf-8") as fh:

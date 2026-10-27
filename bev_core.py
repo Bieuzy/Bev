@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later — Bev, copyright (C) 2026 les auteurs de Bev. Voir LICENSE.
 """Bev - cœur sans interface : moteur audio (capture, mixage, playlist de secours, cartouches, processeur
 d'antenne), sorties (Internet, FM, DAB+, enregistrement), réseau, et processus moteur séparé.
 
@@ -30,6 +31,12 @@ import uuid
 from array import array
 from collections import deque
 from urllib.parse import quote, urlencode
+
+try:  # (présent dans toutes les versions installées ; facultatif pour que la mise à jour express reste possible)
+    from hmac import compare_digest
+except ImportError:
+    def compare_digest(a, b):
+        return hashlib.sha256(a).digest() == hashlib.sha256(b).digest()
 
 try:  # calcul audio rapide (installé automatiquement si absent)
     import numpy as np
@@ -570,6 +577,153 @@ def redact(text):
     return t
 
 
+# ------------------------------------------------------------------ signature Ed25519 (RFC 8032), en Python pur
+# Sert à vérifier que les mises à jour viennent bien de l'auteur de Bev (et pas seulement de GitHub) : la clé privée
+# reste sur l'ordinateur de l'auteur (tools/signer.py), seule la clé publique est dans Bev. Python pur, sans
+# bibliothèque à installer : la mise à jour express reste possible sur les Bev déjà installés.
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_xrecover(y):
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P)
+    x = pow(xx, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - xx) % _ED_P:
+        x = x * _ED_I % _ED_P
+    if (x * x - xx) % _ED_P:
+        raise ValueError("point invalide")
+    return x
+
+
+def _ed_base():
+    y = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+    x = _ed_xrecover(y)
+    if x & 1:
+        x = _ED_P - x
+    return x, y, 1, x * y % _ED_P
+
+
+def _ed_add(P, Q):
+    p = _ED_P
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % p
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % p
+    C = 2 * P[3] * Q[3] * _ED_D % p
+    D = 2 * P[2] * Q[2] % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return E * F % p, G * H % p, F * G % p, E * H % p
+
+
+def _ed_mul(s, P):
+    Q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+_ED_B = _ed_base()
+
+
+def _ed_eq(P, Q):
+    p = _ED_P
+    return (P[0] * Q[2] - Q[0] * P[2]) % p == 0 and (P[1] * Q[2] - Q[1] * P[2]) % p == 0
+
+
+def _ed_enc(P):
+    zi = pow(P[2], _ED_P - 2, _ED_P)
+    x, y = P[0] * zi % _ED_P, P[1] * zi % _ED_P
+    return int.to_bytes(y | ((x & 1) << 255), 32, "little")
+
+
+def _ed_dec(b):
+    if len(b) != 32:
+        raise ValueError("point invalide")
+    y = int.from_bytes(b, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    if y >= _ED_P:
+        raise ValueError("point invalide")
+    x = _ed_xrecover(y)
+    if x == 0 and sign:
+        raise ValueError("point invalide")
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x, y, 1, x * y % _ED_P
+
+
+def _ed_h(m):
+    return int.from_bytes(hashlib.sha512(m).digest(), "little")
+
+
+def _ed_secret(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def ed25519_public(seed):
+    """Clé publique (32 octets) d'une clé privée (graine de 32 octets)."""
+    return _ed_enc(_ed_mul(_ed_secret(seed)[0], _ED_B))
+
+
+def ed25519_sign(seed, msg):
+    """Signature (64 octets) de msg avec la clé privée seed (32 octets)."""
+    a, prefix = _ed_secret(seed)
+    A = _ed_enc(_ed_mul(a, _ED_B))
+    r = _ed_h(prefix + msg) % _ED_L
+    R = _ed_enc(_ed_mul(r, _ED_B))
+    s = (r + _ed_h(R + A + msg) * a) % _ED_L
+    return R + int.to_bytes(s, 32, "little")
+
+
+def ed25519_verify(pub, msg, sig):
+    """True si sig (64 octets) est une signature valide de msg pour la clé publique pub (32 octets)."""
+    try:
+        if len(pub) != 32 or len(sig) != 64:
+            return False
+        A, R = _ed_dec(pub), _ed_dec(sig[:32])
+        s = int.from_bytes(sig[32:], "little")
+        if s >= _ED_L:
+            return False
+        k = _ed_h(sig[:32] + pub + msg) % _ED_L
+        return _ed_eq(_ed_mul(s, _ED_B), _ed_add(R, _ed_mul(k, A)))
+    except (ValueError, TypeError):
+        return False
+
+
+# ------------------------------------------------------------------ journal technique des erreurs « silencieuses »
+# Beaucoup d'erreurs sont rattrapées pour que l'antenne continue (c'est voulu), mais elles disparaissaient sans trace,
+# ce qui rendait certains bugs introuvables. Elles vont désormais dans un petit journal technique (dossier des
+# journaux de Bev « Bev_journaux », bev-erreurs.log, 512 Ko au plus), sans encombrer le journal d'antenne. Une même erreur au même
+# endroit n'est notée qu'une fois par minute.
+TRACE_FILE = os.path.join(os.path.expanduser("~"), "Bev_journaux", "bev-erreurs.log")
+_TRACE_SEEN = {}
+_TRACE_LK = threading.Lock()
+
+
+def trace(where, ex=None):
+    try:
+        now = time.time()
+        key = (where, type(ex).__name__)
+        with _TRACE_LK:
+            if now - _TRACE_SEEN.get(key, 0) < 60:
+                return
+            _TRACE_SEEN[key] = now
+            os.makedirs(os.path.dirname(TRACE_FILE), exist_ok=True)
+            if os.path.isfile(TRACE_FILE) and os.path.getsize(TRACE_FILE) > 512 * 1024:
+                os.replace(TRACE_FILE, TRACE_FILE + ".1")
+            with open(TRACE_FILE, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {where} : "
+                         f"{redact(f'{type(ex).__name__}: {ex}') if ex is not None else ''}\n")
+    except Exception:
+        pass                                   # (le journal technique ne doit jamais gêner l'antenne)
+
+
 def have_module(name):
     try:
         if importlib.util.find_spec(name) is not None:
@@ -681,8 +835,8 @@ def track_info(path):
             tags = {k.lower(): v for k, v in fmt.get("tags", {}).items()}
             if tags.get("title"):
                 base = (tags["artist"] + " - " if tags.get("artist") else "") + tags["title"]
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("track_info", _ex)
     return base, dur
 
 
@@ -763,8 +917,8 @@ def _cover_extract(path, size=96, err=None):
             pick = imgs[0]
         if pick:
             return _ff_png(os.path.join(d, pick), size, err=err)
-    except Exception:
-        pass
+    except Exception as _ex:
+        trace("_cover_extract", _ex)
     return None
 
 
@@ -1022,8 +1176,8 @@ def list_output_devices(fresh=True):
             os.remove(fn)
             known = dict(_sd_query())
             return [(l, known.get(l, -1)) for l in labels]
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("list_output_devices", _ex)
     return _sd_query()
 
 
@@ -1102,7 +1256,7 @@ def new_output(kind, name=None):
          "name": name or KINDS[kind][1], "reconnect": True, "processing": "Aucun"}
     if kind == "internet":
         o.update(protocol="Icecast", host="localhost", port="8000", sc_port="",
-                 mount="/live", user="source", password="", format="MP3",
+                 mount="/live", user="source", password="", tls=False, format="MP3",
                  bitrate="128", channels="2", genre="Various", desc="")
     elif kind == "fm":
         o.update(device="", processing=FM_PROC, rds=False, ps="RADIO",
@@ -1233,10 +1387,89 @@ def migrate_preset(old):
     return p
 
 
+# ------------------------------------------------------------------ secrets du fichier de réglages
+# Mots de passe des serveurs, mot de passe mail, clé SMS, clé de Gaël, adresse de webhook (qui vaut mot de passe) :
+# sous Windows, chiffrés dans le fichier par DPAPI (fonction de Windows, sans bibliothèque à installer) : lisibles
+# seulement par CE compte Windows sur CET ordinateur. Copier le fichier de réglages ailleurs ne livre plus les
+# mots de passe. En mémoire, dans Bev, ils restent en clair (le moteur et les flux en ont besoin).
+SECRET_KEYS = {"password", "gael_key", "mail_pw", "sms_key"}
+SECRET_PREFIX = "dpapi:"
+SECRETS_LOST = []                 # secrets illisibles au chargement (réglages venus d'un autre PC / compte Windows)
+
+
+def _dpapi(data, protect):
+    try:
+        import ctypes
+    except ImportError:
+        raise OSError("ctypes absent")
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):   # 0x1 : jamais de fenêtre
+        raise OSError("DPAPI a refusé")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def _protect_on():
+    """Chiffrer à l'enregistrement ? Seulement l'application INSTALLÉE (≥ 1.2.1) qui tourne sur son propre code : si une
+    mise à jour express échoue, Bev repart sur la version installée, qui doit savoir relire ces mots de passe. Depuis
+    le code source (tests), rien n'est chiffré : une version installée plus ancienne lit le même fichier."""
+    return SYS == "Windows" and bool(getattr(sys, "frozen", False)) and os.environ.get("BEV_CODE") == "builtin"
+
+
+def _walk_secrets(d, fn, path=""):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            p = f"{path}.{k}" if path else str(k)
+            if isinstance(v, str) and v and (k in SECRET_KEYS or p == "alerts.url"):
+                d[k] = fn(v, p)
+            elif isinstance(v, (dict, list)):
+                _walk_secrets(v, fn, p)
+    elif isinstance(d, list):
+        for i, v in enumerate(d):
+            _walk_secrets(v, fn, f"{path}[{i}]")
+
+
+def reveal_secrets(d):
+    """Déchiffre (sur place) les secrets lus dans le fichier. Illisible : vidé, et noté dans SECRETS_LOST."""
+    def dec(v, p):
+        if not v.startswith(SECRET_PREFIX):
+            return v
+        try:
+            return _dpapi(base64.b64decode(v[len(SECRET_PREFIX):]), False).decode("utf-8")
+        except Exception:
+            SECRETS_LOST.append(p)
+            return ""
+    _walk_secrets(d, dec)
+    return d
+
+
+def protect_secrets(d):
+    """Copie de d avec les secrets chiffrés (d n'est pas modifié). En cas d'échec de DPAPI : en clair, comme avant."""
+    d = json.loads(json.dumps(d))
+
+    def enc(v, p):
+        if v.startswith(SECRET_PREFIX):
+            return v
+        try:
+            return SECRET_PREFIX + base64.b64encode(_dpapi(v.encode("utf-8"), True)).decode("ascii")
+        except Exception:
+            return v
+    _walk_secrets(d, enc)
+    return d
+
+
 def load_data():
     try:
         with open(CONF, encoding="utf-8") as f:
             d = json.load(f)
+        reveal_secrets(d)
         if "profiles" not in d:  # ancien format
             bak = CONF + ".v1.bak"
             if not os.path.exists(bak):
@@ -1270,6 +1503,8 @@ def load_data():
 
 def save_data(d):
     tmp = CONF + ".tmp"
+    if _protect_on():
+        d = protect_secrets(d)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
         f.flush()
@@ -2056,8 +2291,8 @@ class Engine:
         try:
             for line in p.stderr:
                 store.append(line.decode("utf-8", "replace").strip())
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("drain", _ex)
 
     def pump(self, proc, store):
         """Lit la sortie d'erreur de ffmpeg (sans l'afficher ligne à ligne : une entrée en panne ne doit pas inonder le journal)."""
@@ -2831,6 +3066,8 @@ class InternetOutput(Output):
                 url = "icecast://{}:{}@{}:{}/{}".format(
                     quote(c["user"], safe=""), quote(c["password"], safe=""),
                     c["host"], c["port"], c["mount"].lstrip("/"))
+                if c.get("tls"):                   # connexion chiffrée : le mot de passe ne circule plus en clair
+                    out += ["-tls", "1"]
                 out += ["-content_type", ctype, "-ice_name", c["name"],
                         "-ice_genre", c["genre"], "-ice_description", c["desc"],
                         "-f", muxer, url]
@@ -2865,7 +3102,7 @@ class InternetOutput(Output):
             return
         try:
             if c["protocol"] == "Icecast":
-                url = (f"http://{c['host']}:{c['port']}/admin/metadata?" + urlencode(
+                url = (f"{'https' if c.get('tls') else 'http'}://{c['host']}:{c['port']}/admin/metadata?" + urlencode(
                     {"mount": "/" + c["mount"].lstrip("/"), "mode": "updinfo",
                      "song": text, "charset": "UTF-8"}))
                 req = urllib.request.Request(url)
@@ -3329,8 +3566,8 @@ def wifi_info(name):
                 if p and p[0] == "yes":
                     return {"ssid": p[1] if len(p) > 1 else "", "signal": (p[2] + " %") if len(p) > 2 else "",
                             "band": p[3] if len(p) > 3 else ""}
-    except Exception:
-        pass
+    except Exception as _ex:
+        trace("wifi_info", _ex)
     return {}
 
 
@@ -3512,6 +3749,13 @@ class AutomateMeta:
             self.log(f"Automate : {self.port_err}.")
             return
         self.srv, self.port_err = srv, ""
+        slots = threading.BoundedSemaphore(16)      # 16 échanges à la fois au plus : un flot de connexions ne sature pas Bev
+
+        def client(c, ip):
+            try:
+                self._client(c, ip, lan)
+            finally:
+                slots.release()
 
         def serve():
             while self.srv is srv and not self.stop_ev.is_set():
@@ -3521,7 +3765,13 @@ class AutomateMeta:
                     continue
                 except OSError:
                     break
-                threading.Thread(target=self._client, args=(c, addr[0], lan), daemon=True).start()
+                if not slots.acquire(blocking=False):
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+                    continue
+                threading.Thread(target=client, args=(c, addr[0]), daemon=True).start()
             try:
                 srv.close()
             except OSError:
@@ -3559,13 +3809,25 @@ class AutomateMeta:
             if not self._local_ip(ip, lan):
                 return answer(403, "refusé : adresse hors du réseau local")
             q = urllib.parse.urlsplit(path).query
+            # Code secret (token) : obligatoire pour les autres postes du réseau (si exigé dans les réglages), et pour
+            # toute demande venue d'un NAVIGATEUR (une page web ouverte sur ce PC ne doit pas pouvoir changer le titre à
+            # l'antenne ; les automates n'envoient pas ces en-têtes de navigateur).
+            tok = str(self.cfg.get("token") or "")
+            given = (urllib.parse.parse_qs(q).get("token") or [""])[0] or hdr.get("x-bev-token", "")
+            tok_ok = bool(tok) and compare_digest(given.encode("utf-8", "replace"), tok.encode("utf-8"))
+            remote = not self._local_ip(ip, False)
+            browser = any(k in hdr for k in ("origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"))
+            if browser and not tok_ok:
+                return answer(403, "refusé : demande venue d'un navigateur sans le code secret (token=…)")
+            if remote and self.cfg.get("lan_token") and not tok_ok:
+                return answer(403, "refusé : code secret absent ou faux (token=…, voir l'adresse donnée par Bev)")
             raw = body[:n] if (meth.upper() == "POST" and body[:n].strip()) else q.encode()
             if not raw.strip():
                 return answer(200, "Bev : prêt à recevoir le titre en cours (?artist=…&title=…&cover=…)")
             info = auto_parse(raw, hdr.get("content-type", ""))
             if not (info["title"] or info["artist"]):
                 return answer(400, "aucun titre reçu (paramètres attendus : artist, title, cover)")
-            self.receive(info, "réseau")
+            self.receive(info, "réseau", local_ok=not remote)
             answer(200, "ok : " + auto_text(info))
         except (OSError, ValueError, IndexError):
             pass
@@ -3584,14 +3846,14 @@ class AutomateMeta:
                 pass
 
     # --- titre reçu
-    def receive(self, info, source, base=""):
+    def receive(self, info, source, base="", local_ok=True):
         if not (info.get("title") or info.get("artist")):
             return
         sig = (info.get("artist"), info.get("title"), info.get("album"), info.get("cover"))
         if sig == self.last_sig:
             return
         self.last_sig = sig
-        cov = self.fetch_cover(info.get("cover") or "", base)
+        cov = self.fetch_cover(info.get("cover") or "", base, local_ok)
         res = {**info, "cover": cov, "text": auto_text(info), "source": source, "t": time.time()}
         self.last = res
         try:
@@ -3599,7 +3861,7 @@ class AutomateMeta:
         except Exception as ex:
             self.log(f"Automate : titre non affiché ({ex})")
 
-    def fetch_cover(self, ref, base=""):
+    def fetch_cover(self, ref, base="", local_ok=True):
         """Pochette : fichier local (chemin, éventuellement relatif au fichier de l'automate, ou file://), ou adresse web
         téléchargée (2 Mo au plus) dans un petit cache. Renvoie un chemin de fichier, ou ""."""
         ref = (ref or "").strip()
@@ -3610,6 +3872,8 @@ class AutomateMeta:
             if SYS == "Windows" and re.match(r"^/[A-Za-z]:", ref):
                 ref = ref[1:]
         if not ref.lower().startswith(("http://", "https://")):
+            if not local_ok:                         # (un autre poste ne désigne pas les fichiers de cet ordinateur)
+                return ""
             p = ref if os.path.isabs(ref) else os.path.join(base or "", ref)
             return p if os.path.isfile(p) else ""
         try:
@@ -3776,8 +4040,8 @@ class EngineWorker:
         if self.eng is not None and self.eng.running:
             try:
                 self.eng.stop()
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("run", _ex)
         if self.eng is not None:
             time.sleep(1.8)                         # les encodeurs se ferment proprement (fin de fichier, fin de flux)
         time.sleep(SNAP_S * 3)                      # dernier état (arrêt) transmis
@@ -4082,8 +4346,8 @@ class EngineProxy:
         try:
             with self._wlk:
                 self._conn.send(m)
-        except Exception:
-            pass
+        except Exception as _ex:
+            trace("_raw_send", _ex)
 
     def _reader(self):
         conn = self._conn
@@ -4105,8 +4369,8 @@ class EngineProxy:
                     self._outcfg(m[1])
                 elif k == "counts":
                     self.__dict__["counts_in"] = m[1]
-            except Exception:
-                pass
+            except Exception as _ex:
+                trace("_reader", _ex)
         s = self._s
         was = s.get("running")
         s["running"] = False
