@@ -4,6 +4,37 @@ from bev_alertes import *  # noqa: F401,F403
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
+    "1.4.0": """## Première prise en main
+
+- « Prêt pour l'antenne ? » : au moment de démarrer, tout ce qui manque est montré d'un coup (entrée audio, flux, mot de passe, playlist de secours), avec un bouton pour régler chaque point.
+- Au premier lancement, Gaël indique l'étape suivante jusqu'à la première antenne (« Plus tard » ou « Ne plus afficher »).
+- Démarrage automatique et reprise après plantage : plus aucune fenêtre ne bloque un démarrage sans personne devant l'écran.
+
+## Support
+
+- « Signaler un problème » (SOS et À propos) : un rapport prêt à envoyer (version, réglages, diagnostic, journaux), sans mot de passe, clé, adresse mail, numéro ni lien d'alerte. Enregistrer, copier, ou ouvrir directement la fiche de bug GitHub.
+- Les erreurs internes sont notées avec tous leurs détails ; Gaël propose de les signaler, l'antenne n'est jamais touchée.
+- Si Bev se ferme brutalement, il le dit au lancement suivant et propose d'envoyer le rapport.
+- Demander « signaler un bug » à Gaël ouvre aussi le rapport.
+
+## Alertes et sons
+
+- « Prévenir en cas de panne » : le voyant vert ne s'allume que si l'envoi a vraiment réussi (test ou alerte). Configuré mais pas testé : orange ; test raté : rouge, avec le canal en cause.
+- Plus aucun bip dans Bev (l'option « Bip répété » est retirée) : les pannes se voient à l'écran et partent par message, mail ou SMS.
+- Nouveau réglage : couper les sons de Windows pendant que Bev est ouvert (ils reviennent à la fermeture).
+- Alertes sur la qualité d'Internet allégées : un message seulement si le problème dure 5 minutes, au plus une fois par heure.
+- Minutage des pannes : le bandeau indique depuis quand la playlist de secours est à l'antenne, ou depuis quand le flux est coupé (« depuis 14:32 (3 min 12 s) ») ; le journal note le début, la fin et la durée.
+
+## Interface
+
+- Les bulles de Gaël restent dans sa colonne, au-dessus de lui : la page n'est plus cachée.
+- À propos : le phare de Bev, une présentation plus claire.
+- Nouvelles icônes dans le menu : un cadran de niveau pour le Processeur, une vraie bouée de sauvetage pour SOS.
+- Automate de diffusion : fenêtre refaite, avec une explication simple, l'adresse à recopier et un bouton « Tester la réception ».
+- Journal : le filtre « Playlist de secours » montre les silences et les relèves.
+- Cartoucheur : un clic sur une cartouche qui joue montre tout de suite ce qui se passe (symbole stop, pause ou lecture qui apparaît puis s'efface) ; pendant l'arrêt en fondu, la tuile affiche « fondu… ».
+- Corrige des bouts de lignes jaunes ou rouges (cadre d'alerte) qui restaient affichés en passant du plein écran à la fenêtre.
+- Gaël : le goéland est devenu farceur (gare au béret !), et quatre nouvelles animations : le bagad, la table de mixage, la marche des fiertés et l'escalade du pylône FM.""",
     "1.3.0": """## Plus fluide
 
 - Changement d'onglet jusqu'à trois fois plus rapide, y compris le premier clic et juste après avoir changé la taille de la fenêtre : les onglets cachés sont préparés pendant les temps morts.

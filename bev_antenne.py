@@ -199,29 +199,12 @@ class AntenneMixin:
         else:
             self.start()
 
-    def start(self):
+    def start(self, ask=True):
+        """Démarre l'antenne. ask=False : démarrage automatique (lancement, reprise après plantage), sans question."""
         prof = json.loads(json.dumps(self.collect_profile()))
-        if not shutil.which("ffmpeg"):
-            return err(self, "ffmpeg", "ffmpeg est introuvable (voir onglet SOS).")
+        if not self.ready_check(ask):                   # « Prêt pour l'antenne ? » : tout ce qui manque, d'un coup
+            return
         outs = [o for o in prof["outputs"] if o.get("enabled", True)]
-        if not outs:
-            return info(self, "Flux", "Ajoute et coche (Actif) au moins un flux dans « 2 · Flux ».")
-        for o in outs:
-            if o["type"] == "internet" and not o["password"]:
-                return info(self, "Mot de passe", f"Renseigne le mot de passe de « {o['name']} » (bouton Modifier).")
-        if prof["fallback"]["enabled"] and not [f for f in prof["fallback"]["playlist"] if f not in set(prof["fallback"].get("off") or [])]:
-            return info(self, "Playlist de secours", "La relève automatique est activée mais la playlist de secours est vide : "
-                                                     "ajoute des titres (bouton ＋ Ajouter), ou désactive la relève.")
-        dev = (prof["source"].get("device") or "").strip()
-        if not dev:
-            return info(self, "Entrée audio", "Choisis d'abord l'entrée audio à diffuser dans « 1 · Source audio ».")
-        known = set(self.dev_map.values())
-        if known and dev not in known and not dev.startswith("lavfi:"):
-            if not yes(self, "Entrée audio introuvable",
-                       f"L'entrée « {dev_short_name(dev)} » n'existe pas sur cet ordinateur (ou elle est débranchée).\n\n"
-                       "Sans elle, les flux partiront en silence. Choisis la bonne entrée dans « 1 · Source audio ».\n\n"
-                       "Démarrer quand même ?"):
-                return
         self.save_all()
         e = self.ensure_engine()
         if e is None:
@@ -715,12 +698,19 @@ class AntenneMixin:
         else:
             down.clear()
         kind = "flux" if bad else ("son" if silent == "dead" else ("secours" if silent == "backup" else None))
+        ended_since = getattr(self, "_alert_since", None)
+        if kind != getattr(self, "alert_kind", None):     # minutage : depuis quand dure la panne / la relève
+            self._alert_since = now - (e.silent_ms / 1000 if kind == "son" else 0)
+        if kind == "flux":                                # la rupture a commencé quand le premier flux est tombé
+            ids_bad = {o.cfg.get("id") for o in e.outputs if (o.cfg.get("name") or "flux") in bad}
+            self._alert_since = min([self._alert_since] + [t for oid, t in down.items() if oid in ids_bad])
+        since = self.since_text(self._alert_since) if kind else ""
         if kind:
             if kind == "flux":
                 c, fg = "#c4263a", "white"
                 hs = ", ".join(bad[:4]) + (f" (+{len(bad) - 4})" if len(bad) > 4 else "")
                 ok_n = [o.cfg.get("name") or "flux" for o in e.outputs if o.cfg.get("enabled", True) and o.state == "live"]
-                txt = (f"⚠  RUPTURE DE FLUX  ·  HS : {hs}  ·  " +
+                txt = (f"⚠  RUPTURE DE FLUX {since}  ·  HS : {hs}  ·  " +
                        (f"toujours à l'antenne : {', '.join(ok_n[:3])}" + (" …" if len(ok_n) > 3 else "") if ok_n
                         else "plus aucun flux ne part : les auditeurs n'entendent plus l'antenne") +
                        "  ·  reconnexion automatique en cours")
@@ -731,10 +721,10 @@ class AntenneMixin:
                 p = e.fb_params()
                 why = ("la playlist de secours est désactivée" if not p["enabled"] else
                        "la playlist de secours est vide" if not p["files"] else "la playlist de secours n'a pas pu démarrer")
-                txt = f"⚠  SILENCE À L'ANTENNE  ·  aucun son en entrée depuis {e.silent_ms // 1000} s  ·  {why}"
+                txt = f"⚠  SILENCE À L'ANTENNE {since}  ·  aucun son en entrée  ·  {why}"
             else:
                 c, fg = SECOURS_Y, "#2a2200"
-                txt = "PLAYLIST DE SECOURS À L'ANTENNE"
+                txt = f"PLAYLIST DE SECOURS À L'ANTENNE {since}"
             self.banner.set_colors(c, fg)
             if self.banner.text() != txt:
                 self.banner.setText(txt)
@@ -744,15 +734,14 @@ class AntenneMixin:
             self.banner.setVisible(bool(kind))
             border = {"flux": "#ff4d5e", "son": "#ff7a1a", "secours": SECOURS_Y}.get(kind)
             self.centralWidget().set_border(border)
+            done = self.since_text(ended_since, done=True) if (prev and ended_since) else ""
+            if prev == "secours" and kind != "secours":
+                self.log(f"Fin de la playlist de secours : elle a été à l'antenne {done}.")
             if kind in ("flux", "son"):
-                if kind not in self._air_beeped:            # un seul bip par panne (la sirène, si elle est cochée, répète)
-                    self._air_beeped.add(kind)
-                    if self.data.get("alerts", {}).get("sound", True):
-                        self.alerts.beep()
                 self.log("⚠ Rupture de flux : " + ", ".join(bad) if kind == "flux" else
                          f"⚠ Silence à l'antenne depuis {e.silent_ms // 1000} s : rien ne prend le relais.")
             elif prev in ("flux", "son"):
-                self.log("Antenne rétablie.")
+                self.log(f"Antenne rétablie : {'rupture de flux' if prev == 'flux' else 'silence'} {done}.")
             if kind not in ("flux", "son"):
                 self._air_beeped.difference_update({"flux", "son"})
         self.alert_on = kind == "flux"
@@ -762,6 +751,17 @@ class AntenneMixin:
         self.air_fx.set(bool(air and n_live > 0), mode)
         if hasattr(self.nav_w, "set_alert"):
             self.nav_w.set_alert(mode if (air and (n_live > 0 or mode)) else False)
+
+    @staticmethod
+    def since_text(t0, done=False):
+        """« depuis 14:32 (3 min 12 s) » ; done=True : « de 14:32 à 14:35 (3 min 12 s) »."""
+        now = time.time()
+        d = max(0, int(now - t0))
+        dur = f"{d // 3600} h {d % 3600 // 60:02d}" if d >= 3600 else (f"{d // 60} min {d % 60:02d} s" if d >= 60 else f"{d} s")
+        h0 = time.strftime("%H:%M", time.localtime(t0))
+        if done:
+            return f"de {h0} à {time.strftime('%H:%M', time.localtime(now))} ({dur})"
+        return f"depuis {h0} ({dur})"
 
     def onair_chip(self, e, bad):
         """Bandeau : sonie de sortie (banque principale à l'antenne ; entrée traitée pendant le contrôle d'entrée)."""

@@ -29,7 +29,7 @@ VERSION_SRC = "bev_version.py"                # version et dépôt (inscrits ici
 # modules de Bev livrés DANS le fichier express (tous les bev_*.py : tests/test_core.py vérifie qu'aucun n'est oublié)
 MODULES = ("bev_version", "bev_core", "bev_assets", "bev_ui", "bev_widgets", "bev_alertes", "bev_maj", "bev_gael",
            "bev_secours", "bev_dialogues", "bev_cartoucheur", "bev_pages", "bev_monitoring", "bev_assistant", "bev_sos",
-           "bev_bandeau", "bev_diffusion", "bev_antenne", "bev_miseajour", "bev_fenetre")
+           "bev_bandeau", "bev_diffusion", "bev_antenne", "bev_miseajour", "bev_support", "bev_fenetre")
 OUT = "dist-express"
 WINDOWS_ONLY = {"pyaudiowpatch", "winreg", "msvcrt", "winsound"}    # n'existent (et ne servent) que sous Windows
 

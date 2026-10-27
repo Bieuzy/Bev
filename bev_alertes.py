@@ -96,7 +96,32 @@ class Alerts:
                     (key.startswith(("fallback", "silence")) and not c.get("on_fallback", True)) or
                     (key.startswith("mon-") and not c.get("on_monitor", True)))
 
-    def send(self, text, key=None, force=False, urgent=False, sound=False):
+    CHAN_FIELDS = {"mail": ("mail_to", "mail_from", "mail_host", "mail_port", "mail_user", "mail_pw", "mail_tls"),
+                   "sms": ("sms_provider", "sms_user", "sms_key", "sms_to", "sms_from", "sms_url"),
+                   "msg": ("kind", "url")}
+
+    def chan_sig(self, key):
+        """Empreinte des réglages d'un canal : si on les modifie, le test réussi ne compte plus (il faut retester)."""
+        c = self.cfg()
+        return hashlib.sha1(json.dumps([str(c.get(f, "")) for f in self.CHAN_FIELDS[key]]).encode("utf-8")).hexdigest()[:16]
+
+    def configured(self):
+        """Canaux configurés : sous-ensemble de ("mail", "sms", "msg")."""
+        c = self.cfg()
+        return [k for k, on in (("mail", c.get("mail_on") and c.get("mail_to")), ("sms", c.get("sms_on") and c.get("sms_to")),
+                                ("msg", (c.get("url") or "").strip())) if on]
+
+    def chan_status(self, key):
+        """« ok » (dernier test réussi, réglages inchangés), « echec », « attente » (test en cours) ou « a_tester »."""
+        v = (self.cfg().get("verified") or {}).get(key) or {}
+        if v.get("sig") != self.chan_sig(key):
+            return "a_tester"
+        return v.get("state", "a_tester")
+
+    def set_status(self, key, state):
+        self.cfg().setdefault("verified", {})[key] = {"sig": self.chan_sig(key), "state": state, "t": time.time()}
+
+    def send(self, text, key=None, force=False, urgent=False, sound=False, test=False):
         """Alerte : journal + message / mail / SMS selon les réglages. Le bip est réservé aux vraies pannes (sound=True) :
         une reconnexion, une bascule automatique sur le secours ou un retour à la normale ne bipent pas."""
         c = self.cfg()
@@ -113,15 +138,13 @@ class Alerts:
                 urgent = True
                 sound = sound or not key.endswith("-ok")
         self.app.log("" + text)
-        if sound and c.get("sound", True):
-            self.app.ui(self.beep)
         if (c.get("url") or "").strip():
-            self.q.put(("msg", text, time.time()))
+            self.q.put(("msg", text, time.time(), test))
         if urgent:
             if c.get("mail_on"):
-                self.q.put(("mail", text, time.time()))
+                self.q.put(("mail", text, time.time(), test))
             if c.get("sms_on"):
-                self.q.put(("sms", text, time.time()))
+                self.q.put(("sms", text, time.time(), test))
 
     def _sender(self):
         """Envois dans l'ordre, un par un. Un envoi raté (souvent : la panne, c'est justement Internet) est gardé et retenté
@@ -130,12 +153,12 @@ class Alerts:
         while True:
             try:
                 item = self.q.get(timeout=1.0)
-                waiting.append([item[0], item[1], item[2], 0.0])
+                waiting.append([item[0], item[1], item[2], 0.0, item[3] if len(item) > 3 else False])
             except queue.Empty:
                 pass
             now = time.time()
             for it in list(waiting):
-                kind, text, t0, nxt = it
+                kind, text, t0, nxt, test = it
                 if now < nxt:
                     continue
                 if kind == "sms" and now - last_sms < 3.0:
@@ -151,6 +174,13 @@ class Alerts:
                     last_sms = time.time()
                 self.sent.append((time.time(), kind, body, bool(ok)))
                 del self.sent[:-200]
+                if ok or test:                       # résultat connu : voyant du canal (un test n'est essayé qu'une fois)
+                    cb = getattr(self.app, "alert_result", None)
+                    if cb is not None:
+                        self.app.ui(cb, kind, bool(ok), test)
+                if test and not ok:
+                    waiting.remove(it)
+                    continue
                 if ok or now - t0 > self.RETRY_FOR_S:
                     waiting.remove(it)
                     if not ok:
@@ -170,22 +200,9 @@ class Alerts:
         return out
 
     def beep(self):
-        """Bip d'alerte joué en arrière-plan (winsound.Beep bloquait l'interface 0,3 s à chaque alerte).
-        Jamais plus d'un bip toutes les 20 s, même si plusieurs pannes arrivent en même temps."""
-        now = time.time()
-        if now - getattr(self, "_last_beep", 0.0) < 20:
-            return
-        self._last_beep = now
-        if SYS == "Windows":
-            def b():
-                try:
-                    import winsound
-                    winsound.Beep(880, 300)
-                except Exception:
-                    pass
-            threading.Thread(target=b, daemon=True).start()
-        else:
-            QApplication.beep()
+        """Bev ne fait plus jamais de bip : un son inattendu sur l'ordinateur du studio peut partir à l'antenne. Les pannes
+        se voient à l'écran (cadre et bandeau rouges) et partent par message, mail ou SMS."""
+        return
 
     def post(self, kind, url, text):
         try:
