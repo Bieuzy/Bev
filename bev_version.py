@@ -21,7 +21,7 @@ import time
 # RUNTIME est à augmenter quand le socle change (nouvelle bibliothèque, nouvelle version de Python, de PySide6, de ffmpeg…) :
 # les versions concernées passent alors par l'installateur complet.
 # ======================================================================================================================
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 RUNTIME = 1
 UPD_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
     "~/Library/Application Support" if sys.platform == "darwin" else "~/.local/share"), "Bev", "maj")

@@ -698,6 +698,7 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
             self.upd_tm.timeout.connect(lambda: self.update_start(False))
             self.upd_tm.start(6 * 3600 * 1000)
         QTimer.singleShot(2600, self.after_update_greet)
+        QTimer.singleShot(1200, self.warm_pages)          # pages cachées prêtes avant le premier clic sur un onglet
         QTimer.singleShot(20000, self.express_settle)
         if not self.data.get("np_tried") and np is None:
             self.data["np_tried"] = True
@@ -1052,13 +1053,50 @@ class MainWindow(UndoMixin, CartMixin, PagesMixin1, PagesMixin2, PagesMixin3, Pa
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        QTimer.singleShot(0, self.fit_band)
         RZ[0] = time.time() + .3
-        QTimer.singleShot(0, self.place_upd_bubble)
         if hasattr(self, "l_beta"):
             self.compact_header()
-        QTimer.singleShot(0, self.apply_compact)
-        QTimer.singleShot(0, self.diff_fit)
+        # Pendant qu'on tire le bord de la fenêtre, Windows envoie souvent plusieurs changements de taille entre deux images :
+        # les ajustements (bandeau, bulle, pages compactes, colonne Diffusion) ne sont faits qu'une fois, pour la dernière
+        # taille, au lieu d'une fois par changement.
+        if not getattr(self, "_rz_pending", False):
+            self._rz_pending = True
+            QTimer.singleShot(0, self._after_resize)
+        tm = getattr(self, "_warm_tm", None)
+        if tm is None:
+            tm = self._warm_tm = QTimer(self)
+            tm.setSingleShot(True)
+            tm.timeout.connect(self.warm_pages)
+        tm.start(600)                                    # taille stabilisée : les autres onglets sont remis à la bonne taille
+
+    def _after_resize(self):
+        self._rz_pending = False
+        self.fit_band()
+        self.place_upd_bubble()
+        self.apply_compact()
+        self.diff_fit()
+
+    def warm_pages(self):
+        """Prépare les onglets cachés à la taille actuelle de la fenêtre (mise en page, styles, premier dessin), un par un
+        et pendant les temps morts. Sans cela, le premier clic sur un onglet (au lancement, ou après avoir changé la taille
+        de la fenêtre) faisait tout ce travail d'un coup : deux à cinq fois plus long qu'un changement d'onglet ordinaire."""
+        st = getattr(self, "stack", None)
+        if st is None or self._closing or not self.isVisible() or self.isMinimized():
+            return
+        if calm():                                       # on est encore en train de redimensionner : plus tard
+            QTimer.singleShot(400, self.warm_pages)
+            return
+        size = st.size()
+        for i in range(st.count()):
+            pg = st.widget(i)
+            if i != st.currentIndex() and pg.size() != size:
+                try:
+                    pg.setGeometry(st.rect())
+                    pg.grab()                            # (rendu hors écran : mise en page + dessin, rien ne s'affiche)
+                except RuntimeError:
+                    return
+                QTimer.singleShot(120, self.warm_pages)  # la page suivante au prochain temps mort
+                return
 
     NARROW_W = 1180
 

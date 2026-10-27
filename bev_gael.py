@@ -1439,6 +1439,7 @@ class GaelView(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
         self._drawn = 0.0
+        self._pm, self._pm_sig, self._fresh = None, None, True     # dernière image de Gaël (voir paintEvent)
         Ticker.add(self, self._tick, 60, always=True)
         if mode == "rail":
             self.setToolTip("Gaël, ton assistant d'antenne · clic : une animation · clic droit : menu")
@@ -1462,6 +1463,7 @@ class GaelView(QWidget):
         if a is None:
             return
         self.anim, self.a_t0 = a, self.now()
+        self._fresh = True
         self.update()
 
     def play_next(self):
@@ -1508,9 +1510,13 @@ class GaelView(QWidget):
             self.anim = None
             self.next_at = t + random.uniform(26, 48)
         busy = self.anim is not None or self.talk > 0 or self.hover or abs(self.coif_v) > .5
-        if not busy and (not ANIM or t - self._drawn < .030):
+        # au repos, seuls la respiration et le léger balancement de la tête bougent, très lentement : 15 images/s
+        # suffisent (deux fois moins de dessin) ; un clignement ou un regard qui se déplace repassent à 30 images/s
+        lively = t >= self.blink_at - .02 or abs(self.look_to - self.look_cur) > .03
+        if not busy and (not ANIM or t - self._drawn < (.030 if lively else .064)):
             return False
         self._drawn = t
+        self._fresh = True
         return True
 
     # --- pose courante
@@ -1557,6 +1563,62 @@ class GaelView(QWidget):
         self.prev = (hx, ha, vx)
 
     def paintEvent(self, e):
+        # Gaël est souvent repeint sans avoir bougé : la fenêtre change de taille, on change d'onglet, le menu se met à jour…
+        # On recopie alors simplement sa dernière image (quelques microsecondes au lieu de près d'une milliseconde). Une
+        # nouvelle image n'est dessinée que si son horloge l'a demandé (_fresh) ou si son état visible a changé.
+        dpr = self.devicePixelRatioF()
+        sig = (self.width(), self.height(), dpr, self.on_air, self.think, self.talk > 0, self.hover, id(self.anim))
+        if self._pm is not None and not self._fresh and sig == self._pm_sig:
+            q = QPainter(self)
+            q.drawPixmap(0, 0, self._pm)
+            self._paint_name(q)
+            return
+        if self._pm is not None and calm() and sig[2:] == self._pm_sig[2:]:
+            # fenêtre en cours de redimensionnement : Gaël change seulement d'échelle ; on agrandit ou réduit sa dernière
+            # image le temps du geste (il est redessiné net dès que la taille ne bouge plus)
+            q = QPainter(self)
+            q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            o0, s0 = self._origin(*self._pm_sig[:2])
+            o1, s1 = self._origin(self.width(), self.height())
+            q.translate(o1)
+            q.scale(s1 / s0, s1 / s0)
+            q.translate(-o0)
+            q.drawPixmap(0, 0, self._pm)
+            q.resetTransform()
+            self._paint_name(q)
+            if not getattr(self, "_sharp_pending", False):   # image nette une fois la taille stabilisée
+                self._sharp_pending = True
+                QTimer.singleShot(400, self._sharpen)
+            return
+        self._fresh = False
+        pm = QPixmap(max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr))))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = new_painter(pm)
+        self._paint_frame(p)
+        p.end()
+        self._pm, self._pm_sig = pm, sig
+        q = QPainter(self)
+        q.drawPixmap(0, 0, pm)
+        self._paint_name(q)
+
+    def _sharpen(self):
+        self._sharp_pending = False
+        if calm():
+            self._sharp_pending = True
+            QTimer.singleShot(250, self._sharpen)
+            return
+        self._fresh = True
+        self.update()
+
+    def _origin(self, W, H):
+        """Point d'ancrage (bas de Gaël) et échelle de son dessin pour un widget de W × H."""
+        box = self.BOX[self.mode]
+        name_h = 18 if self.mode == "rail" else 0
+        s = min(W / box.width(), (H - name_h) / box.height())
+        return QPointF(W / 2 - box.center().x() * s, (H - name_h) - box.bottom() * s), s
+
+    def _paint_frame(self, p):
         t = self.now()
         dt = _cl(t - self.t_last, 0.0, .05)
         self.t_last = t
@@ -1565,7 +1627,6 @@ class GaelView(QWidget):
         P = self.current_pose(t, dt)
         self.spring(t, P, dt)
         P["coif"] += self.coif
-        p = new_painter(self)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         W, H = self.width(), self.height()
         box = self.BOX[self.mode]
@@ -1588,8 +1649,12 @@ class GaelView(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(c)
                 p.drawEllipse(QPointF(24 + i * 7, -150), 2.2, 2.2)
-        if name_h:
-            p.resetTransform()
+
+    def _paint_name(self, p):
+        """Nom sous Gaël (menu) : dessiné directement sur l'écran, pour un texte aussi net que le reste."""
+        if self.mode == "rail":
+            W, H = self.width(), self.height()
+            p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
             f = QFont(self.font())
             f.setPointSizeF(9.5)
             f.setBold(True)

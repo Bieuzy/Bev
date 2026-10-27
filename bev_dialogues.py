@@ -493,15 +493,17 @@ class FitScroll(QScrollArea):
         QTimer.singleShot(0, self.fit)
 
     def eventFilter(self, o, ev):
-        if ev.type() == ev.Type.LayoutRequest:
+        if ev.type() == ev.Type.LayoutRequest and not getattr(self, "_fit_pending", False):
+            self._fit_pending = True                     # plusieurs demandes d'affilée : un seul ajustement
             QTimer.singleShot(0, self.fit)
         return False
 
-    def fit(self):
+    def fit(self, vp=None):
+        self._fit_pending = False
         w = self.widget()
         if w is None:
             return
-        vp = self.viewport().size()
+        vp = vp or self.viewport().size()
         need = w.minimumSizeHint().height()
         lay = w.layout()
         if lay is not None and lay.hasHeightForWidth():      # textes qui passent à la ligne : leur vraie hauteur à cette largeur
@@ -514,6 +516,15 @@ class FitScroll(QScrollArea):
                 need = max(need, min(lay.totalHeightForWidth(max(100, vp.width())), vp.height()))  # le minimum déborde)
         if 0 < need - vp.height() <= 6:                    # quelques pixels de trop : on serre plutôt que d'afficher
             need = vp.height()                               # une barre de défilement pour rien
+        # Barre de défilement seulement si la page déborde vraiment. Laissée « au besoin » en permanence, elle apparaissait
+        # puis disparaissait à chaque image d'un redimensionnement (le temps que la page prenne la nouvelle taille) : la
+        # page entière était alors mise en page trois fois au lieu d'une.
+        pol = Qt.ScrollBarPolicy.ScrollBarAsNeeded if need > vp.height() else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        if self.verticalScrollBarPolicy() != pol:
+            self.setVerticalScrollBarPolicy(pol)
+            if not getattr(self, "_fit_pending", False):    # la largeur utile change : on réajuste juste après
+                self._fit_pending = True
+                QTimer.singleShot(0, self.fit)
         sz = (max(100, vp.width()), max(vp.height(), need))
         if (w.width(), w.height()) != sz:
             w.resize(*sz)

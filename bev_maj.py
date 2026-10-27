@@ -4,9 +4,20 @@ from bev_alertes import *  # noqa: F401,F403
 
 # ------------------------------------------------------------ mise à jour + mini Radiobot
 NEWS = {
+    "1.3.0": """## Plus fluide
+
+- Changement d'onglet jusqu'à trois fois plus rapide, y compris le premier clic et juste après avoir changé la taille de la fenêtre : les onglets cachés sont préparés pendant les temps morts.
+- Redimensionnement plus léger : chaque page n'est plus mise en page qu'une fois par image (au lieu de trois), et Gaël n'est plus redessiné entièrement pendant le geste.
+- Plus de barre de défilement inutile qui apparaissait un instant sur les pages qui tiennent à l'écran.
+- Gaël consomme deux fois moins au repos.
+
+## Coulisses
+
+- Le code de Bev est découpé en modules (un par grande partie de l'application) : plus simple et plus sûr à faire évoluer.
+- Outil de mesure de la fluidité (tools/perf.py).""",
     "1.2.1": """## Sécurité et solidité
 
-- Mises à jour signées par l'auteur de Bev : un compte GitHub piraté ne suffit plus pour envoyer du code aux radios.
+- Préparation des mises à jour signées par l'auteur de Bev (activées dans une prochaine version).
 - Mots de passe des serveurs, du mail, des SMS et clé de Gaël chiffrés dans le fichier de réglages (Windows).
 - Automate de diffusion : code secret pour les autres postes du réseau, et aucune page web ne peut changer le titre à l'antenne.
 - Option de connexion chiffrée (TLS) pour les serveurs Icecast qui l'acceptent.
