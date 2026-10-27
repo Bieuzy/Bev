@@ -23,6 +23,7 @@ NEWS = {
 - Plus aucun bip dans Bev (l'option « Bip répété » est retirée) : les pannes se voient à l'écran et partent par message, mail ou SMS.
 - Nouveau réglage : couper les sons de Windows pendant que Bev est ouvert (ils reviennent à la fermeture).
 - Alertes sur la qualité d'Internet allégées : un message seulement si le problème dure 5 minutes, au plus une fois par heure.
+- Minutage des pannes : le bandeau indique depuis quand la playlist de secours est à l'antenne, ou depuis quand le flux est coupé (« depuis 14:32 (3 min 12 s) ») ; le journal note le début, la fin et la durée.
 
 ## Interface
 
@@ -30,6 +31,7 @@ NEWS = {
 - À propos : le phare de Bev, une présentation plus claire.
 - Automate de diffusion : fenêtre refaite, avec une explication simple, l'adresse à recopier et un bouton « Tester la réception ».
 - Journal : le filtre « Playlist de secours » montre les silences et les relèves.
+- Corrige des bouts de lignes jaunes ou rouges (cadre d'alerte) qui restaient affichés en passant du plein écran à la fenêtre.
 - Gaël : le goéland est devenu farceur (gare au béret !), et quatre nouvelles animations : le bagad, la table de mixage, la marche des fiertés et l'escalade du pylône FM.""",
     "1.3.0": """## Plus fluide
 

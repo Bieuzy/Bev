@@ -622,6 +622,18 @@ class RootWidget(QWidget):
 
     def resizeEvent(self, e):
         self.frame.setGeometry(self.rect())
+        if self.border:
+            # Cadre d'alerte affiché : quand la fenêtre change de taille (plein écran ↔ fenêtre surtout), Qt déplace des
+            # morceaux d'écran déjà dessinés, cadre compris, et des bouts de lignes jaunes / rouges restaient au milieu de
+            # la fenêtre. On redessine donc toute la fenêtre une fois la nouvelle taille en place.
+            self.frame.update()
+            QTimer.singleShot(0, self.full_repaint)
+            QTimer.singleShot(350, self.full_repaint)
+
+    def full_repaint(self):
+        if self.border:
+            self.update()                         # (le fond ET tout ce qu'il y a dessus, cadre compris)
+            self.frame.update()
 
     def paintEvent(self, e):
         if not self.border:

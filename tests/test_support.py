@@ -248,3 +248,44 @@ def test_animations_de_gael():
             gp.draw(p, P, t=t, hand_r=a.hand_r(t), hand_l=a.hand_l(t))
             a.front(p, t, gp, P)
             p.end()
+
+
+def test_minutage_secours_et_rupture(win, monkeypatch):
+    class Out:
+        def __init__(s, oid, state):
+            s.cfg, s.state = {"id": oid, "name": "Internet", "enabled": True}, state
+
+    class Eng:
+        running, air, monitor, mute, silent_ms, backup = True, True, False, False, 0, True
+        outputs = []
+
+        def fb_params(s):
+            return {"enabled": True, "files": ["a.mp3"], "delay": 10000}
+    e = Eng()
+    old = win.engine
+    now = [10_000.0]
+    monkeypatch.setattr(bev.time, "time", lambda: now[0])
+    try:
+        win.engine = e
+        win.alert_kind, win._out_down, win._alert_since = None, {}, None
+        win.rupture_ui(e, 1, 1)
+        assert win.banner.text().startswith("PLAYLIST DE SECOURS À L'ANTENNE depuis")
+        now[0] += 192
+        win.rupture_ui(e, 1, 1)
+        assert "(3 min 12 s)" in win.banner.text()
+        e.backup = False
+        e.outputs = [Out("o1", "error")]
+        win.rupture_ui(e, 0, 1)                      # le flux vient de tomber : pas encore une rupture (6 à 15 s)
+        assert any("Fin de la playlist de secours" in l and "(3 min 12 s)" in l for l in win.log_lines)
+        now[0] += 20
+        win.rupture_ui(e, 0, 1)
+        assert win.banner.text().startswith("⚠  RUPTURE DE FLUX depuis") and "(20 s)" in win.banner.text()
+        e.outputs[0].state = "live"
+        now[0] += 40
+        win.rupture_ui(e, 1, 1)
+        assert any("Antenne rétablie : rupture de flux de" in l and "(1 min 00 s)" in l for l in win.log_lines)
+    finally:
+        win.engine = old
+        win.alert_kind = None
+        win.centralWidget().set_border(None)
+        win.banner.setVisible(False)
