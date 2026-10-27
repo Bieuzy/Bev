@@ -40,7 +40,8 @@ from collections import deque
 #   bev_assets.py         polices et logo intégrés
 #   Interface (Qt), chaque module reprenant tous les noms du précédent, dans cet ordre :
 #   bev_ui → bev_widgets → bev_alertes → bev_maj → bev_gael → bev_secours → bev_dialogues → bev_cartoucheur →
-#   bev_pages → bev_monitoring → bev_assistant → bev_sos → bev_fenetre
+#   bev_pages → bev_monitoring → bev_assistant → bev_sos → bev_bandeau → bev_diffusion → bev_antenne →
+#   bev_miseajour → bev_fenetre (fenêtre principale, qui hérite des parties définies dans les modules précédents)
 # Ajouter un module d'interface : l'insérer dans cette chaîne (et dans MODULES de tools/express.py).
 # ======================================================================================================================
 from bev_version import *  # noqa: E402,F401,F403
