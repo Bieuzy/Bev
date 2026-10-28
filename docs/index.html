@@ -6,6 +6,10 @@
 <title>Bev</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <meta name="description" content="Bev, le logiciel de diffusion des radios associatives : Internet, FM, DAB+ et enregistrement depuis un seul ordinateur. Gratuit, pour Windows et Mac.">
+<meta property="og:title" content="Bev · le logiciel de diffusion des radios associatives">
+<meta property="og:description" content="Internet, FM, DAB+, playlist de secours et enregistrement depuis un seul ordinateur. Gratuit, pour Windows et Mac. Né à Radio Bro Gwened.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0b1f3a">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 560 560%22%3E%3Crect width=%22560%22 height=%22560%22 rx=%22125%22 fill=%22%230b1f3a%22/%3E%3Cpath d=%22M243 172H317L336 404H224Z%22 fill=%22%23f5f7fb%22/%3E%3Crect x=%22258%22 y=%22101%22 width=%2244%22 height=%2256%22 rx=%225%22 fill=%22%23ffb03b%22/%3E%3Cpath d=%22M280 67L314 101H247Z%22 fill=%22%23f5f7fb%22/%3E%3C/svg%3E">
@@ -172,6 +176,91 @@ footer .l{display:flex;align-items:center;gap:10px}
   .g4,.g3,.states{grid-template-columns:1fr}
   .dl .btn{flex:1 1 100%}
 }
+
+/* ---------- pimpage : faisceau, houle, fenêtre, fonctions, veille, installation */
+html{scroll-behavior:smooth}
+.bar{position:sticky;top:0;z-index:10;backdrop-filter:saturate(1.4) blur(12px);background:color-mix(in srgb,var(--splash-a) 88%,transparent)}
+.splash{position:relative}
+.splash .wrap{position:relative;z-index:1;padding-bottom:150px}
+.beam{transform-origin:280px 129px;opacity:0}
+@media (prefers-reduced-motion:no-preference){
+  .beam{animation:balaye 9s ease-in-out infinite}
+  .houle .h1{animation:derive 14s linear infinite}.houle .h2{animation:derive 22s linear infinite reverse}
+  .reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+}
+@keyframes balaye{0%,100%{transform:scaleX(1);opacity:.55}45%{opacity:.1}50%{transform:scaleX(-1);opacity:.55}95%{opacity:.1}}
+@keyframes derive{to{transform:translateX(-50%)}}
+.houle{position:absolute;left:0;right:0;bottom:0;height:120px;overflow:hidden;pointer-events:none}
+.houle svg{position:absolute;bottom:0;left:0;width:200%;height:100%}
+
+/* fenêtre de Bev (maquette) */
+.ecran{position:relative;z-index:2;margin-top:-110px}
+.win{max-width:880px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:22px;overflow:hidden;
+  box-shadow:0 30px 70px -20px rgba(0,0,0,.55),0 8px 20px -10px rgba(0,0,0,.3)}
+.win-top{display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--mut)}
+.win-top i{width:11px;height:11px;border-radius:50%;background:var(--field)}
+.win-top span{margin-left:auto;font-variant-numeric:tabular-nums}
+.win-body{display:grid;grid-template-columns:170px 1fr}
+.win-side{padding:14px 10px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:2px;font-size:13px;font-weight:600}
+.win-side b{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:10px;color:var(--mut);font-weight:600}
+.win-side b.on{background:var(--field);color:var(--txt)}
+.win-side b svg{color:var(--acct)}
+.win-main{padding:18px 20px 20px;display:grid;gap:14px;min-width:0}
+.live{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px}
+.pill{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:13px;padding:6px 12px;border-radius:999px;
+  background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok);transition:background .4s,color .4s}
+.pill .dot{background:currentColor;box-shadow:0 0 0 4px color-mix(in srgb,currentColor 22%,transparent)}
+.live .clock{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.live .lufs{margin-left:auto;text-align:right;font-size:12px;color:var(--mut)}
+.live .lufs b{display:block;font-size:20px;color:var(--txt);font-variant-numeric:tabular-nums}
+.vu{display:grid;gap:7px}
+.vu div{display:grid;grid-template-columns:14px 1fr;gap:8px;align-items:center;font-size:11px;font-weight:700;color:var(--mut)}
+.vu span{height:10px;border-radius:6px;background:var(--field);overflow:hidden;position:relative}
+.vu span::after{content:"";position:absolute;inset:0;width:var(--v,40%);border-radius:6px;
+  background:linear-gradient(90deg,var(--ok) 0 70%,var(--warn) 85%,var(--bad));background-size:var(--bw,100%) 100%;transition:width .09s linear}
+.outs2{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.outs2 div{background:var(--field);border-radius:12px;padding:10px 12px;font-size:12.5px}
+.outs2 b{display:flex;align-items:center;gap:7px;font-size:13.5px}
+.outs2 .dot{background:var(--ok)}
+.outs2 small{color:var(--mut)}
+.net{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:13px;font-weight:600;color:var(--mut)}
+.net b{color:var(--txt);border-bottom:2px solid var(--ok);padding-bottom:2px}
+.ecran .cap{text-align:center;color:var(--mut);font-size:13px;margin-top:14px}
+
+/* fonctions */
+.feat .card{padding:20px 20px 22px;transition:transform .25s,box-shadow .25s,border-color .25s}
+.feat .card:hover{transform:translateY(-3px);border-color:color-mix(in srgb,var(--acc) 45%,var(--line));box-shadow:0 14px 30px -18px rgba(0,0,0,.45)}
+.feat .card h3{font-size:16px}
+.feat .card .sub{font-size:14px}
+
+/* la veille du phare */
+.veille .card{padding:20px}
+.wave{display:flex;align-items:center;gap:3px;height:56px;padding:0 4px}
+.wave i{flex:1;border-radius:3px;background:var(--ok);height:var(--h,40%);transition:height .12s,background .4s}
+.veille.silence .wave i{height:6%!important;background:var(--warn)}
+.veille.secours .wave i{background:var(--orange)}
+.veille.coupe .wave i{height:6%!important;background:var(--bad)}
+.st{transition:background .35s,box-shadow .35s,opacity .35s;opacity:.55}
+.st.on{opacity:1;background:var(--panel);box-shadow:0 0 0 1.5px var(--c)}
+.veille .note{margin-top:14px;font-size:13.5px;color:var(--mut)}
+
+/* installation */
+.os .card{display:flex;flex-direction:column}
+.os .btn{margin-top:auto;align-self:flex-start}
+.os ol.steps{margin-bottom:18px}
+
+/* radios */
+#radios .why{padding:30px;border-radius:24px;background:linear-gradient(135deg,color-mix(in srgb,var(--acc) 10%,var(--panel)),var(--panel));border:1px solid var(--line)}
+footer .bz{font-style:italic}
+
+@media (max-width:900px){
+  .win-body{grid-template-columns:1fr}.win-side{display:none}
+  .outs2{grid-template-columns:1fr 1fr}
+  .ecran{margin-top:-90px}
+}
+@media (max-width:560px){.live .lufs{margin-left:0;text-align:left}}
+
 body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 </style>
 </head>
@@ -201,6 +290,13 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
     <symbol id="i-win" viewBox="0 0 20 20"><path fill="currentColor" d="M1 3.2 8.3 2.2v7H1zM9.2 2.1 19 .8v8.4H9.2zM1 10.1h7.3v7L1 16.2zM9.2 10.1H19v8.4l-9.8-1.3z"/></symbol>
     <symbol id="i-mac" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="3" width="16" height="11" rx="2"/><path d="M7 17.5h6M10 14v3.5"/></g></symbol>
     <symbol id="i-dl" viewBox="0 0 20 20"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 17h13"/></symbol>
+    <linearGradient id="faisceau" x1="0" x2="1"><stop offset="0" stop-color="#ffd27a" stop-opacity=".9"/><stop offset="1" stop-color="#ffd27a" stop-opacity="0"/></linearGradient>
+    <symbol id="i-air" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/></g></symbol>
+    <symbol id="i-bouee" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="m5.6 5.6 3.6 3.6M14.8 14.8l3.6 3.6M18.4 5.6l-3.6 3.6M9.2 14.8l-3.6 3.6"/></g></symbol>
+    <symbol id="i-cart" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></g></symbol>
+    <symbol id="i-proc" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 3v18M12 3v18M18 3v18"/><rect x="3.5" y="13" width="5" height="3" rx="1.5" fill="currentColor"/><rect x="9.5" y="6" width="5" height="3" rx="1.5" fill="currentColor"/><rect x="15.5" y="10" width="5" height="3" rx="1.5" fill="currentColor"/></g></symbol>
+    <symbol id="i-rec" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></g></symbol>
+    <symbol id="i-net" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v12M3.5 12.5 7 16l3.5-3.5M17 20V8M13.5 11.5 17 8l3.5 3.5"/></g></symbol>
   </defs>
 </svg>
 
@@ -210,13 +306,14 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
       <svg width="38" height="38" aria-hidden="true"><use href="#tuile"/></svg>
       <span class="nm"><b>Bev</b><small>BROADCAST TOOL</small></span>
     </a>
-    <nav><a class="gh" href="https://github.com/Bieuzy/Bev">GitHub</a></nav>
+    <nav><a href="#fonctions">Fonctions</a><a href="#installer">Installer</a><a href="#nouveautes">Nouveautés</a><a class="gh" href="https://github.com/Bieuzy/Bev">GitHub</a></nav>
   </div>
 </header>
 
 <div class="splash">
   <div class="wrap">
     <svg class="phare" viewBox="0 0 560 560" role="img" aria-label="Logo de Bev : un phare qui émet des ondes">
+      <path class="beam" d="M280 129 L900 70 L900 188Z" fill="url(#faisceau)"/>
       <g class="ondes">
         <path class="o1" d="M414 24.3A170 170 0 0 1 414 233.7M146 24.3A170 170 0 0 0 146 233.7"/>
         <path class="o2" d="M414 24.3A170 170 0 0 1 414 233.7M146 24.3A170 170 0 0 0 146 233.7"/>
@@ -238,23 +335,115 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
           <span class="t"><b>Télécharger pour Mac</b><small id="mac-info">Image disque .dmg · puce Apple</small></span>
         </a>
       </div>
-      <p class="first" id="first">Premier lancement : Windows → <b>Informations complémentaires</b> › <b>Exécuter quand même</b> · Mac → clic droit › <b>Ouvrir</b></p>
       <div class="meta">
         <span class="chip" id="ver">Version 1.1.1</span>
         <span id="ver-date">Gratuit</span>
       </div>
     </div>
   </div>
+  <div class="houle" aria-hidden="true">
+    <svg class="h2" viewBox="0 0 1440 120" preserveAspectRatio="none"><path d="M0 60 Q 90 30 180 60 T 360 60 T 540 60 T 720 60 T 900 60 T 1080 60 T 1260 60 T 1440 60 V120 H0Z" fill="#5b7fa8" opacity=".18"/></svg>
+    <svg class="h1" viewBox="0 0 1440 120" preserveAspectRatio="none"><path d="M0 60 Q 90 30 180 60 T 360 60 T 540 60 T 720 60 T 900 60 T 1080 60 T 1260 60 T 1440 60 V120 H0Z" transform="translate(0 18)" fill="#5b7fa8" opacity=".28"/></svg>
+  </div>
 </div>
 
+<section class="ecran" aria-label="Aperçu de Bev à l'antenne">
+  <div class="wrap">
+    <div class="win reveal" aria-hidden="true">
+      <div class="win-top"><i></i><i></i><i></i>&nbsp;Bev<span id="win-clock">21:00:00</span></div>
+      <div class="win-body">
+        <div class="win-side">
+          <b class="on"><svg width="16" height="16"><use href="#i-air"/></svg>Diffusion</b>
+          <b><svg width="16" height="16"><use href="#i-cart"/></svg>Cartoucheur</b>
+          <b><svg width="16" height="16"><use href="#i-proc"/></svg>Processeur</b>
+          <b><svg width="16" height="16"><use href="#i-rec"/></svg>Enregistrement</b>
+          <b><svg width="16" height="16"><use href="#i-bouee"/></svg>Secours</b>
+          <b><svg width="16" height="16"><use href="#i-net"/></svg>Réseau</b>
+        </div>
+        <div class="win-main">
+          <div class="live">
+            <span class="pill" id="win-pill"><span class="dot"></span><span id="win-state">À l'antenne</span></span>
+            <span class="clock" id="win-up">02:14:37</span>
+            <span class="lufs">Niveau moyen<b><span id="win-lufs">−16,2</span> LUFS</b></span>
+          </div>
+          <div class="vu"><div>L<span id="vu-l"></span></div><div>R<span id="vu-r"></span></div></div>
+          <div class="outs2">
+            <div><b><span class="dot"></span>Icecast</b><small>MP3 · 192 kb/s</small></div>
+            <div><b><span class="dot"></span>Shoutcast</b><small>AAC · 128 kb/s</small></div>
+            <div><b><span class="dot"></span>FM</b><small>Émetteur</small></div>
+            <div><b><span class="dot"></span>DAB+</b><small>Multiplex</small></div>
+          </div>
+          <div class="net"><b>RJ45</b><span>Wi-Fi</span><span>Clé 4G/5G</span><span style="margin-left:auto">Pige ARCOM en cours</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">Un seul écran pour tout ce qui part à l'antenne.</p>
+  </div>
+</section>
+
+<section id="fonctions">
+  <div class="wrap">
+    <div class="sh reveal"><h2>Ce que fait Bev</h2><p>Tout ce qu'il faut pour tenir l'antenne, sans usine à gaz.</p></div>
+    <div class="grid g3 feat">
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-air"/></svg></div><h3>Partout en même temps</h3><p class="sub">Internet (Icecast, Shoutcast, FLAC compris), FM et DAB+ depuis le même ordinateur.</p></article>
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-bouee"/></svg></div><h3>Jamais de blanc</h3><p class="sub">Un silence trop long et Bev lance la playlist de secours. Il rend l'antenne dès que le direct revient.</p></article>
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-cart"/></svg></div><h3>Cartoucheur</h3><p class="sub">Jingles et virgules à portée de clic, par simple glisser-déposer.</p></article>
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-proc"/></svg></div><h3>Un son d'antenne soigné</h3><p class="sub">Traitement intégré avec préréglages talk-show, news, classique et loud, et un niveau LUFS lisible.</p></article>
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-rec"/></svg></div><h3>Enregistrement et pige</h3><p class="sub">L'antenne enregistrée et découpée heure par heure pour la pige ARCOM.</p></article>
+      <article class="card reveal"><div class="ico"><svg width="20" height="20"><use href="#i-net"/></svg></div><h3>Internet de secours</h3><p class="sub">Wi-Fi, câble, clé 4G ou 5G : Bev mesure la qualité et passe sur le meilleur accès si l'un tombe.</p></article>
+    </div>
+  </div>
+</section>
+
+<section id="veille">
+  <div class="wrap">
+    <div class="sh reveal"><h2>Le phare veille</h2><p>Quand quelque chose lâche, Bev réagit tout seul et vous le montre clairement.</p></div>
+    <div class="card veille reveal" id="veille-demo">
+      <div class="wave" id="wave" aria-hidden="true"></div>
+      <div class="states">
+        <div class="st" style="--c:var(--ok)"><span class="dot" style="background:var(--ok)"></span><div><b>À l'antenne</b><span>Le direct part partout.</span></div></div>
+        <div class="st" style="--c:var(--warn)"><span class="dot" style="background:var(--warn)"></span><div><b>Silence détecté</b><span>Plus rien ne sort du studio.</span></div></div>
+        <div class="st" style="--c:var(--orange)"><span class="dot" style="background:var(--orange)"></span><div><b>Playlist de secours</b><span>La musique prend le relais.</span></div></div>
+        <div class="st" style="--c:var(--bad)"><span class="dot" style="background:var(--bad)"></span><div><b>Flux coupé</b><span>L'écran passe au rouge, Bev se reconnecte.</span></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="installer">
+  <div class="wrap">
+    <div class="sh reveal"><h2>Installer Bev</h2><p>Bev n'est pas signé par Microsoft ni Apple : le premier lancement demande un clic de plus.</p></div>
+    <div class="grid g2 os">
+      <div class="card reveal" id="os-win">
+        <h3><svg width="20" height="20"><use href="#i-win"/></svg>Windows</h3>
+        <ol class="steps">
+          <li><span>Téléchargez et ouvrez l'installateur.</span></li>
+          <li><span>Si Windows affiche un avertissement : <kbd>Informations complémentaires</kbd> puis <kbd>Exécuter quand même</kbd>.</span></li>
+          <li><span>Les mises à jour se font ensuite depuis Bev, en quelques secondes.</span></li>
+        </ol>
+        <a class="btn sm" href="https://github.com/Bieuzy/Bev/releases/latest" data-dl="win"><svg width="16" height="16"><use href="#i-dl"/></svg>Télécharger pour Windows</a>
+      </div>
+      <div class="card reveal" id="os-mac">
+        <h3><svg width="20" height="20"><use href="#i-mac"/></svg>Mac <span class="chip">puce Apple</span></h3>
+        <ol class="steps">
+          <li><span>Ouvrez le fichier .dmg et glissez Bev dans Applications.</span></li>
+          <li><span>Au premier lancement : clic droit sur Bev puis <kbd>Ouvrir</kbd>.</span></li>
+          <li><span>Bev vérifie ensuite lui-même les nouvelles versions.</span></li>
+        </ol>
+        <a class="btn sm" href="https://github.com/Bieuzy/Bev/releases/latest/download/Bev-macOS.dmg" data-dl="mac"><svg width="16" height="16"><use href="#i-dl"/></svg>Télécharger pour Mac</a>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section id="radios">
-  <div class="wrap why">
+  <div class="wrap"><div class="why reveal">
     <h2>Pourquoi les radios associatives comptent</h2>
     <div>
       <p>Elles donnent la parole à ceux qu'on n'entend pas ailleurs : les associations du coin, les musiciens d'ici, les langues régionales, les habitants eux-mêmes. Souvent, ce sont les seules à parler de ce qui se passe à deux rues de chez vous.</p>
       <p>Elles tiennent grâce à des bénévoles et à des budgets serrés. Bev est gratuit pour qu'aucune d'elles n'ait à choisir entre un logiciel de diffusion et le reste.</p>
     </div>
-  </div>
+  </div></div>
 </section>
 
 <section id="nouveautes">
@@ -268,7 +457,7 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 
 <footer>
   <div class="wrap">
-    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev · né à <a href="https://rbg.bzh">Radio Bro Gwened</a></span>
+    <span class="l"><svg width="26" height="26" aria-hidden="true"><use href="#tuile"/></svg>Bev <span class="bz">(« direct » en breton)</span> · né à <a href="https://rbg.bzh">Radio Bro Gwened</a></span>
     <span>Gratuit pour tout usage non commercial · <a href="https://github.com/Bieuzy/Bev/blob/main/LICENCE-FR.md">licence</a> · <a href="https://github.com/Bieuzy/Bev">GitHub</a></span>
   </div>
 </footer>
@@ -283,6 +472,49 @@ var REPO = "Bieuzy/Bev";
   if (mac) {
     w.classList.remove("primary"); m.classList.add("primary"); m.parentNode.insertBefore(m, w);
   }
+  var me = document.getElementById(mac ? "os-mac" : "os-win");
+  me.classList.add("me"); me.querySelector(".btn").classList.add("primary");
+  if (mac) me.parentNode.insertBefore(me, me.parentNode.firstChild);
+})();
+
+// Apparition douce des sections
+(function(){
+  var els = document.querySelectorAll(".reveal");
+  if (!("IntersectionObserver" in window)) { els.forEach(function(e){ e.classList.add("in"); }); return; }
+  var io = new IntersectionObserver(function(es){ es.forEach(function(e){ if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }); }, {rootMargin:"0px 0px -8% 0px"});
+  els.forEach(function(e){ io.observe(e); });
+})();
+
+// Fenêtre de Bev et démo de la veille
+(function(){
+  var calme = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var vl = document.getElementById("vu-l"), vr = document.getElementById("vu-r"), up = document.getElementById("win-up"),
+      clk = document.getElementById("win-clock"), lufs = document.getElementById("win-lufs");
+  var wave = document.getElementById("wave"), bars = [];
+  for (var i = 0; i < 64; i++) { var b = document.createElement("i"); wave.appendChild(b); bars.push(b); }
+  var demo = document.getElementById("veille-demo"), sts = demo.querySelectorAll(".st");
+  var etats = ["", "silence", "secours", "coupe"], k = 0, debut = Date.now() - 8077000, l = 55, r = 52;
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
+  function hms(s){ return pad(Math.floor(s/3600)) + ":" + pad(Math.floor(s/60)%60) + ":" + pad(s%60); }
+  function etat(){
+    demo.className = "card veille in " + etats[k];
+    sts.forEach(function(s, j){ s.classList.toggle("on", j === k); });
+  }
+  etat();
+  if (calme) { vl.style.setProperty("--v","62%"); vr.style.setProperty("--v","58%"); bars.forEach(function(b,j){ b.style.setProperty("--h", (30 + 40*Math.abs(Math.sin(j/4))) + "%"); }); return; }
+  setInterval(function(){
+    l = Math.max(30, Math.min(92, l + (Math.random()-.5)*22)); r = Math.max(30, Math.min(92, l + (Math.random()-.5)*10));
+    vl.style.setProperty("--v", l + "%"); vr.style.setProperty("--v", r + "%"); vl.style.setProperty("--bw", (10000/l) + "%"); vr.style.setProperty("--bw", (10000/r) + "%");
+    bars.forEach(function(b){ b.style.setProperty("--h", (18 + Math.random()*78) + "%"); });
+  }, 110);
+  setInterval(function(){
+    var d = new Date(); clk.textContent = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    up.textContent = hms(Math.floor((Date.now() - debut)/1000));
+    lufs.textContent = "−" + (15.8 + Math.random()*.8).toFixed(1).replace(".", ",");
+  }, 1000);
+  setInterval(function(){ k = (k + 1) % 4; etat(); }, 2600);
+})();
+(function(){
 })();
 
 // ---------- Releases GitHub, chargées à chaque visite
@@ -322,6 +554,8 @@ function render(list){
   document.getElementById("ver-date").textContent = "Publiée le " + frDate(latest.published_at) + " · gratuite";
   var w = findAsset(latest, WIN), m = findAsset(latest, MAC);
   if (w) { document.getElementById("btn-win").href = w.browser_download_url; document.getElementById("win-info").textContent = w.name + " · " + mo(w.size); }
+  if (w) document.querySelector('[data-dl="win"]').href = w.browser_download_url;
+  if (m) document.querySelector('[data-dl="mac"]').href = m.browser_download_url;
   if (m) { document.getElementById("btn-mac").href = m.browser_download_url; document.getElementById("mac-info").textContent = m.name + " · " + mo(m.size); }
 
   box.innerHTML = "";
