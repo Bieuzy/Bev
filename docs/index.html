@@ -249,6 +249,13 @@ html{scroll-behavior:smooth}
 .os .card{display:flex;flex-direction:column}
 .os .btn{margin-top:auto;align-self:flex-start}
 .os ol.steps{margin-bottom:18px}
+#installer .ensuite{margin-top:18px}
+#installer .ensuite ol.steps{margin:6px 0 0}
+#installer a:not(.btn){color:var(--acc)}
+#installer details.aide{margin:-6px 0 18px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;font-size:14px}
+#installer details.aide summary{cursor:pointer;font-weight:700}
+#installer details.aide p{margin:10px 0 6px}
+#installer details.aide ol.steps{margin:6px 0}
 
 /* radios */
 #radios .why{padding:30px;border-radius:24px;background:linear-gradient(135deg,color-mix(in srgb,var(--acc) 10%,var(--panel)),var(--panel));border:1px solid var(--line)}
@@ -412,26 +419,46 @@ body{margin:0}img{max-width:100%}[hidden]{display:none!important}
 
 <section id="installer">
   <div class="wrap">
-    <div class="sh reveal"><h2>Installer Bev</h2><p>Bev n'est pas signé par Microsoft ni Apple : le premier lancement demande un clic de plus.</p></div>
+    <div class="sh reveal"><h2>Installer Bev</h2><p>Cinq minutes suffisent. Bev n'est pas encore signé par Microsoft ni Apple : le premier lancement demande une confirmation, c'est normal.</p></div>
     <div class="grid g2 os">
       <div class="card reveal" id="os-win">
-        <h3><svg width="20" height="20"><use href="#i-win"/></svg>Windows</h3>
+        <h3><svg width="20" height="20"><use href="#i-win"/></svg>Windows <span class="chip">10 et 11</span></h3>
         <ol class="steps">
-          <li><span>Téléchargez et ouvrez l'installateur.</span></li>
-          <li><span>Si Windows affiche un avertissement : <kbd>Informations complémentaires</kbd> puis <kbd>Exécuter quand même</kbd>.</span></li>
-          <li><span>Les mises à jour se font ensuite depuis Bev, en quelques secondes.</span></li>
+          <li><span>Téléchargez l'installateur <b>Bev-Setup</b> et ouvrez-le.</span></li>
+          <li><span>Si Windows affiche « Windows a protégé votre ordinateur » : <kbd>Informations complémentaires</kbd> puis <kbd>Exécuter quand même</kbd>.</span></li>
+          <li><span>Suivez l'installateur : aucun droit administrateur n'est nécessaire. Bev s'ajoute au menu Démarrer.</span></li>
+          <li><span>Pour diffuser le son d'un autre logiciel (automate, lecteur), choisissez « Son de l'ordinateur » comme entrée : rien d'autre à installer.</span></li>
         </ol>
+        <details class="aide">
+          <summary>Windows 11 bloque Bev sans proposer « Exécuter quand même » ?</summary>
+          <p>C'est le <b>Contrôle intelligent des applications</b>, qui bloque les logiciels pas encore signés. Pour installer Bev :</p>
+          <ol class="steps">
+            <li><span>Ouvrez <kbd>Sécurité Windows</kbd> (menu Démarrer).</span></li>
+            <li><span><kbd>Contrôle des applications et du navigateur</kbd> › <kbd>Paramètres du contrôle intelligent des applications</kbd>.</span></li>
+            <li><span>Choisissez <kbd>Désactivé</kbd>, puis relancez l'installateur.</span></li>
+          </ol>
+          <p class="sub">Depuis la mise à jour d'avril 2026 de Windows 11, vous pouvez le réactiver ensuite au même endroit (auparavant, il fallait réinstaller Windows). Si l'interrupteur reste grisé après la mise à jour d'octobre 2026 (KB5127648), c'est un défaut connu de Windows, que Microsoft doit corriger.</p>
+        </details>
         <a class="btn sm" href="https://github.com/Bieuzy/Bev/releases/latest" data-dl="win"><svg width="16" height="16"><use href="#i-dl"/></svg>Télécharger pour Windows</a>
       </div>
       <div class="card reveal" id="os-mac">
-        <h3><svg width="20" height="20"><use href="#i-mac"/></svg>Mac <span class="chip">puce Apple</span></h3>
+        <h3><svg width="20" height="20"><use href="#i-mac"/></svg>Mac <span class="chip">puce Apple (M1 et suivantes)</span></h3>
         <ol class="steps">
-          <li><span>Ouvrez le fichier .dmg et glissez Bev dans Applications.</span></li>
-          <li><span>Au premier lancement : clic droit sur Bev puis <kbd>Ouvrir</kbd>.</span></li>
-          <li><span>Bev vérifie ensuite lui-même les nouvelles versions.</span></li>
+          <li><span>Ouvrez le fichier <b>Bev-macOS.dmg</b> et glissez Bev dans le dossier <b>Applications</b>.</span></li>
+          <li><span>Ouvrez Bev. Si macOS refuse (« impossible de vérifier le développeur ») : <kbd>Réglages Système</kbd> › <kbd>Confidentialité et sécurité</kbd>, tout en bas <kbd>Ouvrir quand même</kbd>, puis confirmez avec votre mot de passe. À faire une seule fois.</span></li>
+          <li><span>Autorisez l'accès au <b>micro</b> quand Bev le demande : c'est ce qui lui permet de capter l'entrée audio.</span></li>
+          <li><span>Pour diffuser le son d'un autre logiciel (Radiologik…), installez une carte son virtuelle (<a href="https://existential.audio/blackhole/">BlackHole</a>, gratuit, ou Loopback) et choisissez-la comme entrée dans Bev.</span></li>
         </ol>
         <a class="btn sm" href="https://github.com/Bieuzy/Bev/releases/latest/download/Bev-macOS.dmg" data-dl="mac"><svg width="16" height="16"><use href="#i-dl"/></svg>Télécharger pour Mac</a>
       </div>
+    </div>
+    <div class="card reveal ensuite">
+      <h3>Et ensuite ?</h3>
+      <ol class="steps">
+        <li><span>Au premier lancement, Gaël, le radio-bot de Bev, indique l'étape suivante : l'entrée audio, puis un flux, puis la playlist de secours.</span></li>
+        <li><span>Le <b>guide pas à pas</b> (onglet <kbd>À propos</kbd>) explique chaque partie de Bev et vous montre où cliquer.</span></li>
+        <li><span>Les mises à jour arrivent ensuite d'elles-mêmes : la plupart s'installent en quelques secondes, sans couper le direct.</span></li>
+      </ol>
     </div>
   </div>
 </section>
